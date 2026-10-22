@@ -619,16 +619,11 @@ static int cs42l84_mute_stream(struct snd_soc_dai *dai, int mute, int stream)
 		}
 	} else {
 		/*
-		 * The ASoC resume work unmutes DAIs that were active at
-		 * suspend while the card is still below D0. The PCM is
-		 * suspended then and the host may not be driving BCLK yet,
-		 * so moving the codec onto it would take the I2C bus down.
-		 * Stay on the oscillator; the unmute after the next prepare
-		 * does the switch.
+		 * ASoC also unmutes here at D2 during card resume. A PCM
+		 * advertising RESUME can restart without another prepare, so
+		 * do not discard that unmute based on the card power state.
+		 * The PLL path below still requires lock before switching.
 		 */
-		if (snd_power_get_state(component->card->snd_card) != SNDRV_CTL_POWER_D0)
-			return 0;
-
 		if (!cs42l84->stream_use) {
 			/* SCLK must be running before codec unmute.
 			 *

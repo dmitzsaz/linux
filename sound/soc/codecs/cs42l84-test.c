@@ -53,11 +53,6 @@ struct cs42l84_test_clk_param {
 	unsigned int ccm_ctl1;
 };
 
-struct cs42l84_test_power_param {
-	unsigned int state;
-	const char *name;
-};
-
 /* BCLK rates that run the codec from the PLL */
 static const struct cs42l84_test_clk_param cs42l84_test_pll_clks[] = {
 	{
@@ -84,13 +79,6 @@ static const struct cs42l84_test_clk_param cs42l84_test_bclk_clks[] = {
 		.ccm_ctl1 = CS42L84_TEST_CCM_CTL1(CS42L84_CCM_CTL1_MCLK_SRC_BCLK,
 						  CS42L84_CCM_CTL1_MCLK_F_12_288KHZ),
 	},
-};
-
-static const struct cs42l84_test_power_param cs42l84_test_low_power[] = {
-	{ .state = SNDRV_CTL_POWER_D1, .name = "D1" },
-	{ .state = SNDRV_CTL_POWER_D2, .name = "D2" },
-	{ .state = SNDRV_CTL_POWER_D3hot, .name = "D3hot" },
-	{ .state = SNDRV_CTL_POWER_D3cold, .name = "D3cold" },
 };
 
 static int cs42l84_test_reg_read(void *context, unsigned int reg, unsigned int *val)
@@ -239,55 +227,46 @@ static void cs42l84_test_expect_switch_to_pll(struct kunit *test,
 }
 
 /*
- * ASoC resume sets the card to D2, unmutes the playback DAIs that were
- * active at suspend and only then sets D0. That early unmute must not move
- * the codec off the oscillator: the stream is still suspended and BCLK may
- * not be running yet.
+ * Follow the codec callbacks from a running stream through card suspend and
+ * resume. ASoC sends the only resume unmute at D2, then publishes D0. A PCM
+ * with SNDRV_PCM_INFO_RESUME can trigger without another prepare/unmute.
+ * A successful PLL lock represents clocks being available, independently of
+ * card power state; the direct-BCLK case retains the host's clock contract.
  */
-static void cs42l84_test_unmute_below_d0_does_nothing(struct kunit *test)
+static void cs42l84_test_resume_without_prepare(struct kunit *test)
 {
-	const struct cs42l84_test_power_param *param = test->param_value;
+	const struct cs42l84_test_clk_param *clk = test->param_value;
 	struct cs42l84_test_priv *priv = test->priv;
-
-	if (!IS_ENABLED(CONFIG_PM))
-		kunit_skip(test, "card power state needs CONFIG_PM");
-
-	/* A PLL configuration whose PLL would lock if it were started */
-	cs42l84_test_set_clk(test, &cs42l84_test_pll_clks[0]);
-	cs42l84_test_set_power(priv, param->state);
-
-	KUNIT_EXPECT_EQ(test, cs42l84_test_mute(priv, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
-
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-	KUNIT_EXPECT_EQ(test, priv->num_lock_reads, 0);
-	KUNIT_EXPECT_EQ(test, priv->cs42l84.stream_use, 0);
-	KUNIT_EXPECT_EQ(test, priv->regs[CS42L84_CCM_CTL1], CS42L84_CCM_CTL1_RCO);
-	KUNIT_EXPECT_EQ(test, priv->regs[CS42L84_DAC_CTL1] & CS42L84_DAC_CTL1_UNMUTE, 0);
-}
-
-/*
- * The resume sequence: the unmute at D2 is skipped, and the unmute that
- * follows the next prepare at D0 does the whole switch.
- */
-static void cs42l84_test_resume_unmute_then_d0_unmute(struct kunit *test)
-{
-	const struct cs42l84_test_clk_param *clk = &cs42l84_test_pll_clks[0];
-	struct cs42l84_test_priv *priv = test->priv;
+	unsigned int writes;
 
 	if (!IS_ENABLED(CONFIG_PM))
 		kunit_skip(test, "card power state needs CONFIG_PM");
 
 	cs42l84_test_set_clk(test, clk);
+	KUNIT_ASSERT_EQ(test, cs42l84_test_mute(priv, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	cs42l84_test_set_power(priv, SNDRV_CTL_POWER_D3hot);
+	KUNIT_ASSERT_EQ(test, cs42l84_test_mute(priv, 1, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	KUNIT_ASSERT_EQ(test, priv->cs42l84.stream_use, 0);
+	KUNIT_ASSERT_EQ(test, priv->regs[CS42L84_CCM_CTL1], CS42L84_CCM_CTL1_RCO);
+	cs42l84_test_clear_log(priv);
 
 	cs42l84_test_set_power(priv, SNDRV_CTL_POWER_D2);
-	KUNIT_EXPECT_EQ(test, cs42l84_test_mute(priv, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	KUNIT_EXPECT_EQ(test, priv->num_writes, 0);
-	KUNIT_EXPECT_EQ(test, priv->cs42l84.stream_use, 0);
-
-	cs42l84_test_set_power(priv, SNDRV_CTL_POWER_D0);
-	KUNIT_EXPECT_EQ(test, cs42l84_test_mute(priv, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
-	cs42l84_test_expect_switch_to_pll(test, clk);
+	KUNIT_ASSERT_EQ(test, cs42l84_test_mute(priv, 0, SNDRV_PCM_STREAM_PLAYBACK), 0);
+	KUNIT_EXPECT_EQ(test, priv->regs[CS42L84_CCM_CTL1], clk->ccm_ctl1);
+	KUNIT_EXPECT_TRUE(test, priv->regs[CS42L84_DAC_CTL1] & CS42L84_DAC_CTL1_UNMUTE);
 	KUNIT_EXPECT_EQ(test, priv->cs42l84.stream_use, BIT(SNDRV_PCM_STREAM_PLAYBACK));
+	writes = priv->num_writes;
+	KUNIT_EXPECT_GT(test, writes, 0);
+
+	/* D0 is a notification, not a second codec callback or clock proof. */
+	cs42l84_test_set_power(priv, SNDRV_CTL_POWER_D0);
+	KUNIT_EXPECT_EQ(test, priv->num_writes, writes);
+	KUNIT_EXPECT_TRUE(test, priv->regs[CS42L84_DAC_CTL1] & CS42L84_DAC_CTL1_UNMUTE);
+}
+
+static void cs42l84_test_resume_without_prepare_bclk(struct kunit *test)
+{
+	cs42l84_test_resume_without_prepare(test);
 }
 
 /* At D0 with a locked PLL the codec moves onto the PLL output */
@@ -361,6 +340,18 @@ static void cs42l84_test_unmute_pll_lock_timeout(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, cs42l84_test_count_writes(priv, CS42L84_DAC_CTL1), 0);
 	KUNIT_EXPECT_EQ(test, priv->regs[CS42L84_DAC_CTL1] & CS42L84_DAC_CTL1_UNMUTE, 0);
 	KUNIT_EXPECT_EQ(test, priv->cs42l84.stream_use, 0);
+}
+
+/* No PLL lock at D2 must not be mistaken for a usable clock at resume. */
+static void cs42l84_test_resume_without_pll_lock(struct kunit *test)
+{
+	struct cs42l84_test_priv *priv = test->priv;
+
+	if (!IS_ENABLED(CONFIG_PM))
+		kunit_skip(test, "card power state needs CONFIG_PM");
+
+	cs42l84_test_set_power(priv, SNDRV_CTL_POWER_D2);
+	cs42l84_test_unmute_pll_lock_timeout(test);
 }
 
 /*
@@ -503,22 +494,16 @@ static void cs42l84_test_clk_desc(const struct cs42l84_test_clk_param *param, ch
 	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "BCLK %u Hz, %u Hz", param->bclk, param->rate);
 }
 
-static void cs42l84_test_power_desc(const struct cs42l84_test_power_param *param, char *desc)
-{
-	snprintf(desc, KUNIT_PARAM_DESC_SIZE, "%s", param->name);
-}
-
 KUNIT_ARRAY_PARAM(cs42l84_test_pll_clks, cs42l84_test_pll_clks, cs42l84_test_clk_desc);
 KUNIT_ARRAY_PARAM(cs42l84_test_bclk_clks, cs42l84_test_bclk_clks, cs42l84_test_clk_desc);
-KUNIT_ARRAY_PARAM(cs42l84_test_low_power, cs42l84_test_low_power, cs42l84_test_power_desc);
 
 static struct kunit_case cs42l84_test_cases[] = {
-	KUNIT_CASE_PARAM(cs42l84_test_unmute_below_d0_does_nothing,
-			 cs42l84_test_low_power_gen_params),
-	KUNIT_CASE(cs42l84_test_resume_unmute_then_d0_unmute),
+	KUNIT_CASE_PARAM(cs42l84_test_resume_without_prepare, cs42l84_test_pll_clks_gen_params),
+	KUNIT_CASE_PARAM(cs42l84_test_resume_without_prepare_bclk, cs42l84_test_bclk_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l84_test_unmute_pll_locked, cs42l84_test_pll_clks_gen_params),
 	KUNIT_CASE(cs42l84_test_unmute_pll_lock_error_bit),
 	KUNIT_CASE_PARAM(cs42l84_test_unmute_pll_lock_timeout, cs42l84_test_pll_clks_gen_params),
+	KUNIT_CASE_PARAM(cs42l84_test_resume_without_pll_lock, cs42l84_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l84_test_unmute_after_pll_lock_timeout,
 			 cs42l84_test_pll_clks_gen_params),
 	KUNIT_CASE_PARAM(cs42l84_test_mute_returns_to_rco, cs42l84_test_pll_clks_gen_params),
