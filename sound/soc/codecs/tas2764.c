@@ -269,11 +269,15 @@ static int tas2764_update_pwr_ctrl(struct tas2764_priv *tas2764)
 
 #ifdef CONFIG_PM
 /*
- * System sleep leaves the SDZ line high: the amp waits in software shutdown, as it does between
- * streams, and keeps its registers. Pulling SDZ low here meant a power-on reset at resume, and
- * soc_resume_deferred() unmutes the amps of a running stream a few milliseconds later: their I/V
- * sense then read a negative average power for several seconds, and the uncached page-0xfd quirk
- * writes were lost. After cold boot no amp is unmuted that fresh out of reset.
+ * Members of an SDZ group keep the shared SDZ line high across system sleep: the amp waits in
+ * software shutdown, as it does between streams, and keeps its registers. Pulling SDZ low here
+ * meant a power-on reset at resume, and soc_resume_deferred() unmutes the amps of a running stream
+ * a few milliseconds later: their I/V sense then read a negative average power for several
+ * seconds, and the uncached page-0xfd quirk writes were lost. After cold boot no amp is unmuted
+ * that fresh out of reset.
+ *
+ * Amps outside a group keep the earlier behaviour (SDZ low across sleep) until the change has run
+ * on the machines that use them.
  */
 static int tas2764_codec_suspend(struct snd_soc_component *component)
 {
@@ -287,6 +291,13 @@ static int tas2764_codec_suspend(struct snd_soc_component *component)
 	if (ret < 0)
 		return ret;
 
+	if (!tas2764->sdz_group) {
+		if (tas2764->sdz_gpio)
+			gpiod_set_value_cansleep(tas2764->sdz_gpio, 0);
+
+		regulator_disable(tas2764->sdz_reg);
+	}
+
 	regcache_cache_only(tas2764->regmap, true);
 	regcache_mark_dirty(tas2764->regmap);
 
@@ -299,6 +310,19 @@ static int tas2764_codec_resume(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
 	int ret;
+
+	if (!tas2764->sdz_group) {
+		ret = regulator_enable(tas2764->sdz_reg);
+		if (ret) {
+			dev_err(tas2764->dev, "Failed to enable regulator\n");
+			return ret;
+		}
+
+		if (tas2764->sdz_gpio)
+			gpiod_set_value_cansleep(tas2764->sdz_gpio, 1);
+
+		usleep_range(1000, 2000);
+	}
 
 	regcache_cache_only(tas2764->regmap, false);
 
@@ -982,6 +1006,10 @@ static int tas2764_codec_probe(struct snd_soc_component *component)
 static void tas2764_codec_remove(struct snd_soc_component *component)
 {
 	struct tas2764_priv *tas2764 = snd_soc_component_get_drvdata(component);
+
+	/* A failed group's supply was forced off: there is no enable left to balance. */
+	if (tas2764_group_failed(tas2764))
+		return;
 
 	regulator_disable(tas2764->sdz_reg);
 }
