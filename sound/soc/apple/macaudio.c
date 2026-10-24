@@ -406,7 +406,8 @@ static void macaudio_stop_playback(struct macaudio_snd_data *ma, bool sw_gain_on
 	 * substream on the card carries a runtime as its private data.
 	 */
 	for_each_card_rtds(&ma->card, rtd) {
-		if (!rtd->pcm)
+		/* A back-end's substream shares its front-end's runtime: stop front-ends only. */
+		if (!rtd->pcm || rtd->dai_link->no_pcm)
 			continue;
 		if (sw_gain_only && !ma->link_props[rtd->dai_link->id].sw_gain)
 			continue;
@@ -1271,6 +1272,22 @@ static int macaudio_fe_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct snd_soc_pcm_runtime *rtd = snd_soc_substream_to_rtd(substream);
 	struct macaudio_snd_data *ma = snd_soc_card_get_drvdata(rtd->card);
+
+	/*
+	 * A prepare can pass just before a failed lock is recorded and the
+	 * stop work then find the stream not yet prepared: refuse its start.
+	 */
+	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK &&
+	    READ_ONCE(ma->speaker_lock_failed)) {
+		switch (cmd) {
+		case SNDRV_PCM_TRIGGER_START:
+		case SNDRV_PCM_TRIGGER_RESUME:
+		case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+			return -EIO;
+		default:
+			break;
+		}
+	}
 
 	if (!macaudio_sw_gain_pcm(substream))
 		return 0;
