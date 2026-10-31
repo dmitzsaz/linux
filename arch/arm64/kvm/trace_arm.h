@@ -237,7 +237,8 @@ TRACE_EVENT(kvm_get_timer_map,
 
 	TP_fast_assign(
 		__entry->vcpu_id		= vcpu_id;
-		__entry->direct_vtimer		= arch_timer_ctx_index(map->direct_vtimer);
+		__entry->direct_vtimer =
+			(map->direct_vtimer) ? arch_timer_ctx_index(map->direct_vtimer) : -1;
 		__entry->direct_ptimer =
 			(map->direct_ptimer) ? arch_timer_ctx_index(map->direct_ptimer) : -1;
 		__entry->emul_vtimer =
