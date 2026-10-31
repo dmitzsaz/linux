@@ -16,3 +16,5 @@ obj-$(CONFIG_MUX_ADGS1408)	+= mux-adgs1408.o
 obj-$(CONFIG_MUX_APPLE_DPXBAR)	+= mux-apple-display-crossbar.o
 obj-$(CONFIG_MUX_GPIO)		+= mux-gpio.o
 obj-$(CONFIG_MUX_MMIO)		+= mux-mmio.o
+
+obj-$(CONFIG_MUX_J704_DPXBAR) += j704_dpxbar.o

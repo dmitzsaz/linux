@@ -83,6 +83,13 @@ config MUX_MMIO
 	  To compile the driver as a module, choose M here: the module will
 	  be called mux-mmio.
 
+config MUX_J704_DPXBAR
+	tristate "Apple J704 DisplayPort crossbar"
+	depends on ARCH_APPLE && OF
+	help
+	  T8142 DisplayPort routing and link clock control on J704.
+	  The module is called j704_dpxbar.
+
 endmenu
 
 endif # MULTIPLEXER
