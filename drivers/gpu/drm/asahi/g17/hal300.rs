@@ -8,11 +8,8 @@
 //!
 //! 1. Identify both loaded firmware images (SHA-256 of TEXT with the entropy and the data pointer
 //!    cleared) before any firmware-visible write.
-//! 2. Build the startup graph (`hal300_build`, from the generated tables in `hal300_graph` and
-//!    the device tree's operating points and power inputs), or, on a device tree without builder
-//!    inputs, load the captured one (`apple/t8142-hal300-graph.bin`). When both exist the built
-//!    graph is compared with the captured one byte for byte. Every object is Linux-owned RAM at a
-//!    fixed address; every window is an admitted SGX or power-telemetry register range.
+//! 2. Build the startup graph from the public layout tables and the DT's operating points
+//!    and owner-supplied power inputs. Missing inputs are rejected before firmware startup.
 //! 3. Create the UAT over the reserved tables, which are not System RAM
 //!    ([`mmu::Uat::new_published_foreign`]), and map the lower aliases, so the lower root's
 //!    top-level entries exist when the coprocessors sample them.
@@ -50,15 +47,6 @@ use super::{
 };
 use crate::driver::AsahiDrmDevice;
 use crate::{mem, mmu, regs};
-
-/// Firmware file of the startup graph.
-const GRAPH_FILE: &CStr = c_str!("apple/t8142-hal300-graph.bin");
-const GRAPH_MAGIC: &[u8; 8] = b"T8142H30";
-const GRAPH_VERSION: u32 = 1;
-const GRAPH_HEADER: usize = 64;
-const GRAPH_WINDOW: usize = 32;
-const GRAPH_OBJECT: usize = 72;
-const SHA256: usize = 32;
 
 /// The driver-managed kernel window, where every graph object lives.
 const KERNEL_WINDOW: Range<u64> = 0xfffffc20_00000000..0xfffffc30_00000000;
@@ -222,16 +210,15 @@ struct Window {
     slot: u32,
 }
 
-/// An object of the graph: its fixed addresses and the non-zero runs of its contents.
+/// An object of the graph: its fixed addresses, extent and name.
 struct GraphObject<'a> {
     va: u64,
     size: usize,
     aliases: [u64; 2],
     name: &'a [u8],
-    runs: KVec<(usize, &'a [u8])>,
 }
 
-/// The parsed, validated startup graph.
+/// The validated driver-built startup graph.
 struct Graph<'a> {
     windows: KVec<Window>,
     objects: KVec<GraphObject<'a>>,
@@ -240,123 +227,6 @@ struct Graph<'a> {
 
 fn page_aligned(value: u64) -> bool {
     value & mmu::UAT_PGMSK as u64 == 0
-}
-
-impl<'a> Graph<'a> {
-    fn parse(data: &'a [u8], cfg: &Hal300Config) -> Result<Self> {
-        if data.len() < GRAPH_HEADER + SHA256 || data.get(..8) != Some(GRAPH_MAGIC.as_slice()) {
-            return Err(EINVAL);
-        }
-        let (signed, digest) = data.split_at(data.len() - SHA256);
-        if glue::sha256(signed) != digest {
-            return Err(EBADMSG);
-        }
-        if le32(data, 8)? != GRAPH_VERSION
-            || le32(data, 12)? as usize != GRAPH_HEADER
-            || le64(data, 0x28)? as usize != signed.len() - GRAPH_HEADER
-        {
-            return Err(EINVAL);
-        }
-        let windows = le32(data, 0x10)? as usize;
-        let objects = le32(data, 0x14)? as usize;
-        let roots = [le64(data, 0x18)?, le64(data, 0x20)?];
-        let mut graph = Graph {
-            windows: KVec::new(),
-            objects: KVec::new(),
-            roots,
-        };
-        let mut at = GRAPH_HEADER;
-        for _ in 0..windows {
-            let window = Window {
-                va: le64(signed, at)?,
-                phys: le64(signed, at + 8)?,
-                size: le64(signed, at + 16)?,
-                slot: le32(signed, at + 24)?,
-            };
-            at += GRAPH_WINDOW;
-            let admitted = cfg.registers.iter().any(|range| {
-                window.phys >= range.start
-                    && window.size <= range.end - range.start
-                    && window.phys - range.start <= range.end - range.start - window.size
-            });
-            if window.slot >= 64
-                || window.va != REGISTER_WINDOWS + u64::from(window.slot) * 0x100000
-                || window.size == 0
-                || window.size > 0x100000
-                || !page_aligned(window.phys | window.size)
-                || !admitted
-                || graph.windows.iter().any(|other| other.slot == window.slot)
-            {
-                return Err(EINVAL);
-            }
-            graph.windows.push(window, GFP_KERNEL)?;
-        }
-        let mut total = 0usize;
-        for _ in 0..objects {
-            let va = le64(signed, at)?;
-            let size = usize::try_from(le64(signed, at + 8)?)?;
-            let aliases = [le64(signed, at + 16)?, le64(signed, at + 24)?];
-            let count = le32(signed, at + 32)? as usize;
-            let name = signed.get(at + 40..at + 72).ok_or(EINVAL)?;
-            let name = &name[..name.iter().position(|&b| b == 0).ok_or(EINVAL)?];
-            at += GRAPH_OBJECT;
-            total = total.checked_add(size).ok_or(EOVERFLOW)?;
-            let end = va.checked_add(size as u64).ok_or(EOVERFLOW)?;
-            if size == 0
-                || size > MAX_OBJECT
-                || total > MAX_GRAPH
-                || !page_aligned(va | size as u64)
-                || va < KERNEL_WINDOW.start
-                || end > REGISTER_WINDOWS
-                || graph
-                    .objects
-                    .iter()
-                    .any(|other| va < other.va + other.size as u64 && other.va < end)
-            {
-                return Err(EINVAL);
-            }
-            for alias in aliases.iter().filter(|&&alias| alias != 0) {
-                let alias_end = alias.checked_add(size as u64).ok_or(EOVERFLOW)?;
-                if !page_aligned(*alias) || *alias < LOWER_WINDOW.start || alias_end > LOWER_WINDOW.end {
-                    return Err(EINVAL);
-                }
-            }
-            let table = signed.get(at..at + count * 8).ok_or(EINVAL)?;
-            at += count * 8;
-            let mut runs = KVec::with_capacity(count, GFP_KERNEL)?;
-            for i in 0..count {
-                let offset = le32(table, i * 8)? as usize;
-                let length = le32(table, i * 8 + 4)? as usize;
-                if offset.checked_add(length).ok_or(EOVERFLOW)? > size {
-                    return Err(EINVAL);
-                }
-                runs.push((offset, signed.get(at..at + length).ok_or(EINVAL)?), GFP_KERNEL)?;
-                at += length;
-            }
-            at = (at + 7) & !7;
-            graph.objects.push(
-                GraphObject {
-                    va,
-                    size,
-                    aliases,
-                    name,
-                    runs,
-                },
-                GFP_KERNEL,
-            )?;
-        }
-        if at != signed.len() {
-            return Err(EINVAL);
-        }
-        for root in roots {
-            if !graph.objects.iter().any(|object| {
-                root >= object.va && root & 7 == 0 && root - object.va + ROOT_SIZE <= object.size as u64
-            }) {
-                return Err(EINVAL);
-            }
-        }
-        Ok(graph)
-    }
 }
 
 impl Graph<'static> {
@@ -419,40 +289,12 @@ impl Graph<'static> {
                     size: spec.size,
                     aliases: spec.aliases,
                     name: spec.name,
-                    runs: KVec::new(),
                 },
                 GFP_KERNEL,
             )?;
         }
         Ok(graph)
     }
-}
-
-/// Bytes of `built` that differ from the captured object `reference` (its runs, zero elsewhere):
-/// their count and the first offset.
-fn differences(built: &[u8], reference: &GraphObject<'_>) -> (usize, Option<usize>) {
-    let (mut count, mut first, mut at) = (0usize, None, 0usize);
-    let mut check = |offset: usize, got: u8, want: u8| {
-        if got != want {
-            count += 1;
-            first.get_or_insert(offset);
-        }
-    };
-    for (offset, data) in reference.runs.iter() {
-        for i in at..(*offset).min(built.len()) {
-            check(i, built[i], 0);
-        }
-        for (j, want) in data.iter().enumerate() {
-            if let Some(got) = built.get(offset + j) {
-                check(offset + j, *got, *want);
-            }
-        }
-        at = offset + data.len();
-    }
-    for i in at..built.len() {
-        check(i, built[i], 0);
-    }
-    (count, first)
 }
 
 /// Settled status both coprocessors reported after every qualified M5 power-on.
@@ -504,53 +346,15 @@ pub(super) fn boot(
         super::capacity::FirmwareData::record(role, &data);
     }
     let sgx_base = pdev.resource_by_name(c_str!("sgx")).ok_or(EINVAL)?.start() as u64;
-    let inputs = super::hal300_build::Inputs::load(pdevice, sgx_base)?;
-    // The captured graph is required only without builder inputs; with them it is the reference
-    // the built graph is compared with.
-    let file = match inputs {
-        Some(_) => kernel::firmware::Firmware::request(GRAPH_FILE, pdevice).ok(),
-        None => Some(kernel::firmware::Firmware::request(GRAPH_FILE, pdevice)?),
-    };
-    let reference = match &file {
-        Some(file) => Some(Graph::parse(file.data(), hal).inspect_err(|e| {
-            dev_err!(pdevice, "HAL300: captured startup graph rejected: {:?}\n", e)
-        })?),
-        None => None,
-    };
-    let built = match inputs {
-        Some(_) => Some(Graph::from_tables(hal).inspect_err(|e| {
-            dev_err!(pdevice, "HAL300: built startup graph rejected: {:?}\n", e)
-        })?),
-        None => None,
-    };
-    let graph = match (&built, &reference) {
-        (Some(built), _) => built,
-        (None, Some(reference)) => reference,
-        (None, None) => return Err(ENOENT),
-    };
-    if let (Some(built), Some(reference)) = (&built, &reference) {
-        let same_shape = built.roots == reference.roots
-            && built.windows.len() == reference.windows.len()
-            && built.windows.iter().zip(reference.windows.iter()).all(|(a, b)| {
-                a.va == b.va && a.phys == b.phys && a.size == b.size && a.slot == b.slot
-            })
-            && built.objects.len() == reference.objects.len()
-            && built.objects.iter().zip(reference.objects.iter()).all(|(a, b)| {
-                a.va == b.va && a.size == b.size && a.aliases == b.aliases && a.name == b.name
-            });
-        if !same_shape {
-            dev_err!(pdevice, "HAL300: built and captured startup graphs differ in layout\n");
-            return Err(EINVAL);
-        }
-    }
-    let origin = if built.is_some() { "built by the driver" } else { "captured image" };
-    dev_info!(
-        pdevice,
-        "HAL300: startup graph with {} objects and {} register windows ({})\n",
-        graph.objects.len(),
-        graph.windows.len(),
-        origin
-    );
+    let inputs = super::hal300_build::Inputs::load(pdevice, sgx_base)?.ok_or_else(|| {
+        dev_err!(pdevice, "HAL300: missing DT power inputs; firmware not started\n");
+        EINVAL
+    })?;
+    let graph = Graph::from_tables(hal).inspect_err(|e| {
+        dev_err!(pdevice, "HAL300: startup graph rejected: {:?}\n", e)
+    })?;
+    dev_info!(pdevice, "HAL300: built {} startup objects and {} register windows\n",
+              graph.objects.len(), graph.windows.len());
 
     // UAT, lower mappings and objects. Nothing runs yet; errors release everything.
     let geometry = mmu::UatGeometry {
@@ -573,38 +377,18 @@ pub(super) fn boot(
         CpuMap::WriteCombined,
     )?;
     let mut objects = KVec::with_capacity(graph.objects.len(), GFP_KERNEL)?;
-    let (mut differing, mut use_reference) = (0usize, false);
     for (index, item) in graph.objects.iter().enumerate() {
         let mut object = KernelObject::backing(dev, item.size, CpuMap::WriteCombined)?;
         // M5 reports its CPU caches as coherent (CLIDR_EL1.LoC == 0), so DMA mapping performs
         // no maintenance; the RAM runtime cleaned every object explicitly.
         object.evict_cpu_caches();
         let bytes = object.bytes_mut();
-        if let Some(inputs) = &inputs {
-            let mut staged = KVVec::from_elem(0u8, item.size, GFP_KERNEL)?;
-            super::hal300_build::fill(index, &mut staged, inputs).inspect_err(|e| {
-                dev_err!(pdevice, "HAL300: building {} failed: {:?}\n",
-                         core::str::from_utf8(item.name).unwrap_or("?"), e)
-            })?;
-            if let Some(reference) = reference.as_ref().and_then(|r| r.objects.get(index)) {
-                let (count, first) = differences(&staged, reference);
-                if count != 0 {
-                    differing += 1;
-                    dev_err!(
-                        pdevice,
-                        "HAL300: built {} differs from the captured graph in {} bytes, first at {:#x}\n",
-                        core::str::from_utf8(item.name).unwrap_or("?"),
-                        count,
-                        first.unwrap_or(0)
-                    );
-                }
-            }
-            bytes.copy_from_slice(&staged);
-        } else {
-            for (offset, data) in item.runs.iter() {
-                bytes[*offset..*offset + data.len()].copy_from_slice(data);
-            }
-        }
+        let mut staged = KVVec::from_elem(0u8, item.size, GFP_KERNEL)?;
+        super::hal300_build::fill(index, &mut staged, &inputs).inspect_err(|e| {
+            dev_err!(pdevice, "HAL300: building {} failed: {:?}\n",
+                     core::str::from_utf8(item.name).unwrap_or("?"), e)
+        })?;
+        bytes.copy_from_slice(&staged);
         let mut aliases = KVec::new();
         for alias in item.aliases.iter().filter(|&&alias| alias != 0) {
             aliases.push(
@@ -625,39 +409,6 @@ pub(super) fn boot(
             },
             GFP_KERNEL,
         )?;
-    }
-    if differing != 0 {
-        // A built graph that does not equal the qualified captured one is not used unless
-        // debug_flags bit 48 asks for it: the captured objects replace it.
-        use_reference = crate::module_parameters::debug_flags.value() & (1 << 48) == 0;
-        if use_reference {
-            let reference = reference.as_ref().ok_or(EINVAL)?;
-            for (object, item) in objects.iter_mut().zip(reference.objects.iter()) {
-                let bytes = object.object.bytes_mut();
-                bytes.fill(0);
-                for (offset, data) in item.runs.iter() {
-                    bytes[*offset..*offset + data.len()].copy_from_slice(data);
-                }
-            }
-        }
-    }
-    if built.is_some() {
-        let verdict = if reference.is_none() {
-            "no captured graph to compare, using the built one"
-        } else if differing == 0 {
-            "identical to the captured graph"
-        } else if use_reference {
-            "using the captured graph instead"
-        } else {
-            "using it anyway (debug_flags bit 48)"
-        };
-        dev_info!(
-            pdevice,
-            "HAL300: built startup graph: {} ({} of {} objects differ from the captured graph)\n",
-            verdict,
-            differing,
-            graph.objects.len()
-        );
     }
     // Tables the adopted compute graph does not contain. Render needs the parameter-buffer
     // descriptor table, which the firmware learns from both main configurations

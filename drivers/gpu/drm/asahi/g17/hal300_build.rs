@@ -30,8 +30,7 @@ pub(crate) struct Inputs {
 }
 
 impl Inputs {
-    /// Reads the inputs, or returns `None` when the device tree carries no builder inputs
-    /// (`apple,hal300-derived` absent): the driver then needs the captured graph image.
+    /// Reads the per-machine DT inputs. The caller refuses startup when they are absent.
     pub(crate) fn load(dev: &device::Device, sgx_base: u64) -> Result<Option<Self>> {
         let node = dev.of_node().ok_or(EIO)?;
         let raw: Option<KVec<u32>> = node.get_opt_property(c_str!("apple,hal300-derived"))?;
@@ -78,7 +77,22 @@ impl Inputs {
             dev_err!(dev, "HAL300: {} GPU operating points\n", states.len());
             return Err(EINVAL);
         }
+        if states[0].hz != 0 || states.windows(2).any(|pair| pair[0].hz == pair[1].hz) {
+            dev_err!(dev, "HAL300: invalid GPU operating point frequencies\n");
+            return Err(EINVAL);
+        }
+        if derived.iter().any(|&(object, offset, _, value)| {
+            usize::from(object) == graph::POWER_OBJECT && offset as usize == graph::PSTATE_MAX
+                && value != states.len() as u64 - 1
+        }) {
+            dev_err!(dev, "HAL300: power profile does not match the operating point count\n");
+            return Err(EINVAL);
+        }
         let sample_period_ms: u32 = node.get_property(c_str!("apple,power-sample-period"))?;
+        if sample_period_ms == 0 || sample_period_ms > 10000 {
+            dev_err!(dev, "HAL300: invalid power sample period\n");
+            return Err(EINVAL);
+        }
         Ok(Some(Inputs {
             sgx_base,
             states,
