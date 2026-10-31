@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,j704-platform-data.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple J704 loader PCIe tuning data
+maintainers:
+  - Dmitriy <noc@pimk.in>
+description: |
+  The static DTS contains empty shared, port0 and port2 children. Aura supplies
+  validated tables from the current ADT, then publishes format version 1 and
+  the ready marker. Each table is a flat sequence of u32 (offset, mask, value)
+  triples; the register update is (old & ~mask) | value. The driver validates
+  alignment, lengths and individual register-window bounds before hardware use.
+$defs:
+  table:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 12288
+    description: Register offset, RMW clear mask and value triples from the ADT.
+properties:
+  compatible:
+    const: apple,j704-platform-data
+  apple,format-version:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    const: 1
+    description: Loader tuning contract version.
+  apple,pcie-tunables-ready:
+    type: boolean
+    description: All twelve tuning properties have been validated by the loader.
+  shared:
+    type: object
+    properties:
+      apple,tunable-axi2af:
+        $ref: '#/$defs/table'
+      apple,tunable-phy:
+        $ref: '#/$defs/table'
+      apple,tunable-pll:
+        $ref: '#/$defs/table'
+      apple,tunable-auspma:
+        $ref: '#/$defs/table'
+    additionalProperties: false
+patternProperties:
+  '^port[02]$':
+    type: object
+    properties:
+      apple,tunable-config:
+        $ref: '#/$defs/table'
+      apple,tunable-root:
+        $ref: '#/$defs/table'
+      apple,tunable-gen3:
+        $ref: '#/$defs/table'
+      apple,tunable-gen4:
+        $ref: '#/$defs/table'
+    additionalProperties: false
+required:
+  - compatible
+  - shared
+  - port0
+  - port2
+additionalProperties: false
+...

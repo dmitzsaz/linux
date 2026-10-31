@@ -1,0 +1,95 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/gpu/apple,agx-t8142.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple T8142 HAL300 GPU
+maintainers:
+  - Dmitriy <noc@pimk.in>
+description: |
+  The loader reserves current firmware/UAT memory, supplies operating points
+  and owner-provided HAL300 power inputs, then enables the GPU. Static hardware
+  resources belong in the board DTS, not the machine's coefficients or addresses
+  of allocations made during a particular boot. Input ABI v1 describes the
+  qualified G17G C0 firmware layout, not a firmware image.
+properties:
+  compatible:
+    const: apple,agx-t8142
+  reg:
+    maxItems: 2
+  reg-names:
+    items:
+      - const: asc
+      - const: sgx
+  status:
+    enum: [okay, disabled]
+  mboxes:
+    minItems: 2
+    maxItems: 2
+  power-domains:
+    maxItems: 1
+  operating-points-v2: true
+  memory-region:
+    minItems: 10
+    maxItems: 10
+  memory-region-names:
+    items:
+      - const: ttbs
+      - const: pagetables
+      - const: handoff
+      - const: l2-pagetables
+      - const: fw-text0
+      - const: fw-data0
+      - const: crashlog0
+      - const: fw-text1
+      - const: fw-data1
+      - const: crashlog1
+  apple,power-sample-period:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 10000
+    description: Power controller sampling period in milliseconds from the ADT.
+  apple,hal300-derived:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 515
+    maxItems: 515
+    description: |
+      Owner-supplied HAL300 ABI v1 coefficients. Each of the 103 records contains
+      object index, byte offset, width, value low u32 and value high u32, in the
+      order specified by the T8142 HAL300 layout. Loader and driver validate
+      every descriptor. Values belong in a private per-machine input overlay.
+  apple,hal300-source-pstates:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 48
+    description: |
+      Profile provenance verified by the loader against the live ADT. Triples
+      contain frequency in Hz, core millivolts and SRAM millivolts, including
+      state zero.
+  apple,hal300-source-period:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 10000
+    description: Profile source sampling period, matched against the live ADT.
+required:
+  - compatible
+  - reg
+  - reg-names
+  - mboxes
+  - power-domains
+  - operating-points-v2
+allOf:
+  - if:
+      properties:
+        status:
+          const: disabled
+      required: [status]
+    then: {}
+    else:
+      required:
+        - memory-region
+        - memory-region-names
+        - apple,power-sample-period
+        - apple,hal300-derived
+additionalProperties: false
+...

@@ -472,6 +472,12 @@ properties:
           - const: apple,t6041
           - const: apple,arm-platform
 
+      - description: Apple M5 SoC based platforms
+        items:
+          - const: apple,j704 # MacBook Pro (14-inch, M5)
+          - const: apple,t8142
+          - const: apple,arm-platform
+
   aurora,minimal-boot:
     type: boolean
     description:

@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,j704-platform.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple J704 PCIe startup coordinator
+maintainers:
+  - Dmitriy <noc@pimk.in>
+description: |
+  Coordinates the shared PCIe PHY, radio and SD reader links before publishing
+  their dormant DART/host nodes. It waits for the board SMC, consumes the loader
+  tuning contract, and pins partial hardware state until reboot. There is no
+  userspace stage sequence or module parameter interface.
+properties:
+  compatible:
+    const: apple,j704-platform
+  apple,smc:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: SMC provider owning the radio and SD reader power functions.
+required:
+  - compatible
+  - apple,smc
+additionalProperties: false
+...
