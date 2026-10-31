@@ -335,6 +335,102 @@ pub(crate) const fn work_ring_offset(channel: usize) -> usize {
     bundle::WORK_RINGS + work_slot(channel) * bundle::WORK_RING_SIZE
 }
 
+/// Where the runtime finds the shared rings and state of one firmware generation's graph.
+///
+/// HAL200 (T8140) builds the graph itself from the constants of this module. HAL300 (T8142)
+/// adopts the graph the macOS initializer produced: the same channel table, ring and record
+/// formats, with some structures grown, so the bundle and private-cluster offsets move.
+pub(crate) struct Layout {
+    /// Bundle offset of each instance's main configuration.
+    pub(crate) main_config: [usize; 2],
+    /// Bundle offset of the work rings.
+    pub(crate) work_rings: usize,
+    /// Bundle offsets of the five views named by the primary main configuration.
+    pub(crate) views: [usize; 5],
+    /// Private-cluster offset of each instance's state grid.
+    pub(crate) state: [usize; 2],
+    /// Private-cluster offset of each instance's status A block.
+    pub(crate) status_a: [usize; 2],
+    /// Region C offset of the host power-assert tally.
+    pub(crate) power_assert_tally: usize,
+    /// Region C offset of the effort input, if known.
+    pub(crate) effort: Option<usize>,
+    /// Whether the recovery handshake fields of the primary status B are known.
+    pub(crate) recovery: bool,
+    /// Primary status B offsets of the recovery records, active hardware-slot mask, epoch,
+    /// handshake state and host-recovery flag.
+    pub(crate) recovery_b: [usize; 5],
+    /// Report-view offset of the recovery class.
+    pub(crate) recovery_reason: usize,
+    /// A firmware-initiated recovery fails all in-flight work: no per-slot attribution and no
+    /// replay (the HAL300 attribution inputs are not qualified, sol-hal300-recovery-study.md).
+    pub(crate) recovery_fail_all: bool,
+    /// Index of the completion ring compute kicks complete on.
+    pub(crate) compute_completions: usize,
+}
+
+impl Layout {
+    /// Bundle offset of work channel `channel`'s ring.
+    pub(crate) const fn work_ring_offset(&self, channel: usize) -> usize {
+        self.work_rings + work_slot(channel) * bundle::WORK_RING_SIZE
+    }
+}
+
+// The effort override word directly follows the effort input ([`Layout::effort`]).
+static_assert!(RegionC::UNK_E8 == RegionC::EFFORT + 4);
+
+/// The graph this driver builds for the HAL200 firmware.
+pub(crate) const HAL200: Layout = Layout {
+    main_config: bundle::MAIN_CONFIG,
+    work_rings: bundle::WORK_RINGS,
+    views: bundle::VIEWS,
+    state: [private::PRIMARY_STATE, private::SECONDARY_STATE],
+    status_a: [private::PRIMARY_STATUS_A, private::SECONDARY_STATUS_A],
+    power_assert_tally: RegionC::POWER_ASSERT_TALLY,
+    effort: Some(RegionC::EFFORT),
+    recovery: true,
+    recovery_b: [
+        core::mem::offset_of!(PrimaryStatusB, recovery_info),
+        core::mem::offset_of!(PrimaryStatusB, recovery_slot_mask),
+        core::mem::offset_of!(PrimaryStatusB, recovery_epoch),
+        core::mem::offset_of!(PrimaryStatusB, recovery_state),
+        core::mem::offset_of!(PrimaryStatusB, host_recovery),
+    ],
+    recovery_reason: recovery::REASON,
+    recovery_fail_all: false,
+    compute_completions: 0,
+};
+
+/// The HAL300 graph of the 26A434 firmware, as the qualified j704 RAM runtime started it:
+/// work rings and both main configurations 0x880 later in the bundle, status B grown by 0x340,
+/// the secondary state grid at 0x177400 and the power tally at region C 0xe75; compute
+/// completions share the first of four completion rings with render work.
+pub(crate) const HAL300: Layout = Layout {
+    main_config: [0x1ee40, 0x23300],
+    work_rings: 0xce40,
+    views: [0x2880, 0x34c0, 0x4540, 0xc500, 0xc580],
+    state: [0, 0x177400],
+    status_a: [0xf180, 0xc3440],
+    power_assert_tally: 0xe75,
+    // Native setCLPCDeadlineControlEffort (0xfffffe0008ba937c) stores the normalized effort to
+    // region C +0xe8 and updateDeadlineControllerOverride (0x8baf154) the explicit pstate
+    // override to +0xec; the secondary samples both at S+0x14644 (sol-hal300-power-study.md).
+    // HAL200's pair is +0xe4/+0xe8.
+    effort: Some(0xe8),
+    // Native host predicates isFirmwareStoppedFor{Pre,Post}Recovery / resumeFirmware*Recovery
+    // (0xfffffe0008bb6bec..0x8bb6ce0, 0x8bbf440): status B grew by 0x1e0 before these fields.
+    recovery: true,
+    recovery_b: [0x4298, 0x4ab8, 0x4ad0, 0x4ae0, 0x4af0],
+    recovery_reason: 0x48,
+    recovery_fail_all: true,
+    // The lab runtime's compute queues completed on ring 1, but this driver's queues complete on
+    // ring 0 together with TA and fragment work (type byte (data master + 1) << 4 | 3; ring 1 is
+    // never written, ring 2 carries other record types): Arch desktop 2026-10-31, read through
+    // debugfs peek around 25 compute kicks. Scanning ring 1 latched no record, so every compute
+    // kick waited for the recordless one-pass grace.
+    compute_completions: 0,
+};
+
 /// Offsets in a status area, the region starting at an instance's status A
 /// block, of the rings the firmware fills.
 pub(crate) mod status {
@@ -2238,13 +2334,39 @@ static_assert!(size_of::<PagePoolDescriptor>() == 0x20);
 
 impl PagePoolDescriptor {
     /// Complete row for a physical compute queue's independent 21-block pool.
-    pub(crate) const fn compute(page_list_va: u64) -> Self {
+    pub(crate) fn compute(page_list_va: u64) -> Self {
         Self::compute_blocks(page_list_va, 21)
     }
 
-    pub(crate) const fn compute_blocks(page_list_va: u64, blocks: usize) -> Self {
+    pub(crate) fn compute_blocks(page_list_va: u64, blocks: usize) -> Self {
         let pages = blocks as u64 * FREE_LIST_BLOCK_PAGES as u64;
+        if super::compute::g17g_selected() {
+            return Self::g17g(page_list_va, 0, pages as u32, 0, pages as u32, PAGE_POOL_UNIT as u32);
+        }
         Self::new(page_list_va, pages << PAGE_POOL_FREE_PAGES_SHIFT, pages)
+    }
+
+    /// G17G (HAL300) row packing of the native AGXAcceleratorG17G halLoadUMADesc
+    /// (0xfffffe0008bd0a54; halStoreUMADesc 0xfffffe0008bd09b0 is its inverse), from free-list
+    /// control C: D0 = C+14 >> 7 | (C+28 & 1) << 61, D1 = C+20 | C+24 << 32 (two 28-bit
+    /// lanes), D2 = C+2c | C+1c << 32, D3 = 0 (sol-render-teardown-study.md section 3). The G17P
+    /// packing below put the unit in D0 bit 41 and shifted the lanes by 5/33, so the firmware
+    /// saw twice the free pages and its USC private-memory manager ran past a pool's last
+    /// block (gUPM write faults one page after a render pool, asahi-render39/41/46-boot).
+    pub(crate) const fn g17g(
+        page_list_va: u64,
+        used: u32,
+        free: u32,
+        flag: u32,
+        pages: u32,
+        unit: u32,
+    ) -> Self {
+        Self {
+            page_list: (page_list_va >> PAGE_POOL_LIST_SHIFT) | ((flag as u64 & 1) << 61),
+            counters: (used as u64 & 0x0fff_ffff) | ((free as u64 & 0x0fff_ffff) << 32),
+            page_count: (pages as u64 & 0x0fff_ffff) | ((unit as u64) << 32),
+            unk_18: 0,
+        }
     }
 
     const fn new(page_list_va: u64, counters: u64, page_count: u64) -> Self {

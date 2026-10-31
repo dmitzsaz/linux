@@ -120,6 +120,9 @@ pub(crate) struct Context {
     work: Arc<Mutex<WorkStorage>>,
     work_base: u64,
     render: Arc<Mutex<Option<Arc<RenderPool>>>>,
+    /// Alias of an adopted render pool's backing in this context's VM (HAL300 pool reuse).
+    render_alias: Arc<Mutex<Option<mmu::KernelMapping>>>,
+    render_adopted: AtomicBool,
     render_blocks: AtomicUsize,
     /// Timestamp pages of retired compute commands, mapped in this context's VM.
     compute_timestamps: Arc<super::completion::ComputeTimestampCache>,
@@ -183,6 +186,8 @@ impl Context {
             GFP_KERNEL,
         )?;
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
+        let render_alias =
+            Arc::pin_init(new_mutex!(None, "G17 adopted render pool alias"), GFP_KERNEL)?;
         Ok(Self {
             execution,
             status,
@@ -195,6 +200,8 @@ impl Context {
             work,
             work_base,
             render,
+            render_alias,
+            render_adopted: AtomicBool::new(false),
             render_blocks: AtomicUsize::new(super::fw::freelist::RENDER_BLOCKS),
             compute_timestamps: super::completion::ComputeTimestampCache::new()?,
             policy,
@@ -306,6 +313,12 @@ impl Context {
         if let Some(pool) = &*render {
             // A pool vacated under memory pressure is re-armed before reuse.
             pool.ensure_backing(alloc, render_global, self.vm())?;
+            if self.render_adopted.load(Ordering::Acquire) {
+                let mut alias = self.render_alias.lock();
+                if alias.is_none() {
+                    *alias = Some(pool.alias_client(self.vm())?);
+                }
+            }
             return Ok(pool.clone());
         }
         let pool = Arc::new(
@@ -313,7 +326,30 @@ impl Context {
             GFP_KERNEL,
         )?;
         *render = Some(pool.clone());
+        if super::fw::compute::g17g_selected() {
+            // HAL300 never frees a render pool's backing, control or state: after an exiting
+            // GL client's pool was given back while other clients rendered, gUPM wrote to
+            // its freed lower-arena page (asahi-render39/41-boot). Retained until reboot.
+            core::mem::forget(pool.clone());
+        }
         Ok(pool)
+    }
+    /// HAL300 pool reuse: take over a closed owner's idle render pool before this context
+    /// built one. Its backing is aliased into this VM by the next `render_pool` call.
+    pub(crate) fn adopt_render_pool(
+        &self,
+        pool: Arc<RenderPool>,
+    ) -> core::result::Result<(), Arc<RenderPool>> {
+        let mut render = self.render.lock();
+        if render.is_some() || pool.blocks() < self.render_blocks() {
+            return Err(pool);
+        }
+        *render = Some(pool);
+        self.render_adopted.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn has_render_pool(&self) -> bool {
+        self.render.lock().is_some()
     }
     /// Drops the pool once its free-list release is consumed and the closed
     /// scheduler is detached. Installed compute bindings may retain the

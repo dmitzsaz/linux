@@ -22,6 +22,9 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
+/// Bytes of one UMA usage record (native AGXUSCPrivMemFList::updateSubmitInfo advances by 0x40).
+const USAGE_RECORD: usize = 0x40;
+const _: () = assert!(DESCRIPTORS * USAGE_RECORD <= crate::mmu::UAT_PGSZ);
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
@@ -31,6 +34,13 @@ const PREDECESSOR: usize = 0x400;
 const POINTERS: usize = 0x100;
 const ITEMS: usize = 0x4000;
 const STAMP: usize = 0x300;
+/// G17G raw command timestamps: one `{u64 start, u64 end}` per kick-ring slot in the queue's
+/// own firmware-mapped support object. The firmware CPU writes these through descriptor
+/// 0xf7c/0xf84 while it consumes an eligible hardware completion, so they must live in a
+/// kernel-VM object: pointing them at a client-VM page faulted the primary firmware at
+/// P+0xdec8 with FAR 0x7080000000 (asahi-ts1-boot).
+const TIMESTAMPS: usize = 0x8000;
+const TIMESTAMP_STRIDE: usize = 0x10;
 
 #[repr(C)]
 struct GraphLayout {
@@ -123,7 +133,12 @@ impl Graph {
         let ring = DescriptorRing::new(alloc)?;
         let preempt = alloc.kernel(0x4000, page, prot, cpu)?;
         let usage = alloc.kernel(mmu::UAT_PGSZ, page, prot, cpu)?;
-        let operand = alloc.lower(0x14000, page, prot, cpu)?;
+        // G17G names regions up to +0x48000 (0x10229 at +0x40000, the UMA register 0x140a8
+        // at +0x48000). The G17P size 0x14000 left those outside the object, so the hardware
+        // wrote whatever the client VM had mapped there and faulted where nothing was: the
+        // UMA_CORE write fault at 0x708024c000 = operand alias 0x7080204000 + 0x48000
+        // (asahi-pw19..pw33, also once in a default-mode CTS run).
+        let operand = alloc.lower(crate::g17::fw::compute::operand_state_size(), page, prot, cpu)?;
         let mut support = alloc.kernel(0xc000, page, prot, cpu)?;
         let support_va = support.gpu_va();
         support.write(0, support_va + page)?;
@@ -174,7 +189,12 @@ impl Graph {
             return Err(EFAULT);
         }
         let vm = context.vm();
-        vm.install_job_context_aliases()?;
+        // The HAL200 context views are a G17P contract: Mesa binds those slots only for
+        // G17P, so on G17G every slot is empty and installing them fails with ENOENT for
+        // every submission. HAL300 needs none of them.
+        if !crate::g17::fw::compute::g17g_selected() {
+            vm.install_job_context_aliases()?;
+        }
         let descriptors = self.descriptor_alias(vm)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let page = mmu::UAT_PGSZ as u64;
@@ -188,6 +208,20 @@ impl Graph {
         let queue_context = self
             .context_low
             .alias_in(vm, dynamic::CLIENT_LOWER, page, prot)?;
+        // Per-client address map, with the per-pass trace (debug_flags bit 62).
+        if crate::g17::fw::compute::g17g_selected()
+            && crate::module_parameters::debug_flags.value() & (1 << 62) != 0
+        {
+            pr_info!(
+                "asahi: HAL300 compute binding context {} preempt {:#x} usage {:#x} \
+                 operand {:#x} queue_context {:#x}\n",
+                context.id(),
+                preempt.iova(),
+                usage.iova(),
+                operand.iova(),
+                queue_context.iova(),
+            );
+        }
         Ok(Binding {
             _kick_alias: kick_alias,
             pool_alias: Some(pool_alias),
@@ -249,7 +283,16 @@ impl Graph {
     }
     fn rearm_ring(&mut self, ring: DescriptorRing) -> Result {
         if self.ring.is_some() {
-            return Err(EBUSY);
+            // HAL300 retains a closed owner's whole graph, so a queue offered for reuse
+            // still carries that owner's descriptor ring. The queue is idle (reusable()
+            // required a retirement witness) and the successor publishes its own
+            // descriptor addresses in every kick entry, so the retained ring is replaced
+            // rather than refused.
+            if !(crate::g17::fw::compute::g17g_selected()
+                && crate::g17::runtime::queue_reuse_enabled())
+            {
+                return Err(EBUSY);
+            }
         }
         self.ring = Some(ring);
         Ok(())
@@ -478,6 +521,10 @@ pub(crate) struct Queue {
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
     release_sent_ns: Option<u64>,
+    /// A kick named this pool's registration since its last free-list release. A re-armed
+    /// pool that grows before its first kick has nothing to release: publishing 0x2e again
+    /// repeated the previous owner's generation once per client (asahi-reuse19-boot log).
+    pool_used: bool,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
@@ -502,6 +549,13 @@ pub(crate) struct Queue {
     replay_prepared: bool,
     exit: Option<exit::Transaction>,
     installed: bool,
+    /// The installed registration still names the previous owner's records, so the
+    /// next publication must re-register this QID. Native tag-15 with install set on
+    /// an already registered QID removes its hardware bit (21078/80), rewrites the
+    /// descriptor including `(dm + 1) << 60` and republishes it (21068/70), which is
+    /// how a physical queue changes owner without any scheduler release
+    /// (sol-ksm-queue-descriptor-study.md section B).
+    reinstall: bool,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
@@ -542,6 +596,7 @@ impl Queue {
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
             release_sent_ns: None,
+            pool_used: false,
             growing: false,
             growth_blocks: 0,
             needs_fresh_backing: false,
@@ -560,6 +615,7 @@ impl Queue {
             replay_prepared: false,
             exit: None,
             installed: false,
+            reinstall: false,
             outer_started: 0,
             published_config: None,
             ordinal: 0,
@@ -722,6 +778,8 @@ impl Queue {
                 active.observed = batch.take(&ticket)?;
                 if active.observed.is_some() {
                     active.observed_at = Some(now_ns());
+                    crate::g17::initdata::COMPLETION_LATCHED
+                        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -821,8 +879,14 @@ impl Queue {
                 if recovery_state != 0 {
                     return Err(EAGAIN);
                 }
-                let recordless = if epoch != ticket.epoch {
+                // HAL300 recovery (asahi-pw8/pw10-boot) records every kick it cancels, and the
+                // service fails exactly those queues' owners (quarantined above). Any other work
+                // that crossed the recovery just kept running: a covering stamp and consumed
+                // items mean it executed, record or not. G17P keeps the ambiguous-crossing rule.
+                let recordless = if epoch != ticket.epoch && !crate::g17::fw::compute::g17g_selected() {
                     Recordless::CrossedRecovery
+                } else if epoch != ticket.epoch {
+                    Recordless::Allowed
                 } else if masks.is_none() || (finished_before && oldest) {
                     Recordless::Allowed
                 } else {
@@ -865,17 +929,49 @@ impl Queue {
                         complete_qos(self.qos_owner())?;
                         self.active.iter_mut().next().ok_or(EIO)?.qos_pending = false;
                     }
+                    let kick = self.active.front().ok_or(EIO)?.ticket.ok_or(EIO)?.kick;
                     let front = self.active.front().ok_or(EIO)?;
+                    // G17G writes this command's own raw 24 MHz pair through descriptor
+                    // 0xf7c/0xf84 (sol-hal300-timestamp-study.md). Both words nonzero after
+                    // the retirement witness means the firmware measured this command; the
+                    // completion-record interval stays the fallback and the ordering input.
+                    let published = self
+                        .raw_timestamps(kick)
+                        .ok()
+                        .filter(|words| {
+                            crate::g17::fw::compute::g17g_selected()
+                                && words[0] != 0
+                                && words[1] >= words[0]
+                        })
+                        .unwrap_or([timestamps[0], timestamps[1]]);
+                    // A timestamp-only command (Honeykrisp's empty CDM stream that carries a
+                    // stamp, M5 has no carrier dispatch) is never measured by the firmware and
+                    // has no record interval: report the end of the last measured command on
+                    // this queue, else the CPU counter, which shares the GPU stamps' origin
+                    // (asahi-pw16-boot: CNTVCT brackets them). It ordered after that earlier
+                    // work, so the CTS guard <= stage relation and monotonicity hold.
+                    let published = if crate::g17::fw::compute::g17g_selected()
+                        && (published[0] == 0 || published[1] == 0)
+                    {
+                        let at = if self.last_end != 0 { self.last_end } else { host_timestamp_ticks() };
+                        [at, at]
+                    } else {
+                        published
+                    };
                     self.retire_pending = true;
                     defer(Deferred::Retired(
                         front.packet.completion.clone(),
-                        Ok([timestamps[0], timestamps[1], 0, 0]),
+                        Ok([published[0], published[1], 0, 0]),
                     ))?;
                     self.retire_pending = false;
                     self.submitted = submitted;
                     let active = self.active.pop().ok_or(EIO)?;
                     if active.observed.is_some() {
                         self.last_end = self.last_end.max(timestamps[1]);
+                    }
+                    if crate::g17::fw::compute::g17g_selected() {
+                        // G17G reports the raw pair, not the record interval (often zero).
+                        self.last_end = self.last_end.max(published[1]);
                     }
                     drop(self.previous.take());
                     self.retirement_ready = self.active.len == 0;
@@ -1061,6 +1157,17 @@ impl Queue {
         }
     }
 
+    /// A crashed HAL300 session is retained, not torn down: wake every waiter of this queue's
+    /// commands with `error` while each command stays owned (nothing is popped or released).
+    pub(crate) fn fail_owned(&self, error: Error) {
+        for packet in self.replays.iter() {
+            packet.completion.fail_while_owned(error);
+        }
+        for active in self.active.iter() {
+            active.packet.completion.fail_while_owned(error);
+        }
+    }
+
     /// Caller already stopped both processors. No firmware owner can access retained mappings.
     pub(crate) fn stopped(&mut self, defer: &mut impl FnMut(Deferred) -> Result) -> Result {
         while let Some(packet) = self.replays.front() {
@@ -1100,6 +1207,10 @@ fn retained_capacity(
     quarantined: bool, released: bool, active: usize, replays: usize, replay_front: bool,
 ) -> Result {
     if quarantined || released {
+        if crate::g17::runtime::reuse_trace_enabled() {
+            pr_info!("J704_REUSE step=retained_capacity quarantined={} released={}\n",
+                quarantined, released);
+        }
         return Err(EBUSY);
     }
     if active >= IN_FLIGHT || (replays != 0 && !replay_front) {
@@ -1212,6 +1323,17 @@ impl Queue {
     }
     pub(crate) fn bind_owner(&mut self, owner: u64, context: Arc<Context>) -> Result {
         if !self.reusable() {
+            if crate::g17::runtime::reuse_trace_enabled() {
+                let release_sent = matches!(self.pool_phase, PoolPhase::ReleaseSent(_));
+                let vacant = matches!(self.pool_phase, PoolPhase::Vacant);
+                let exiting = self.exit.is_some();
+                let owned = self.owner.is_some();
+                pr_info!(
+                    "J704_REUSE qid={} not reusable: growing={} installed={} release_sent={} fresh={} vacant={} exit={} owner={} released={} retired={}\n",
+                    self.qid(), self.growing, self.installed, release_sent,
+                    self.needs_fresh_backing, vacant, exiting, owned, self.released,
+                    self.retirement_ready);
+            }
             return Err(EBUSY);
         }
         if !context.is_current() {
@@ -1251,6 +1373,9 @@ impl Queue {
                 publication: None,
             });
             self.retained_owner = None;
+            if self.installed && crate::g17::runtime::queue_reuse_enabled() {
+                self.reinstall = true;
+            }
         }
         context.mark_published();
         self.owner = Some(owner);
@@ -1400,6 +1525,16 @@ impl Queue {
     pub(crate) fn released_at(&self) -> u64 {
         self.released_at
     }
+    /// This kick's raw 24 MHz pair, written by the firmware through descriptor 0xf7c/0xf84.
+    fn raw_timestamps(&self, kick: u64) -> Result<[u64; 2]> {
+        let offset = TIMESTAMPS + (kick as usize) % DESCRIPTORS * TIMESTAMP_STRIDE;
+        let words = [
+            self.graph.support.dword(offset)?.load(Ordering::Relaxed),
+            self.graph.support.dword(offset + 8)?.load(Ordering::Relaxed),
+        ];
+        fence(Ordering::Acquire);
+        Ok(words)
+    }
     pub(crate) fn pool_vacant(&self) -> bool {
         self.pool_phase == PoolPhase::Vacant
     }
@@ -1415,6 +1550,7 @@ impl Queue {
         let cursor = Rings::publish_control(init, &record)?;
         self.pool_phase = PoolPhase::ReleaseSent(cursor);
         self.release_sent_ns = Some(crate::g17::now_ns());
+        self.pool_used = false;
         fence(Ordering::SeqCst);
         Ok(())
     }
@@ -1455,6 +1591,9 @@ impl Queue {
         ring: DescriptorRing,
     ) -> Result<(u16, u64)> {
         if !self.can_rearm() { return Err(EAGAIN); }
+        // The item ring stays continuous across an owner change. Zeroing it here (an earlier
+        // attempt) crashed the primary firmware at P+0x12aa4: its walk from its own cursor to
+        // the producer dereferenced a cleared slot (FAR 0, asahi-reuse11-boot).
         self.graph.rearm_ring(ring)?;
         self.pool.rearm(pages)?;
         self.pool_phase = PoolPhase::Populated;
@@ -1474,15 +1613,17 @@ impl Queue {
             || self.active.len != 0 || self.replays.len != 0 || self.previous.is_some()
             || (self.installed && !self.retirement_ready)
             || self.pool_phase != PoolPhase::Populated { return Err(EAGAIN); }
-        if self.installed {
+        let release = self.installed && (self.pool_used || !crate::g17::fw::compute::g17g_selected());
+        if release {
             let record = ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
             let cursor = Rings::publish_control(init, &record)?;
             self.pool_phase = PoolPhase::ReleaseSent(cursor);
-        self.release_sent_ns = Some(crate::g17::now_ns());
+            self.release_sent_ns = Some(crate::g17::now_ns());
+            self.pool_used = false;
         } else { self.pool_phase = PoolPhase::Vacant; self.release_sent_ns = None; }
         self.growing = true;
         self.growth_blocks = blocks;
-        Ok(self.installed)
+        Ok(release)
     }
 
     pub(crate) fn finish_growth(&mut self, init: &crate::g17::initdata::InitData,
@@ -1699,10 +1840,17 @@ impl Graph {
             || cursors.count != ITEM_RING_ENTRIES
             || expected >= ITEM_RING_ENTRIES
         {
+            if crate::g17::runtime::reuse_trace_enabled() {
+                pr_info!("J704_REUSE append expected={} producer={} consumer={} count={}\n",
+                    expected, cursors.producer, cursors.consumer, cursors.count);
+            }
             return Err(EBUSY);
         }
         let next = (expected + 1) % ITEM_RING_ENTRIES;
         if next == cursors.consumer {
+            if crate::g17::runtime::reuse_trace_enabled() {
+                pr_info!("J704_REUSE append ring full at {}\n", expected);
+            }
             return Err(EBUSY);
         }
         let slot = self.graph.dword(ITEMS + expected as usize * 8)?;
@@ -1779,11 +1927,41 @@ impl Queue {
         let work_node = work.node_va()?;
         let timestamp_va = packet.completion.compute_timestamp_va()?;
         let kick_timestamp = self.kick.timestamp();
+        // This kick's own raw timestamp slot, cleared before the descriptor names it: the
+        // firmware keeps the minimum start and the maximum end, so a stale value would win.
+        let timestamp_raw = {
+            let offset =
+                TIMESTAMPS + (kick_timestamp.get() as usize) % DESCRIPTORS * TIMESTAMP_STRIDE;
+            let support = &self.graph.support;
+            support.dword(offset)?.store(0, Ordering::Relaxed);
+            support.dword(offset + 8)?.store(0, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            [support.gpu_va() + offset as u64, support.gpu_va() + (offset + 8) as u64]
+        };
+        // Native reserves and zeroes a fresh 64-byte UMA usage record per submitted command and
+        // publishes the same record offset through the client alias (0x14070) and the firmware
+        // alias (descriptor 0xfcb); the firmware reads it back for the queue's classification
+        // (sol-hal300-buffer-size-audit-study.md 3.1). One record per descriptor slot shares the
+        // descriptor's protected lifetime; every kick used to name the same first record.
+        let usage_offset = if crate::g17::fw::compute::g17g_selected() {
+            let offset = (kick_timestamp.slot() as usize % DESCRIPTORS) * USAGE_RECORD;
+            let usage = &self.graph.usage;
+            for word in (0..USAGE_RECORD).step_by(8) {
+                usage.dword(offset + word)?.store(0, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            offset as u64
+        } else {
+            0
+        };
         let kick_parent = self.kick.parent();
         let qid = self.qid();
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
         let (descriptor_high, descriptor_low) =
             self.graph.descriptor_vas(kick_timestamp.slot() as u8)?;
+        // `first` is the fresh-queue layout: descriptor at item 0, producer 1, a new context
+        // item. A queue changing owner keeps its item ring running (the firmware walks on from
+        // its own cursor), so it is not a first kick; only its QueueConfig re-registers.
         let first = !self.installed && self.ordinal == 0;
         let entry_signal = first
             || dependencies
@@ -1812,8 +1990,8 @@ impl Queue {
             kick: kick_timestamp,
             preempt_va: addresses.preempt,
             operand_state_va: addresses.operand,
-            usage_va: addresses.usage,
-            usage_fw_va: self.graph.usage.gpu_va(),
+            usage_va: addresses.usage + usage_offset,
+            usage_fw_va: self.graph.usage.gpu_va() + usage_offset,
             free_list_slot: u32::from(self.pool.id()),
             free_list_control_va: self.pool.control_va(),
             stamp_va: self.graph.support.gpu_va() + STAMP as u64,
@@ -1821,6 +1999,14 @@ impl Queue {
             status_va: [
                 self.graph.support.gpu_va() + 0x310,
                 self.graph.support.gpu_va() + 0x318,
+            ],
+            timestamp_raw_va: timestamp_raw,
+            // The G17G footer names two more status words at descriptor 0xf9c/0xfa4.
+            // The firmware writes them; this driver never reads them, so they point at
+            // the next unused pair of this queue's own support object.
+            extra_status_va: [
+                self.graph.support.gpu_va() + 0x320,
+                self.graph.support.gpu_va() + 0x328,
             ],
             timestamp_va,
         };
@@ -1832,11 +2018,13 @@ impl Queue {
         self.free_list_generation = u64::from(packet.context.scheduler_generation());
         let policy = packet.context.policy();
         let ring = 1u8 << policy.priority();
-        let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
+        let config =
+            self.queue_config(&identity, first || self.reinstall, args.context_id, policy, &packet)?;
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let kick_args = KickArgs {
+            typed_dependencies: crate::g17::fw::compute::g17g_selected(),
             qid,
             timestamp: kick_timestamp,
             parent: kick_parent,
@@ -1865,7 +2053,12 @@ impl Queue {
                 failure_deferred: false,
                 qos_pending: false,
             })
-            .map_err(|_| EBUSY)?;
+            .map_err(|_| {
+                if crate::g17::runtime::reuse_trace_enabled() {
+                    pr_info!("J704_REUSE step=active_push\n");
+                }
+                EBUSY
+            })?;
         self.retirement_ready = false;
         let mut visible = false;
         let mut accounted = false;
@@ -1993,6 +2186,8 @@ impl Queue {
             let notify_activation = self.outer_started & ring == 0;
             self.outer_started |= ring;
             self.installed = true;
+            self.reinstall = false;
+            self.pool_used = true;
             self.published_config = Some(identity);
             self.ordinal = ordinal;
             let (accepted, state) = host.epoch()?;
@@ -2056,6 +2251,9 @@ impl Queue {
     ) -> Result<(u64, BindingAddresses)> {
         let (epoch, state) = host.epoch()?;
         if state != 0 {
+            if crate::g17::runtime::reuse_trace_enabled() {
+                pr_info!("J704_REUSE step=preflight_state state={}\n", state);
+            }
             return Err(EBUSY);
         }
         let replay_front = self
@@ -2292,4 +2490,20 @@ impl Queue {
         self.released_at = now_ns();
         Ok((false, retired))
     }
+}
+
+/// The GPU's 24 MHz timestamp domain read from the CPU generic timer. On M5 the counter runs at
+/// CNTFRQ (1 GHz) from the same origin as the GPU stamps.
+fn host_timestamp_ticks() -> u64 {
+    let (count, freq): (u64, u64);
+    // SAFETY: reading the EL0-accessible generic timer registers has no side effects.
+    unsafe {
+        core::arch::asm!("isb", "mrs {}, cntvct_el0", out(reg) count);
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) freq);
+    }
+    if freq == 0 {
+        return 0;
+    }
+    // No 128-bit division in the kernel: whole seconds, then the remainder (< freq * 24e6).
+    (count / freq) * 24_000_000 + (count % freq) * 24_000_000 / freq
 }

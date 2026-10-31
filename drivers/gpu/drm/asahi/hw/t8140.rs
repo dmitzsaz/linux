@@ -42,6 +42,8 @@ pub(crate) const CONFIG: Config = Config {
         va: 0x10_0008_0000,
         size: 0x8000,
     },
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    hal300: None,
 };
 
 use crate::g17::fw::initdata::{PerfConfig, RegisterWindow, PERF_STATES};

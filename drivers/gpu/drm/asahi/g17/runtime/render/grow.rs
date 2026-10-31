@@ -20,6 +20,11 @@ pub(super) struct Grow {
     release_attempts: u16,
 }
 impl Grow {
+    /// Requests the host has queued and not yet answered, for the read-only observation.
+    pub(super) fn observation(&self) -> (usize, bool) {
+        (self.requests.len(), self.active.is_some())
+    }
+
     pub(super) fn new() -> Result<Self> {
         Ok(Self {
             requests: KVec::with_capacity(2 * EVENT_SLOTS as usize, GFP_KERNEL)?,
@@ -40,7 +45,10 @@ impl RenderState {
                 entry.published
                     && u32::from(entry.reservation.buffer.0) == request.buffer_slot
                     && entry.context.as_ref().is_some_and(|context| {
-                        request.vm_slot == -1 || request.vm_slot as u32 == context.id()
+                        // HAL300 names the requesting context exactly; the G17P -1 wildcard
+                        // is not a HAL300 ownership witness (sol-render-pb-tiles-study.md).
+                        (request.vm_slot == -1 && !crate::g17::fw::buffer::hal300_units())
+                            || request.vm_slot as u32 == context.id()
                     })
             })
         })
@@ -56,6 +64,39 @@ impl RenderState {
 
 impl crate::g17::Firmware {
     pub(in crate::g17) fn queue_tvb_grow(&mut self, request: TvbGrowRequest) -> Result {
+        if crate::g17::fw::compute::g17g_selected() && !crate::g17::fw::buffer::hal300_units() {
+            // HAL300 cannot grow today's parameter buffer truthfully: its 128-KiB inventory rows
+            // are not the 512-KiB units the native grow worker (P+0x21868) expands
+            // (sol-render-pb-tiles-study.md). Answer the live request with the native refusal
+            // (kind 8, grew=0); the firmware then continues the pass through its partial-render
+            // path instead of waiting forever. Each request identity is answered once.
+            static ANSWERED: core::sync::atomic::AtomicU64 =
+                core::sync::atomic::AtomicU64::new(u64::MAX);
+            let identity = u64::from(request.buffer_slot)
+                | u64::from(request.counter) << 8
+                | u64::from(request.vm_slot as u32) << 40
+                | u64::from(request.subpipe) << 56;
+            if request.halt_count != self.recovery.generation()
+                || ANSWERED.load(core::sync::atomic::Ordering::Relaxed) == identity
+                || self.queues.render.grow.reply.is_some()
+            {
+                return Ok(());
+            }
+            static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+            if REPORTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 8 {
+                pr_warn!(
+                    "asahi: HAL300 parameter-buffer grow request refused: buffer slot {}, vm slot {}, counter {}, subpipe {}, halt {}\n",
+                    request.buffer_slot,
+                    request.vm_slot,
+                    request.counter,
+                    request.subpipe,
+                    request.halt_count
+                );
+            }
+            ANSWERED.store(identity, core::sync::atomic::Ordering::Relaxed);
+            self.queues.render.grow.reply = Some((request, false, 0));
+            return Ok(());
+        }
         let render = &mut self.queues.render;
         if request.halt_count != self.recovery.generation()
             || render.grow.active == Some(request)
@@ -185,6 +226,19 @@ impl crate::g17::Firmware {
                 word.store(value, Ordering::Relaxed);
             }
             fence(Ordering::SeqCst);
+            if crate::g17::fw::compute::g17g_selected() {
+                static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                if LOGGED.fetch_add(1, Ordering::Relaxed) < 32 {
+                    pr_info!(
+                        "asahi: HAL300 parameter-buffer host growth: slot {} context {} buffer {} now {} blocks of {:#x}\n",
+                        slot,
+                        pair.context().id(),
+                        buffer_id,
+                        pair.manager().blocks(),
+                        crate::g17::fw::buffer::tvb_block_size(),
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -319,6 +373,25 @@ impl crate::g17::Shared {
                     false
                 }
             };
+            if crate::g17::fw::buffer::hal300_units() {
+                // HAL300 growth is new (phase2n30); log the first replies so a boot shows whether
+                // the firmware asked and what it got.
+                static LOGGED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+                if LOGGED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+                    let blocks = slot
+                        .and_then(|slot| firmware.queues.render.entries[slot].as_mut())
+                        .and_then(|entry| entry.pair.as_mut())
+                        .map(|pair| pair.manager().blocks());
+                    pr_info!(
+                        "asahi: HAL300 parameter-buffer grow: buffer slot {}, vm slot {}, counter {}, grew {}, blocks now {:?}\n",
+                        request.buffer_slot,
+                        request.vm_slot,
+                        request.counter,
+                        grew,
+                        blocks
+                    );
+                }
+            }
             firmware.queues.render.grow.reply = Some((request, grew, 0));
             if !firmware.flush_tvb_reply()? {
                 return Ok(());

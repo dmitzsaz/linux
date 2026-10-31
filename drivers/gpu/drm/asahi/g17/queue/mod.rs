@@ -340,6 +340,17 @@ impl<B: Backend> Queue<B> {
                 Validated::Render { .. } => Engine::Render,
                 Validated::Compute { .. } => Engine::Compute,
             };
+            // HAL300 admits only the narrow render profile the G17G programs are implemented
+            // for; everything else is refused before any firmware structure is built. The
+            // reason is logged because a first draw is reached by widening this profile one
+            // field at a time.
+            if super::fw::compute::g17g_selected() {
+                if let Some(reason) = payload.hal300_refusal() {
+                    pr_err!("asahi: HAL300 render refused: {} is outside the implemented profile\n",
+                            reason);
+                    return Err(EINVAL);
+                }
+            }
             let order = Order::new(
                 base,
                 preceding,

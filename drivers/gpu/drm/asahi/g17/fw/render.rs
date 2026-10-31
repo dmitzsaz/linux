@@ -52,6 +52,20 @@ const VDM_OFFSET_LIMIT: u64 = 1 << 39;
 /// offsets.
 const DEFLAKE_20: u64 = 0x20;
 const DEFLAKE_2A0: u64 = 0x2a0;
+/// G17G sub-buffer offsets: the native Metal producer reserves 0x300 bytes (64-byte aligned)
+/// for the first and 0x680 for the second (0x2160a0304..0x2160a0334, 0x215eff6d4..0x215eff6e8);
+/// the G17P pair above overlaps them by 0x60 bytes (sol-render-tiles-axis-study.md).
+const DEFLAKE_FIRST_G17G: u64 = 0x40;
+const DEFLAKE_SECOND_G17G: u64 = 0x340;
+
+/// Offsets of the first and second deflake sub-buffers for the selected generation.
+fn deflake_offsets() -> (u64, u64) {
+    if g17g() {
+        (DEFLAKE_FIRST_G17G, DEFLAKE_SECOND_G17G)
+    } else {
+        (DEFLAKE_20, DEFLAKE_2A0)
+    }
+}
 
 const TA_REGISTERS: usize = 73;
 const TA_REGISTERS_MAX: usize = TA_REGISTERS + 1;
@@ -82,12 +96,26 @@ const TILE_SIZE: u64 = 32;
 const MACRO_TILES: u64 = 4;
 const REGION_ENTRY_SIZE: u64 = 5;
 /// Highest number of samples per pixel, as a power of two.
-const SAMPLES_LOG2_MAX: u8 = 2;
+pub(crate) const SAMPLES_LOG2_MAX: u8 = 2;
+
+/// G17G also renders 8x: the native sample-code table at 0xfffffe0007152220 maps 1/2/4/8
+/// samples to codes 0/1/2/3 (= log2), the same utile-word field this builder already fills,
+/// and Honeykrisp advertises VK_SAMPLE_COUNT_8_BIT on M5 (dEQP-VK...raster_samples.samples_8.*
+/// was refused here with EINVAL -> device lost, asahi-pw15-boot).
+pub(crate) fn samples_log2_max() -> u8 {
+    if crate::g17::fw::compute::g17g_selected() {
+        3
+    } else {
+        SAMPLES_LOG2_MAX
+    }
+}
 /// Bytes of tile buffer per block.
 const TIB_BLOCK_SIZE: u64 = 2048;
 const TILE_CONFIG_BASE: u64 = 0x280;
 const TILE_CONFIG_LAYERED: u64 = 1 << 0;
 const TILE_CONFIG_PROCESS_EMPTY_TILES: u64 = 1 << 16;
+/// Tile-config bits 19:16 the G17G partial constructors clear before inserting their phase.
+const TILE_CONFIG_PARTIAL_MASK_G17G: u64 = 0xf << 16;
 const AUX_FB_FLAGS_BASE: u64 = 0xc000;
 /// The pass rasterizes at most four known primitives (userspace's promise).
 const AUX_FB_FLAGS_FEW_PRIMITIVES: u64 = 1 << 0;
@@ -117,12 +145,101 @@ const UTILE_CONFIG_SIZE_MASK: u64 = 0xf000;
 /// surface.
 const ZLS_PARTIAL_DEPTH: u64 = 1 << 15 | 1 << 19;
 const ZLS_PARTIAL_STENCIL: u64 = 1 << 14 | 1 << 18;
+/// G17G partial ZLS construction (0xfffffe0008bdc5d8..0x8bdc62c, 0x8bdc790..0x8bdc7d4).
+const ZLS_FORCE_LOAD_DEPTH: u64 = 0x8000;
+const ZLS_FORCE_LOAD_STENCIL: u64 = 0x4000;
+const ZLS_STORE_DEPTH: u64 = 0x8_0000;
+const ZLS_STORE_STENCIL: u64 = 0x4_0000;
+const ZLS_PARTIAL_STORE_MASK: u64 = 0xf0ff_ffff_ffff_febf;
+const ZLS_STORE_DEPTH_COMPRESS: u64 = 0x40;
+const ZLS_STORE_STENCIL_COMPRESS: u64 = 0x100;
 const STENCIL_CLEAR_BASE: u32 = 0x300;
 /// Value of the ZLS swizzle registers and descriptor field.
 const ZLS_SWIZZLE: u32 = 0x0404_0404;
 /// Value of register 0x15359 in the partial store and resume arrays; the
 /// main array writes zero.
 const UNK_15359_PARTIAL: u64 = 0x20;
+
+// ---------------------------------------------------------------------------
+// G17G (M5, HAL300) render programs
+//
+// Recovered from the native TA constructor 0xfffffe0008bddf00 and fragment constructor
+// 0xfffffe0008bcd254 by the delegated native study in
+// `features/gpu-bringup/sol-render-study.md`, whose complete per-write map with every input
+// offset is `sol-render-register-map-complete.json`. The arrays below are emitted from that
+// map in native order by `features/asahi-t8142/render/emit_registers.py`, so each entry is
+// transcribed mechanically; the script's override table names the native evidence for every
+// write that differs from the G17P list.
+//
+// The profile implemented here is the native disabled-feature one: no shader-context (SCS)
+// request, no ray query, no additional optional features. Each register whose native producer
+// is not yet established writes the zero that profile publishes.
+// ---------------------------------------------------------------------------
+
+/// Main writes of the G17G programs and their checkpoints, from the native constructors'
+/// kick-descriptor stores for the disabled-feature profile.
+const TA_REGISTERS_G17G: usize = 82;
+const FRAGMENT_REGISTERS_G17G: usize = 90;
+const PARTIAL_STORE_REGISTERS_G17G: usize = 17;
+const PARTIAL_RESUME_REGISTERS_G17G: usize = 24;
+const PARTIAL_LOAD_REGISTERS_G17G: usize = 12;
+const TA_CHECKPOINTS_G17G: [u16; 3] = [79, 82, 82];
+const FRAGMENT_CHECKPOINTS_G17G: [u16; 3] = [87, 89, 89];
+
+/// G17G packs the macro-tile block counts in ten-bit fields where G17P uses nine
+/// (0xfffffe0008bdcdb4..0xfffffe0008bdcde4, shift vectors 0xfffffe000714f2b8 and
+/// 0xfffffe000714f2c0): a 32x32 target gives 0x40200c instead of 0x10100c.
+const BLOCK_SHIFTS_G17G: [u32; 2] = [10, 20];
+/// G17G tile-state packing: the utile nibble begins at bit 38 and the tile-minus-one fields at
+/// 42 and 52 (0xfffffe0008bcedec..0xfffffe0008bceea8). The same 32x32 fixture gives
+/// 0x2a00003717f where G17P gives 0xa200003717f.
+const TILE_STATE_UTILE_SHIFT_G17G: u32 = 26;
+const TILE_STATE_TILES_X_SHIFT_G17G: u32 = 42;
+const TILE_STATE_TILES_Y_SHIFT_G17G: u32 = 52;
+/// TA control word with the ordinary flags (0xfffffe0008bdebd0..0xfffffe0008bdec50); G17P
+/// publishes only the low [`UNK_1C8F8`].
+const UNK_1C8F8_G17G: u64 = 0x10c0_8860;
+/// Value the native low-accelerator branch gives register 0x10131 (call 0xfffffe0008bded68).
+/// It is not the separate 0x10139 MSAA operand.
+const UNK_10131_G17G: u64 = 0x88;
+/// TA control word the native constructor builds for the normal flag
+/// (0xfffffe0008bdf400..0xfffffe0008bdf488) and then ORs 1 into (0xfffffe0008be0164), where
+/// G17P writes zero and then one.
+const UNK_1C898_G17G: u64 = 0x700;
+/// The native TA constructor aligns the scene scratch operand of 0x1ca30 and 0x16c39 down to
+/// 64 bytes (0xfffffe0008bdfa70, 0xfffffe0008bdfac8); fragment 0x1ca28 keeps its 16-byte form.
+const TA_PM_SCRATCH_MASK_G17G: u64 = !0x3f;
+/// Constant of the new TA geometry group (call 0xfffffe0008bdf158).
+const UNK_1CA60_G17G: u64 = 0x200;
+/// Fragment 0x10791 keeps this bit even without scratch
+/// (0xfffffe0008bcdaf0..0xfffffe0008bcdb5c).
+const UNK_10791_G17G_BIT: u64 = 1 << 45;
+/// The native partial lists carry the phase in the tile configuration
+/// (0xfffffe0008bdc080..0xfffffe0008bdc0f0) instead of G17P's separate 0x15359 write.
+const UNK_10039_SPM_BIT: u64 = 1 << 21;
+
+/// Inventory word a scratch-free G17G pass publishes in the render analogues of the compute
+/// 0x101d1 register: TA 0x101c9 (packed at 0xfffffe0008bdf798..0x8bdf7a4) and fragment 0x101c1
+/// (0xfffffe0008bcf0f8..0x8bcf104). The native constructor packs them exactly as the compute
+/// word, and on compute a published zero stalled every launch silently - no thread work, no
+/// fault, firmware alive - which the auto66..auto68 bisect isolated to that single value.
+/// The first M5 render pair showed the same signature with G17P's zero here: both work slots
+/// consumed, no stamp, no completion, no fault (boot asahi-render9-boot).
+const G17G_INVENTORY_DISABLED: u64 = 0xffff_ffff_0000;
+
+/// Value of a render inventory register for `scratch`.
+fn inventory_word_g17g(scratch: super::compute::ScratchRequest) -> u64 {
+    if scratch.enabled() {
+        scratch.size_word()
+    } else {
+        G17G_INVENTORY_DISABLED
+    }
+}
+
+/// Whether this device runs the G17G programs.
+fn g17g() -> bool {
+    super::compute::g17g_selected()
+}
 /// Required value of register 0x15049 and of fragment descriptor field
 /// +0x1f50.
 const UNK_15049: u64 = 0x10_0000;
@@ -367,14 +484,15 @@ impl Geometry {
         let mtile_x = tiles_x.div_ceil(MACRO_TILES).next_multiple_of(4);
         let mtile_y = tiles_y.div_ceil(MACRO_TILES).next_multiple_of(4);
         let macro_tiles = mtile_x * mtile_y;
+        let [low, high] = if g17g() { BLOCK_SHIFTS_G17G } else { [9, 18] };
         Ok(Self {
             tiles_x,
             tiles_y,
             region_size: (REGION_ENTRY_SIZE * macro_tiles * utiles).div_ceil(4),
             macro_tiles,
             utile_slots: 2 * macro_tiles * utiles,
-            x_blocks: (3 * mtile_x) | ((2 * mtile_x) << 9) | (mtile_x << 18),
-            y_blocks: (3 * mtile_y) | ((2 * mtile_y) << 9) | (mtile_y << 18),
+            x_blocks: (3 * mtile_x) | ((2 * mtile_x) << low) | (mtile_x << high),
+            y_blocks: (3 * mtile_y) | ((2 * mtile_y) << low) | (mtile_y << high),
             screen: (tiles_y - 1) << 12 | (tiles_x - 1),
             pixels: (width - 1) | (height - 1) << 16,
             macro_size: (mtile_y * utiles_y) | ((mtile_x * utiles_x) << 16),
@@ -389,6 +507,15 @@ struct PassWords {
     layer_mode: u64,
     tib_blocks: u64,
     partial_zls_control: u64,
+    /// G17G per-phase partial ZLS words (0xfffffe0008bdbdb8..0x8bdc894): store keeps the main
+    /// word with backing-dependent store/compression bits, resume adds the forced loads, load
+    /// is the main word with the forced loads.
+    partial_store_zls_g17g: u64,
+    partial_resume_zls_g17g: u64,
+    partial_load_zls_g17g: u64,
+    /// Bit 16 of the G17G partial-store tile configuration: set when a depth or stencil
+    /// surface is stored (0xfffffe0008bdbfdc..0x8bdbff4).
+    partial_store_zls_bit_g17g: u64,
     aux_fb_flags: u64,
     bg_rsrc_spec: u64,
     bg_va: u64,
@@ -402,7 +529,7 @@ struct PassWords {
 
 impl PassWords {
     fn new(pass: &RenderPass) -> Result<Self> {
-        if pass.samples_log2 > SAMPLES_LOG2_MAX {
+        if pass.samples_log2 > samples_log2_max() {
             return Err(EINVAL);
         }
         let samples = 1u64 << pass.samples_log2;
@@ -432,6 +559,17 @@ impl PassWords {
             partial_zls_control |= ZLS_PARTIAL_STENCIL;
         }
 
+        let has_depth = pass.depth.va != 0;
+        let has_stencil = pass.stencil.va != 0;
+        let force_load = if has_depth { ZLS_FORCE_LOAD_DEPTH } else { 0 }
+            | if has_stencil { ZLS_FORCE_LOAD_STENCIL } else { 0 };
+        let store_zls = ((pass.zls_control
+            | if has_depth { ZLS_STORE_DEPTH } else { 0 }
+            | if has_stencil { ZLS_STORE_STENCIL } else { 0 })
+            & ZLS_PARTIAL_STORE_MASK)
+            | if pass.depth.compression_va != 0 { ZLS_STORE_DEPTH_COMPRESS } else { 0 }
+            | if pass.stencil.compression_va != 0 { ZLS_STORE_STENCIL_COMPRESS } else { 0 };
+
         let mut aux_fb_flags = AUX_FB_FLAGS_BASE;
         if pass.depth_bias_is_int {
             aux_fb_flags |= AUX_FB_FLAGS_DBIAS_INT;
@@ -457,6 +595,14 @@ impl PassWords {
                 * samples)
                 .div_ceil(TIB_BLOCK_SIZE),
             partial_zls_control,
+            partial_store_zls_g17g: store_zls,
+            partial_resume_zls_g17g: store_zls | force_load,
+            partial_load_zls_g17g: pass.zls_control | force_load,
+            partial_store_zls_bit_g17g: if has_depth || has_stencil {
+                TILE_CONFIG_PROCESS_EMPTY_TILES
+            } else {
+                0
+            },
             aux_fb_flags,
             bg_rsrc_spec: rsrc_spec(pass.bg.rsrc_spec),
             bg_va: usc(pass.bg.offset)?,
@@ -580,6 +726,322 @@ fn ta_registers(
         RegisterWrite::new(0x1c898, 1),
     ])
 }
+
+/// The G17G tiling program, in the order of the native constructor 0xfffffe0008bddf00.
+fn ta_registers_g17g(
+    args: &RenderArgs<'_>,
+    g: &Geometry,
+    w: &PassWords,
+) -> Result<[RegisterWrite; TA_REGISTERS_G17G]> {
+    let p = args.pass;
+    let r = args.resources;
+    let tilemap = user_offset(r.tilemap_va)?;
+    let layermeta = user_offset(r.layermeta_va)?;
+    let heapmeta = user_offset(r.heapmeta_va)? | 1 << 63;
+    let tpc = user_offset(r.tpc_va)?;
+    let deflake = u64::from(user_offset32(r.deflake_va)?);
+    let (first_offset, second_offset) = deflake_offsets();
+    let deflake_20 = u64::from(user_offset32(offset_va(r.deflake_va, first_offset)?)?);
+    let deflake_2a0 = u64::from(user_offset32(offset_va(r.deflake_va, second_offset)?)?);
+    let vdm = user_offset(p.vdm_va)?;
+    if vdm >= VDM_OFFSET_LIMIT {
+        return Err(EINVAL);
+    }
+    let key = work_key(r.context_id, args.ta.state_word);
+    let ids = r.ta_ids.word();
+    let rt = args.ray_query[0];
+    let ift = rt.intersection.words();
+
+    Ok([
+        RegisterWrite::new(0x01748, 1),
+        RegisterWrite::new(0x10141, 0x200),
+        RegisterWrite::new(0x1c039, tilemap),
+        RegisterWrite::new(0x1c9c8, tilemap),
+        RegisterWrite::new(0x1c0a1, tpc),
+        RegisterWrite::new(0x1c031, heapmeta),
+        RegisterWrite::new(0x1c9c0, heapmeta),
+        RegisterWrite::new(0x1c051, 0x003a_0012_006b_0003),
+        RegisterWrite::new(0x1c061, 1),
+        RegisterWrite::new(0x10149, w.utile_config),
+        RegisterWrite::new(0x10139, p.msaa_control),
+        RegisterWrite::new(0x10111, deflake_2a0),
+        RegisterWrite::new(0x1c9b0, deflake_2a0),
+        RegisterWrite::new(0x10119, deflake_20),
+        RegisterWrite::new(0x1c9b8, deflake_20),
+        RegisterWrite::new(0x1c958, 1),
+        RegisterWrite::new(0x1c950, deflake | 1 << 50),
+        RegisterWrite::new(0x1c930, 0),
+        RegisterWrite::new(0x1c880, vdm),
+        RegisterWrite::new(0x1c079, layermeta),
+        RegisterWrite::new(0x1c9d8, layermeta),
+        RegisterWrite::new(0x10151, 0),
+        RegisterWrite::new(0x1c199, 0),
+        RegisterWrite::new(0x1c1a1, 0),
+        RegisterWrite::new(0x1c1a9, 0),
+        RegisterWrite::new(0x1c1b1, 0),
+        RegisterWrite::new(0x1c1b9, 0),
+        RegisterWrite::new(0x0d499, 0),
+        RegisterWrite::new(0x0d419, UNK_0D411),
+        RegisterWrite::new(0x0a5a1, UNK_0A599),
+        RegisterWrite::new(0x1c8f8, UNK_1C8F8_G17G),
+        RegisterWrite::new(0x1c0b1, g.region_size),
+        RegisterWrite::new(0x1c850, g.region_size),
+        RegisterWrite::new(0x10131, UNK_10131_G17G),
+        RegisterWrite::new(0x10121, p.ppp_control),
+        RegisterWrite::new(0x10129, g.pixels),
+        RegisterWrite::new(0x101b9, g.screen),
+        RegisterWrite::new(0x1c069, g.x_blocks),
+        RegisterWrite::new(0x1c071, g.y_blocks),
+        RegisterWrite::new(0x1c081, g.macro_tiles),
+        RegisterWrite::new(0x1c0a9, g.utile_slots),
+        RegisterWrite::new(0x1ca50, g.screen),
+        RegisterWrite::new(0x1ca58, w.utile_config),
+        RegisterWrite::new(0x1ca60, UNK_1CA60_G17G),
+        RegisterWrite::new(0x1ca70, g.x_blocks),
+        RegisterWrite::new(0x1ca78, g.y_blocks),
+        RegisterWrite::new(0x1ca68, g.macro_tiles),
+        RegisterWrite::new(0x10171, 0x100),
+        RegisterWrite::new(0x10169, w.layer_mode),
+        RegisterWrite::new(0x1c8e0, u64::MAX),
+        RegisterWrite::new(0x1c8e8, u64::MAX),
+        RegisterWrite::new(0x1c898, UNK_1C898_G17G),
+        RegisterWrite::new(0x101e1, UNK_101D9),
+        RegisterWrite::new(0x1c9e8, w.layer_mode & LAYER_MODE_PIPE_MASK),
+        RegisterWrite::new(0x1a099, ift[0]),
+        RegisterWrite::new(0x1a0a1, ift[1]),
+        RegisterWrite::new(0x1a069, ift[2]),
+        RegisterWrite::new(0x1a071, ift[3]),
+        RegisterWrite::new(0x1a0c9, ift[4]),
+        RegisterWrite::new(0x1a0d1, ift[5]),
+        RegisterWrite::new(0x101c9, inventory_word_g17g(rt.scratch)),
+        RegisterWrite::new(0x0d471, rt.scratch.tail_word()),
+        RegisterWrite::new(0x1a0f1, rt.scratch.stack_word()),
+        RegisterWrite::new(0x1a149, 0),
+        RegisterWrite::new(0x10799, rt.scratch.window_word()),
+        RegisterWrite::new(0x1c830, u64::from(r.pb_slot)),
+        RegisterWrite::new(0x1ca30, r.pm_scratch & TA_PM_SCRATCH_MASK_G17G),
+        RegisterWrite::new(0x16c39, r.pm_scratch & TA_PM_SCRATCH_MASK_G17G),
+        RegisterWrite::new(0x1c910, r.pm_metric),
+        RegisterWrite::new(0x1ca10, ids),
+        RegisterWrite::new(0x014a1, ids),
+        RegisterWrite::new(0x0a349, ids),
+        RegisterWrite::new(0x0a739, 0),
+        RegisterWrite::new(0x10209, key),
+        RegisterWrite::new(0x1c9f0, key),
+        RegisterWrite::new(0x14320, key),
+        RegisterWrite::new(0x14308, u64::from(r.free_list_slot)),
+        RegisterWrite::new(0x14318, r.ta_status_va | 1),
+        RegisterWrite::new(0x01740, 1),
+        RegisterWrite::new(0x0a739, 0),
+        RegisterWrite::new(0x1c880, deflake_2a0),
+        RegisterWrite::new(0x1c898, UNK_1C898_G17G | 1),
+    ])
+}
+
+/// The G17G fragment program, in the order of the native constructor 0xfffffe0008bcd254.
+fn fragment_registers_g17g(
+    args: &RenderArgs<'_>,
+    g: &Geometry,
+    w: &PassWords,
+) -> [RegisterWrite; FRAGMENT_REGISTERS_G17G] {
+    let p = args.pass;
+    let r = args.resources;
+    let mut tile_state = TILE_STATE_BASE
+        | (w.utile_config & UTILE_CONFIG_SIZE_MASK) << TILE_STATE_UTILE_SHIFT_G17G
+        | (g.tiles_x - 1) << TILE_STATE_TILES_X_SHIFT_G17G
+        | (g.tiles_y - 1) << TILE_STATE_TILES_Y_SHIFT_G17G;
+    if p.layers > 1 {
+        tile_state |= TILE_STATE_LAYERED;
+    }
+    let key = work_key(r.context_id, args.fragment.state_word);
+    let ids = r.fragment_ids.word();
+    let rt = args.ray_query[1];
+    let ift = rt.intersection.words();
+
+    [
+        RegisterWrite::new(0x01739, 1),
+        RegisterWrite::new(0x10009, w.utile_config),
+        RegisterWrite::new(0x15379, w.eot_rsrc_spec),
+        RegisterWrite::new(0x15381, w.eot_va),
+        // Second EOT-family pair (command +0x7a0/+0x7a8, 0xfffffe0008bcd5f0/0x8bcd64c). Metal
+        // copies the normal EOT here or falls back to it (sol-render-wide-target-study.md);
+        // zero left a null program for passes with geometry.
+        RegisterWrite::new(0x153b1, w.eot_rsrc_spec),
+        RegisterWrite::new(0x153b9, w.eot_va),
+        RegisterWrite::new(0x15369, w.bg_rsrc_spec),
+        RegisterWrite::new(0x15371, w.bg_va),
+        RegisterWrite::new(0x15131, u64::from(p.merge_upper_x)),
+        RegisterWrite::new(0x15139, u64::from(p.merge_upper_y)),
+        RegisterWrite::new(0x100a1, 0),
+        RegisterWrite::new(0x15069, 0),
+        RegisterWrite::new(0x15071, 0),
+        RegisterWrite::new(0x16058, 0),
+        RegisterWrite::new(0x10019, p.msaa_control),
+        RegisterWrite::new(0x16469, g.macro_size),
+        RegisterWrite::new(0x16030, g.macro_size),
+        RegisterWrite::new(0x16471, g.screen),
+        RegisterWrite::new(0x10791, rt.scratch.window_word() | 1 << 9 | UNK_10791_G17G_BIT),
+        RegisterWrite::new(0x16098, r.heapmeta_va),
+        RegisterWrite::new(0x15021, w.aux_fb_flags),
+        RegisterWrite::new(0x15211, u64::from(p.height) << 32 | u64::from(p.width)),
+        RegisterWrite::new(0x15049, UNK_15049),
+        RegisterWrite::new(0x10051, w.tib_blocks),
+        RegisterWrite::new(0x0d491, 0),
+        RegisterWrite::new(0x0d429, UNK_0D411),
+        RegisterWrite::new(0x0a5a9, UNK_0A599),
+        RegisterWrite::new(0x15321, p.depth_dimensions),
+        RegisterWrite::new(0x15301, u64::from(p.depth_clear)),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
+        RegisterWrite::new(0x15311, p.occlusion_query_va),
+        RegisterWrite::new(0x15319, p.zls_control),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
+        RegisterWrite::new(0x15351, 0),
+        RegisterWrite::new(0x15329, p.depth.va),
+        RegisterWrite::new(0x15331, p.depth.va),
+        RegisterWrite::new(0x15339, p.stencil.va),
+        RegisterWrite::new(0x15341, p.stencil.va),
+        RegisterWrite::new(0x15231, 0),
+        RegisterWrite::new(0x15221, 0),
+        RegisterWrite::new(0x15239, 0),
+        RegisterWrite::new(0x15229, 0),
+        RegisterWrite::new(0x15401, p.depth.stride),
+        RegisterWrite::new(0x15421, p.depth.stride),
+        RegisterWrite::new(0x15409, p.stencil.stride),
+        RegisterWrite::new(0x15429, p.stencil.stride),
+        RegisterWrite::new(0x153c1, p.depth.compression_va),
+        RegisterWrite::new(0x15411, p.depth.compression_stride),
+        RegisterWrite::new(0x153c9, p.depth.compression_va),
+        RegisterWrite::new(0x15431, p.depth.compression_stride),
+        RegisterWrite::new(0x153d1, p.stencil.compression_va),
+        RegisterWrite::new(0x15419, p.stencil.compression_stride),
+        RegisterWrite::new(0x153d9, p.stencil.compression_va),
+        RegisterWrite::new(0x15439, p.stencil.compression_stride),
+        RegisterWrite::new(0x16429, r.tilemap_va),
+        RegisterWrite::new(0x16060, r.layermeta_va),
+        RegisterWrite::new(0x16431, (4 * g.region_size) << 24),
+        RegisterWrite::new(0x10039, w.tile_config),
+        RegisterWrite::new(0x16020, 0),
+        RegisterWrite::new(0x16451, 0),
+        RegisterWrite::new(0x15359, 0),
+        RegisterWrite::new(0x16138, UNK_1C8F8),
+        RegisterWrite::new(0x16461, r.aux_fb_va),
+        RegisterWrite::new(0x16090, r.aux_fb_va),
+        RegisterWrite::new(0x101e9, UNK_101D9),
+        RegisterWrite::new(0x16068, tile_state),
+        RegisterWrite::new(0x1a0a9, ift[0]),
+        RegisterWrite::new(0x1a0b1, ift[1]),
+        RegisterWrite::new(0x1a079, ift[2]),
+        RegisterWrite::new(0x1a081, ift[3]),
+        RegisterWrite::new(0x1a0d9, ift[4]),
+        RegisterWrite::new(0x1a0e1, ift[5]),
+        RegisterWrite::new(0x101c1, inventory_word_g17g(rt.scratch)),
+        RegisterWrite::new(0x0d469, rt.scratch.tail_word()),
+        RegisterWrite::new(0x1a0f9, rt.scratch.stack_word()),
+        RegisterWrite::new(0x1a151, 0),
+        RegisterWrite::new(0x160e0, ids),
+        RegisterWrite::new(0x01499, ids),
+        RegisterWrite::new(0x0a341, ids),
+        RegisterWrite::new(0x1c838, u64::from(r.pb_slot)),
+        RegisterWrite::new(0x1ca28, r.pm_scratch),
+        RegisterWrite::new(0x0a741, 0),
+        RegisterWrite::new(0x10211, key),
+        RegisterWrite::new(0x10420, key),
+        RegisterWrite::new(0x14048, u64::from(r.free_list_slot)),
+        RegisterWrite::new(0x14080, r.fragment_status_va | 1),
+        RegisterWrite::new(0x01731, 1),
+        RegisterWrite::new(0x0a741, 0),
+        RegisterWrite::new(0x16020, 1),
+        RegisterWrite::new(0x16068, 0x4_0000),
+    ]
+}
+
+fn partial_store_registers_g17g(
+    p: &RenderPass,
+    w: &PassWords,
+) -> [RegisterWrite; PARTIAL_STORE_REGISTERS_G17G] {
+    [
+        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x15381, w.partial_eot_va),
+        // The second program/resource pair repeats the partial EOT (0xfffffe0008bdbf50,
+        // 0xfffffe0008bdbfb0); zero made a partial phase fetch from VA 0.
+        RegisterWrite::new(0x153b1, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x153b9, w.partial_eot_va),
+        // Native clears bits 19:16 before inserting the phase (0xfffffe0008bdc0bc); bit 16
+        // returns only with a partial depth/stencil store, which this profile does not admit.
+        RegisterWrite::new(
+            0x10039,
+            w.tile_config & !TILE_CONFIG_PARTIAL_MASK_G17G
+                | UNK_10039_SPM_BIT
+                | w.partial_store_zls_bit_g17g,
+        ),
+        RegisterWrite::new(0x15331, p.depth.va),
+        RegisterWrite::new(0x153c9, p.depth.compression_va),
+        RegisterWrite::new(0x15341, p.stencil.va),
+        RegisterWrite::new(0x153d9, p.stencil.compression_va),
+        RegisterWrite::new(0x15421, p.depth.stride),
+        RegisterWrite::new(0x15431, p.depth.compression_stride),
+        RegisterWrite::new(0x15429, p.stencil.stride),
+        RegisterWrite::new(0x15439, p.stencil.compression_stride),
+        RegisterWrite::new(0x15221, 0),
+        RegisterWrite::new(0x15229, 0),
+        RegisterWrite::new(0x15319, w.partial_store_zls_g17g),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
+    ]
+}
+
+fn partial_resume_registers_g17g(
+    p: &RenderPass,
+    w: &PassWords,
+) -> [RegisterWrite; PARTIAL_RESUME_REGISTERS_G17G] {
+    [
+        RegisterWrite::new(0x15379, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x15381, w.partial_eot_va),
+        RegisterWrite::new(0x153b1, w.partial_eot_rsrc_spec),
+        RegisterWrite::new(0x153b9, w.partial_eot_va),
+        RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
+        RegisterWrite::new(0x15371, w.partial_bg_va),
+        RegisterWrite::new(0x10039, w.tile_config & !TILE_CONFIG_PROCESS_EMPTY_TILES | UNK_10039_SPM_BIT),
+        RegisterWrite::new(0x15331, p.depth.va),
+        RegisterWrite::new(0x153c9, p.depth.compression_va),
+        RegisterWrite::new(0x15341, p.stencil.va),
+        RegisterWrite::new(0x153d9, p.stencil.compression_va),
+        RegisterWrite::new(0x15421, p.depth.stride),
+        RegisterWrite::new(0x15431, p.depth.compression_stride),
+        RegisterWrite::new(0x15429, p.stencil.stride),
+        RegisterWrite::new(0x15439, p.stencil.compression_stride),
+        RegisterWrite::new(0x15221, 0),
+        RegisterWrite::new(0x15229, 0),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
+        RegisterWrite::new(0x15329, p.depth.va),
+        RegisterWrite::new(0x153c1, p.depth.compression_va),
+        RegisterWrite::new(0x15339, p.stencil.va),
+        RegisterWrite::new(0x153d1, p.stencil.compression_va),
+        RegisterWrite::new(0x15319, w.partial_resume_zls_g17g),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
+    ]
+}
+
+fn partial_load_registers_g17g(
+    p: &RenderPass,
+    w: &PassWords,
+) -> [RegisterWrite; PARTIAL_LOAD_REGISTERS_G17G] {
+    [
+        RegisterWrite::new(0x15369, w.partial_bg_rsrc_spec),
+        RegisterWrite::new(0x15371, w.partial_bg_va),
+        RegisterWrite::new(0x10039, w.tile_config & !TILE_CONFIG_PROCESS_EMPTY_TILES | UNK_10039_SPM_BIT),
+        RegisterWrite::new(0x15309, u64::from(p.stencil_clear | STENCIL_CLEAR_BASE)),
+        // Partial load repeats the normal EOT program (0xfffffe0008bdc54c, 0xfffffe0008bdc5a8).
+        RegisterWrite::new(0x153b1, w.eot_rsrc_spec),
+        RegisterWrite::new(0x153b9, w.eot_va),
+        RegisterWrite::new(0x15329, p.depth.va),
+        RegisterWrite::new(0x153c1, p.depth.compression_va),
+        RegisterWrite::new(0x15339, p.stencil.va),
+        RegisterWrite::new(0x153d1, p.stencil.compression_va),
+        RegisterWrite::new(0x15319, w.partial_load_zls_g17g),
+        RegisterWrite::new(0x15349, u64::from(ZLS_SWIZZLE)),
+    ]
+}
+
 
 fn fragment_registers(
     args: &RenderArgs<'_>,
@@ -902,7 +1364,8 @@ impl TaDescriptor {
         let geometry = Geometry::new(pass)?;
         let words = PassWords::new(pass)?;
         let registers = ta_registers(args, &geometry, &words)?;
-        let deflake_2a0_offset = user_offset32(offset_va(resources.deflake_va, DEFLAKE_2A0)?)?;
+        let deflake_2a0_offset =
+            user_offset32(offset_va(resources.deflake_va, deflake_offsets().1)?)?;
         let array_va = offset_va(args.ta.descriptor_va, Self::ARRAY_OFFSET)?;
         let sampler_max = sampler_max(pass.sampler_count)?;
         let stamp_value = args.stamp_value();
@@ -917,14 +1380,26 @@ impl TaDescriptor {
         self.scene_va = resources.scene_va;
         self.scene_end_va = resources.scene_end_va;
         let scs_register = args.ray_query[0].scratch.enabled();
-        self.checkpoints = TA_CHECKPOINTS.map(|count| count + u16::from(scs_register));
         self.unk_48 = (args.ordinal as u32).wrapping_add((args.ordinal / 2) as u32);
-        if scs_register {
-            self.registers.set(array_va, &registers)?;
+        if g17g() {
+            // The G17G shader-context program is a different, unqualified list; a request for
+            // it is refused rather than approximated with this one.
+            if scs_register {
+                return Err(EINVAL);
+            }
+            self.checkpoints = TA_CHECKPOINTS_G17G;
+            self.registers
+                .set(array_va, &ta_registers_g17g(args, &geometry, &words)?)?;
         } else {
-            let mut trimmed = [registers[0]; TA_REGISTERS];
-            trimmed[TA_SCS_ENABLE_INDEX..].copy_from_slice(&registers[TA_SCS_ENABLE_INDEX + 1..]);
-            self.registers.set(array_va, &trimmed)?;
+            self.checkpoints = TA_CHECKPOINTS.map(|count| count + u16::from(scs_register));
+            if scs_register {
+                self.registers.set(array_va, &registers)?;
+            } else {
+                let mut trimmed = [registers[0]; TA_REGISTERS];
+                trimmed[TA_SCS_ENABLE_INDEX..]
+                    .copy_from_slice(&registers[TA_SCS_ENABLE_INDEX + 1..]);
+                self.registers.set(array_va, &trimmed)?;
+            }
         }
         self.tpc_va = resources.tpc_va;
         self.tpc_size = resources.tpc_size;
@@ -945,6 +1420,11 @@ impl TaDescriptor {
         self.current_id = resources.ta_ids.current.into();
         self.ordinal = args.ordinal as u32;
         self.timestamp_start_va = resources.timestamp_va;
+        if g17g() {
+            // G17G: the tiling stage gets its own end word (0x906); G17P leaves it zero and
+            // the pass reports one envelope (sol-hal300-timestamp-study.md).
+            self.timestamp_end_va = offset_va(resources.timestamp_va, 8)?;
+        }
         self.unk_932 = Self::UNK_932;
         self.free_list_control_va = resources.free_list_control_va;
         self.unk_93c = Self::UNK_93C;
@@ -981,10 +1461,16 @@ impl TaDescriptor {
         descriptor_va: u64,
         scs_register: bool,
     ) -> Result<[Option<RegisterArrayBinding>; 4]> {
-        let array = RegisterArrayBinding::new(
-            offset_va(descriptor_va, Self::ARRAY_OFFSET)?,
-            TA_CHECKPOINTS[0] as u8 + u8::from(scs_register),
-        )?;
+        // The kick advertises its own count, separately from the descriptor checkpoints: the
+        // native encoder packs it at bit 43 (0xfffffe0008bd9df8..0xfffffe0008bd9e8c) from the
+        // TA RCE summary at command +0x15b8, which is 79 on G17G.
+        let count = if g17g() {
+            TA_CHECKPOINTS_G17G[0] as u8
+        } else {
+            TA_CHECKPOINTS[0] as u8 + u8::from(scs_register)
+        };
+        let array =
+            RegisterArrayBinding::new(offset_va(descriptor_va, Self::ARRAY_OFFSET)?, count)?;
         Ok([Some(array), None, None, None])
     }
 }
@@ -1148,6 +1634,33 @@ static_assert!(core::mem::offset_of!(FragmentDescriptor, bg_rsrc_spec) == 0x1e78
 static_assert!(core::mem::offset_of!(FragmentDescriptor, tib_blocks) == 0x1f38);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_1f50) == 0x1f50);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, eot_va) == 0x1f7c);
+
+impl FragmentDescriptor {
+    /// HAL300 offsets of the fields whose width or meaning differs from G17P
+    /// (`features/gpu-bringup/sol-render-study.md`).
+    const EOT_RSRC_SPEC_G17G: usize = 0x1f74;
+    const PARTIAL_EOT_RSRC_SPEC_G17G: usize = 0x1f94;
+    const STENCIL_CLEAR_G17G: usize = 0x1fac;
+
+    /// Writes `value` at a byte offset of this descriptor, for a field whose HAL300 width or
+    /// position differs from the G17P layout this structure names.
+    fn write_at(&mut self, offset: usize, value: &[u8]) -> Result {
+        let end = offset.checked_add(value.len()).ok_or(EINVAL)?;
+        if end > core::mem::size_of::<Self>() {
+            return Err(EINVAL);
+        }
+        // SAFETY: This packed structure of integers is uniquely borrowed, the range was just
+        // bounds checked against its size, and a byte view has alignment one.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::from_mut(self).cast::<u8>(),
+                core::mem::size_of::<Self>(),
+            )
+        };
+        bytes[offset..end].copy_from_slice(value);
+        Ok(())
+    }
+}
 static_assert!(core::mem::offset_of!(FragmentDescriptor, depth_clear) == 0x1fa8);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, unk_2104) == 0x2104);
 static_assert!(core::mem::offset_of!(FragmentDescriptor, stamp_va) == 0x2140);
@@ -1176,6 +1689,16 @@ impl FragmentDescriptor {
             let va = offset_va(descriptor_va, Self::array_offset(index))?;
             Ok(Some(RegisterArrayBinding::new(va, checkpoint as u8)?))
         };
+        if g17g() {
+            // Native fragment RCE summary (command +0x858): 87 main entries and the complete
+            // partial store, resume and load arrays.
+            return Ok([
+                array(0, FRAGMENT_CHECKPOINTS_G17G[0] as usize)?,
+                array(1, PARTIAL_STORE_REGISTERS_G17G)?,
+                array(2, PARTIAL_RESUME_REGISTERS_G17G)?,
+                array(3, PARTIAL_LOAD_REGISTERS_G17G)?,
+            ]);
+        }
         Ok([
             array(0, FRAGMENT_CHECKPOINTS[0] as usize + usize::from(scs_register))?,
             array(1, PARTIAL_STORE_REGISTERS)?,
@@ -1245,21 +1768,33 @@ impl FragmentSlot {
         desc.merge_upper_y = pass.merge_upper_y;
         desc.tiles = geometry.tiles_x * geometry.tiles_y;
         let scs_register = args.ray_query[1].scratch.enabled();
-        let extra = u16::from(scs_register);
-        desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
-        desc.entries = FRAGMENT_REGISTERS as u16 + extra;
-        let registers = fragment_registers(args, &geometry, &words);
-        if scs_register {
-            desc.arrays[0].set(arrays[0], &registers)?;
+        if g17g() {
+            if scs_register {
+                return Err(EINVAL);
+            }
+            desc.checkpoints = FRAGMENT_CHECKPOINTS_G17G;
+            desc.entries = FRAGMENT_REGISTERS_G17G as u16;
+            desc.arrays[0].set(arrays[0], &fragment_registers_g17g(args, &geometry, &words))?;
+            desc.arrays[1].set(arrays[1], &partial_store_registers_g17g(pass, &words))?;
+            desc.arrays[2].set(arrays[2], &partial_resume_registers_g17g(pass, &words))?;
+            desc.arrays[3].set(arrays[3], &partial_load_registers_g17g(pass, &words))?;
         } else {
-            let mut trimmed = [registers[0]; FRAGMENT_REGISTERS];
-            trimmed[FRAGMENT_SCS_ENABLE_INDEX..]
-                .copy_from_slice(&registers[FRAGMENT_SCS_ENABLE_INDEX + 1..]);
-            desc.arrays[0].set(arrays[0], &trimmed)?;
+            let extra = u16::from(scs_register);
+            desc.checkpoints = FRAGMENT_CHECKPOINTS.map(|count| count + extra);
+            desc.entries = FRAGMENT_REGISTERS as u16 + extra;
+            let registers = fragment_registers(args, &geometry, &words);
+            if scs_register {
+                desc.arrays[0].set(arrays[0], &registers)?;
+            } else {
+                let mut trimmed = [registers[0]; FRAGMENT_REGISTERS];
+                trimmed[FRAGMENT_SCS_ENABLE_INDEX..]
+                    .copy_from_slice(&registers[FRAGMENT_SCS_ENABLE_INDEX + 1..]);
+                desc.arrays[0].set(arrays[0], &trimmed)?;
+            }
+            desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
+            desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;
+            desc.arrays[3].set(arrays[3], &partial_load_registers(pass, &words))?;
         }
-        desc.arrays[1].set(arrays[1], &partial_store_registers(pass, &words))?;
-        desc.arrays[2].set(arrays[2], &partial_resume_registers(pass, &words))?;
-        desc.arrays[3].set(arrays[3], &partial_load_registers(pass, &words))?;
         desc.depth_bias_va = pass.depth_bias_va;
         desc.scissor_va = pass.scissor_va;
         desc.occlusion_query_va = pass.occlusion_query_va;
@@ -1274,12 +1809,28 @@ impl FragmentSlot {
         desc.height = pass.height;
         desc.unk_1f50 = UNK_15049;
         desc.tile_config = words.tile_config;
-        desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
         desc.eot_va = words.eot_va;
-        desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
         desc.partial_eot_va = words.partial_eot_va;
         desc.depth_clear = pass.depth_clear;
-        desc.unk_1fac = words.tib_blocks << Self::UNK_1FAC_TIB_SHIFT | Self::UNK_1FAC_BASE;
+        if g17g() {
+            // HAL300 carries both end-of-tile resource specifiers as full 64-bit words four
+            // bytes earlier (0xfffffe0008b48a68 and 0xfffffe0008b48a80), and holds the stencil
+            // clear where G17P synthesizes a tile-buffer word (0xfffffe0008b48a8c). The
+            // tile-buffer blocks still reach the hardware through register 0x10051.
+            desc.write_at(FragmentDescriptor::EOT_RSRC_SPEC_G17G, &words.eot_rsrc_spec.to_le_bytes())?;
+            desc.write_at(
+                FragmentDescriptor::PARTIAL_EOT_RSRC_SPEC_G17G,
+                &words.partial_eot_rsrc_spec.to_le_bytes(),
+            )?;
+            desc.write_at(
+                FragmentDescriptor::STENCIL_CLEAR_G17G,
+                &(pass.stencil_clear | STENCIL_CLEAR_BASE).to_le_bytes(),
+            )?;
+        } else {
+            desc.eot_rsrc_spec = words.eot_rsrc_spec as u32;
+            desc.partial_eot_rsrc_spec = words.partial_eot_rsrc_spec as u32;
+            desc.unk_1fac = words.tib_blocks << Self::UNK_1FAC_TIB_SHIFT | Self::UNK_1FAC_BASE;
+        }
         desc.unk_2104 = resources.unk_2104;
         desc.predecessor_id = resources.fragment_ids.predecessor;
         desc.unk_210c = resources.unk_210c;
@@ -1292,17 +1843,56 @@ impl FragmentSlot {
         desc.first_kick = u32::from(args.ordinal == 0);
         desc.current_id = resources.fragment_ids.current.into();
         desc.ordinal = args.ordinal as u32;
-        desc.timestamp_start_va = resources.timestamp_va;
-        desc.timestamp_end_va = timestamp_end_va;
+        // G17G fragment timestamps use words 2 and 3 of this pass's slot, after the two
+        // tiling words; G17P keeps the shared start word and the second word as the end.
+        let (fragment_start_va, fragment_end_va) = if g17g() {
+            (offset_va(resources.timestamp_va, 16)?, offset_va(resources.timestamp_va, 24)?)
+        } else {
+            (resources.timestamp_va, timestamp_end_va)
+        };
+        desc.timestamp_start_va = fragment_start_va;
+        desc.timestamp_end_va = fragment_end_va;
         desc.unk_21cc = Self::UNK_21CC;
         desc.free_list_control_va = resources.free_list_control_va;
         desc.unk_21d6 = Self::UNK_21D6;
         desc.status_va = resources.fragment_status_va;
         desc.status_fw_va = resources.fragment_status_fw_va;
         desc.context_generation = resources.context_generation;
-        desc.unk_2208 = Self::UNK_2208;
-        desc.unk_220c = Self::UNK_220C;
         desc.unk_222d = Self::UNK_222D;
+        if g17g() {
+            // HAL300 keeps the pass accounting elsewhere: u32 +0x220f is the TA-retirement credit
+            // the fragment adds to PB+0 (compared with PB+0x14), byte +0x2213 the scheduling mode
+            // that cleans the scene at completion (0xfffffe0008b48b88..0x8b48b94; firmware
+            // P+0xc488, P+0xea44). One TA per fragment: credit 1, mode 1. The G17P constants at
+            // +0x2208/+0x220c are not native here.
+            desc.unk_2208 = 0;
+            desc.unk_220c = 0;
+            desc.write_at(0x220f, &1u32.to_le_bytes())?;
+            desc.write_at(0x2213, &[1])?;
+            // The ZLS block the native writer copies beside the registers
+            // (0xfffffe0008b48860..0x8b48b3c). Linux names one surface per aspect, so the
+            // load, store and partial bases coincide; the stencil store/partial slots at
+            // +0x1f10/+0x1f18 stay zero as natively.
+            for (offset, value) in [
+                (0x1eb8, pass.zls_control),
+                (0x1ec8, pass.depth.va),
+                (0x1ed0, pass.depth.stride),
+                (0x1ed8, pass.depth.compression_stride),
+                (0x1ee0, pass.depth.va),
+                (0x1ee8, pass.depth.va),
+                (0x1ef0, pass.depth.compression_va),
+                (0x1ef8, pass.stencil.va),
+                (0x1f00, pass.stencil.stride),
+                (0x1f08, pass.stencil.compression_stride),
+                (0x1f20, pass.stencil.compression_va),
+                (0x1fd0, pass.depth_dimensions),
+            ] {
+                desc.write_at(offset, &value.to_le_bytes())?;
+            }
+        } else {
+            desc.unk_2208 = Self::UNK_2208;
+            desc.unk_220c = Self::UNK_220C;
+        }
         Ok(())
     }
 

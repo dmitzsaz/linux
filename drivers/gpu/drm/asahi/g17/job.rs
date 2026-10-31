@@ -250,12 +250,7 @@ pub(crate) fn fence_status(fence: &Fence) -> i32 {
 }
 
 fn check_status(fence: &Fence) -> Result {
-    let status = fence_status(fence);
-    if status < 0 {
-        Err(super::dependency::inherited_error(Error::from_errno(status)))
-    } else {
-        Ok(())
-    }
+    super::dependency::producer_failure(fence_status(fence))
 }
 
 /// The backend retains visible packets through exact retirement or processor stop.
@@ -345,7 +340,22 @@ impl<B: Backend> sched::JobImpl for Job<B> {
         job.backend.prepare(&job.packet)
     }
     fn run(job: &mut Self) -> Result<Option<Fence>> {
-        job.backend.publish(job.packet.clone()).map(Some)
+        match job.backend.publish(job.packet.clone()) {
+            // HAL300: a cancelled command (a pass a recovery cancelled for an innocent client, or
+            // one of a closing queue) is a dropped frame, not a failure. An error returned here
+            // would become the scheduler's finished-fence error, which implicit sync hands to
+            // every consumer of the command's buffers. Its completion already signalled without
+            // an error (or will, if it was published), so hand that fence back instead.
+            Err(error) if error == ECANCELED && super::fw::compute::g17g_selected() => {
+                let fence = job.packet.completion.scheduler_fence();
+                if job.packet.is_published() || fence_status(&fence) != 0 {
+                    Ok(Some(fence))
+                } else {
+                    Err(error)
+                }
+            }
+            result => result.map(Some),
+        }
     }
     fn timed_out(job: &mut Timeout<B>, finished: bool) -> sched::Status {
         // The scheduler retains the detached job throughout this callback. Keep

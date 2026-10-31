@@ -46,6 +46,9 @@ pub(crate) trait Host {
     fn publish(&mut self, record: &SchedulerStateRelease) -> Result<u32>;
     fn notify(&mut self) -> Result;
     fn detach(&mut self, context: &Arc<Context>) -> Result;
+    /// HAL300: hand a closed, idle context to the off-lock reclaim without parking its
+    /// graphs. Installed queues keep naming it until a new owner re-registers them.
+    fn retain_closed(&mut self, context: &Arc<Context>) -> Result;
     fn report(&mut self, context: &Arc<Context>, failure: Failure);
 }
 
@@ -79,12 +82,28 @@ impl Pending {
     /// last ran have not been detached yet. Until then the firmware may still
     /// process the release against those queues: none of them may change owner.
     pub(crate) fn releasing(&self, context: &Arc<Context>) -> bool {
+        if Self::never_released() {
+            return false;
+        }
         self.find(context)
             .is_some_and(|index| self.entries[index].phase != Phase::Deferred)
     }
 
+    /// HAL300 publishes no scheduler release at all, so an entry stays Draining for the rest
+    /// of the boot and "a release is in flight" is never actually true. Answering yes there
+    /// made every gate that waits on it wait forever: a closed owner's queue was never
+    /// offered again, and the first command after an owner change retried EAGAIN until its
+    /// deadline (asahi-reuse10-boot). Changing a physical queue's owner is a native
+    /// re-registration instead (sol-ksm-queue-descriptor-study.md section B).
+    fn never_released() -> bool {
+        crate::g17::fw::compute::g17g_selected() && crate::g17::runtime::queue_reuse_enabled()
+    }
+
     /// `releasing` for the context that owns scheduler page `scheduler`.
     pub(crate) fn releasing_scheduler(&self, scheduler: u64) -> bool {
+        if Self::never_released() {
+            return false;
+        }
         self.entries.iter().any(|entry| {
             entry.phase != Phase::Deferred && entry.context.scheduler_va() == scheduler
         })
@@ -148,7 +167,8 @@ impl Pending {
     /// Publish in insertion order. Mandatory control replies and a full control ring stop this
     /// pass; an error for one page leaves it retained while other ready releases may progress.
     pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool, now: u64) -> Result {
-        if !recovery {
+        // HAL300 never publishes the release (take_closed_idle consumes the entry instead).
+        if !recovery && !Self::never_released() {
             for entry in self.entries.iter_mut() {
                 // The ring record is already published. Retry only its doorbell;
                 // never duplicate a scheduler release after a transport error.
@@ -212,6 +232,9 @@ impl Pending {
         producer: u32,
         host: &mut impl Host,
     ) -> Result<Option<Arc<Context>>> {
+        if Self::never_released() {
+            return self.take_closed_idle(host);
+        }
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
             let Phase::Released(target) = entry.phase else {
@@ -228,6 +251,35 @@ impl Pending {
                 Err(error) => return Err(error),
             }
             let entry = self.entries.remove(index).map_err(|_| EIO)?;
+            return Ok(Some(entry.context));
+        }
+        Ok(None)
+    }
+
+    /// HAL300 publishes no scheduler release, so a closed context would otherwise stay
+    /// Draining for the rest of the boot and keep its application context (TTBAT slot) and
+    /// QoS identity: 50 sequential GL clients ran out of execution contexts after 12
+    /// (asahi-reuse15-boot). Once its render and compute work is idle (the same witnesses
+    /// upstream waits for before publishing the release) the context goes to the ordinary
+    /// off-lock reclaim, which returns the slot and the QoS lease. Its scheduler page and
+    /// work storage stay mapped until reboot: without a consumed release the firmware's own
+    /// scheduler tables may still name them. Its render pool is already retained on HAL300.
+    fn take_closed_idle(&mut self, host: &mut impl Host) -> Result<Option<Arc<Context>>> {
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.phase != Phase::Draining
+                || !host.render_idle(&entry.context)?
+                || !host.compute_idle(&entry.context)
+            {
+                continue;
+            }
+            match host.retain_closed(&entry.context) {
+                Ok(()) => {}
+                Err(EBUSY) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let entry = self.entries.remove(index).map_err(|_| EIO)?;
+            core::mem::forget(entry.context.retain_firmware_pages());
             return Ok(Some(entry.context));
         }
         Ok(None)

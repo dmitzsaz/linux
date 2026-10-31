@@ -44,6 +44,16 @@ const FAULT_INFO: usize = 0x17030;
 
 /// A nonzero low nibble permits writes through the G17 queue configuration port.
 const G17_HOST_IRQ_SUMMARY: usize = 0xe01000;
+/// Queue mask the firmware's scheduler reconstruction iterates (two halves).
+const G17_QUEUE_SCAN_MASK: usize = 0x21038;
+/// GPU MMU fault latch: info word, then raw address (VA = raw << 6). Primary TEXT 6cd8..6ce8.
+const G17_FAULT_INFO: usize = 0xd8c0;
+/// Queue mask the tag-15 registration path publishes (two halves).
+const G17_QUEUE_PUBLISHED_MASK: usize = 0x21068;
+/// Index of the queue whose descriptor the window below exposes.
+const G17_QUEUE_SELECTOR: usize = 0x103a8;
+/// Indexed queue descriptor; bits 61:60 hold `data_master + 1`.
+const G17_QUEUE_DESCRIPTOR: usize = 0x21008;
 const G17_HOST_POWERED: u32 = 0xf;
 
 const ID_VERSION: usize = 0xd04000;
@@ -608,6 +618,41 @@ impl G17Resources {
         } else {
             0
         }
+    }
+
+    /// Reads the scheduler's queue bookkeeping: the two halves of the queue
+    /// mask its reconstruction iterates, the two halves the queue-registration
+    /// path publishes, the currently selected queue and that queue's indexed
+    /// descriptor.
+    ///
+    /// Read-only, and only while the GPU answers as powered. The selector is
+    /// not moved: the descriptor of any other queue would need a write that
+    /// races the firmware's own scheduling.
+    pub(crate) fn queue_state(&self) -> Result<[u64; 6]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(ENODEV);
+        }
+        Ok([
+            sgx.try_read64(G17_QUEUE_SCAN_MASK)?,
+            sgx.try_read64(G17_QUEUE_SCAN_MASK + 8)?,
+            sgx.try_read64(G17_QUEUE_PUBLISHED_MASK)?,
+            sgx.try_read64(G17_QUEUE_PUBLISHED_MASK + 8)?,
+            sgx.try_read64(G17_QUEUE_SELECTOR)?,
+            sgx.try_read64(G17_QUEUE_DESCRIPTOR)?,
+        ])
+    }
+
+    /// The GPU MMU fault latch (info, raw address), read-only and only while the GPU answers as
+    /// powered. The firmware owns clearing it; the host never writes these registers.
+    pub(crate) fn fault_latch(&self) -> Result<[u64; 2]> {
+        let sgx = self.sgx.try_access().ok_or(ENODEV)?;
+        let sgx = (&*sgx).as_view();
+        if sgx.relaxed().read32(G17_HOST_IRQ_SUMMARY) & G17_HOST_POWERED == 0 {
+            return Err(ENODEV);
+        }
+        Ok([sgx.try_read64(G17_FAULT_INFO)?, sgx.try_read64(G17_FAULT_INFO + 8)?])
     }
 
     /// Get the identification of a G17 GPU from its registers.

@@ -275,20 +275,20 @@ impl Growth {
 
 pub(crate) fn firmware_growth_target(current: usize) -> usize {
     current
-        .saturating_add(fw::GROW_BLOCKS)
-        .min(cfg::TVB_MAX_BLOCKS)
+        .saturating_add(fw::grow_blocks())
+        .min(fw::tvb_max_blocks())
 }
 
 /// The high-water sample estimates capacity, not current occupancy. A growth
 /// reserves three times the demand only once twice that demand no longer fits.
 pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Option<usize> {
-    let maximum = fw::NORMAL_MAX_BLOCKS;
+    let maximum = fw::normal_max_blocks();
     if current >= maximum {
         return None;
     }
     let need = used_pages
         .saturating_mul(2)
-        .div_ceil(cfg::TVB_PAGES_PER_BLOCK)
+        .div_ceil(fw::tvb_pages_per_block())
         .min(maximum);
     if need <= current {
         return None;
@@ -296,7 +296,7 @@ pub(crate) fn automatic_growth_target(used_pages: usize, current: usize) -> Opti
     Some(
         used_pages
             .saturating_mul(3)
-            .div_ceil(cfg::TVB_PAGES_PER_BLOCK)
+            .div_ceil(fw::tvb_pages_per_block())
             .min(maximum),
     )
 }
@@ -350,22 +350,22 @@ impl Tvb {
     /// Blocks are packed in the backing; only their VA placement keeps the
     /// stride and its trailing guard.
     fn bytes(blocks: usize) -> Result<usize> {
-        blocks.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)
+        blocks.checked_mul(fw::tvb_block_size()).ok_or(EOVERFLOW)
     }
     fn map_block(
         object: &KernelObject,
         vm: &mmu::Vm,
         relative: usize,
     ) -> Result<mmu::KernelMapping> {
-        let start = relative.checked_mul(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
-        let source = start..start.checked_add(cfg::TVB_BLOCK_SIZE).ok_or(EOVERFLOW)?;
+        let start = relative.checked_mul(fw::tvb_block_size()).ok_or(EOVERFLOW)?;
+        let source = start..start.checked_add(fw::tvb_block_size()).ok_or(EOVERFLOW)?;
         let mapping = compact_alias(
             object,
             vm,
             source,
             cfg::TVB_PAGE,
             mmu::PROT_GPU_SHARED_RW,
-            cfg::TVB_BLOCK_STRIDE as usize - cfg::TVB_BLOCK_SIZE,
+            fw::tvb_block_stride() as usize - fw::tvb_block_size(),
         )?;
         fw::compact_page(mapping.iova())?;
         Ok(mapping)
@@ -375,7 +375,7 @@ impl Tvb {
         vm: &mmu::Vm,
         blocks: usize,
     ) -> Result<(Self, KVec<mmu::KernelMapping>)> {
-        if blocks == 0 || blocks > cfg::TVB_MAX_BLOCKS {
+        if blocks == 0 || blocks > fw::tvb_max_blocks() {
             return Err(ERANGE);
         }
         let backing = KernelObject::backing(dev, Self::bytes(blocks)?, CpuMap::WriteCombined)?;
@@ -403,7 +403,7 @@ impl Tvb {
     }
     /// Blocks of each growth extension; extensions are packed like the primary.
     fn extension_blocks(extension: &KernelObject) -> usize {
-        extension.size() / cfg::TVB_BLOCK_SIZE
+        extension.size() / fw::tvb_block_size()
     }
     /// Blocks of the primary backing, which a heap never gives back.
     fn primary_blocks(&self) -> usize {
@@ -423,7 +423,7 @@ impl Tvb {
         if target <= self.blocks() {
             return Ok(None);
         }
-        if target > cfg::TVB_MAX_BLOCKS {
+        if target > fw::tvb_max_blocks() {
             return Err(ERANGE);
         }
         let added = target - self.blocks();
@@ -573,7 +573,9 @@ pub(crate) struct Manager {
 const SHRINK_PERIOD_NS: u64 = 1_000_000_000;
 const SHRINK_IDLE_NS: u64 = 10_000_000_000;
 /// Blocks in one native 512 KiB parameter-buffer block.
-const SHRINK_STEP_BLOCKS: usize = 0x8_0000 / cfg::TVB_BLOCK_SIZE;
+fn shrink_step_blocks() -> usize {
+    (0x8_0000 / fw::tvb_block_size()).max(1)
+}
 /// Active periods in the recent-load window.
 const SHRINK_WINDOW: usize = (SHRINK_IDLE_NS / SHRINK_PERIOD_NS) as usize;
 
@@ -750,7 +752,7 @@ impl Manager {
     fn shrink_floor(&self) -> usize {
         let recent = (self.shrink.busy_peak as usize)
             .saturating_mul(2)
-            .div_ceil(cfg::TVB_PAGES_PER_BLOCK);
+            .div_ceil(fw::tvb_pages_per_block());
         self.tvb.primary_blocks().max(self.shrink.required).max(recent)
     }
     /// Whether the heap holds growth beyond its primary backing.
@@ -786,9 +788,9 @@ impl Manager {
                 self.shrink.busy_peak = self.shrink.window.iter().copied().max().unwrap_or(0);
             }
             self.shrink.period_start = now;
-            let capacity = self.blocks() * cfg::TVB_PAGES_PER_BLOCK;
+            let capacity = self.blocks() * fw::tvb_pages_per_block();
             if (self.shrink.average as usize).saturating_mul(4) < capacity {
-                self.shrink.credit = self.shrink.credit.saturating_add(SHRINK_STEP_BLOCKS);
+                self.shrink.credit = self.shrink.credit.saturating_add(shrink_step_blocks());
             } else {
                 self.shrink.credit = 0;
             }
@@ -834,11 +836,11 @@ impl Manager {
     /// one VM snapshot before constructing more aliases.
     pub(crate) fn validate_vm(&self, vm: &mmu::Vm) -> Result {
         if self.blocks() < cfg::TVB_INITIAL_PAGES.len()
-            || self.blocks() > cfg::TVB_MAX_BLOCKS
+            || self.blocks() > fw::tvb_max_blocks()
             || !vm.covers_sparse_blocks_with_guards(
                 self.tvb.addresses(),
-                cfg::TVB_BLOCK_SIZE as u64,
-                cfg::TVB_BLOCK_STRIDE,
+                fw::tvb_block_size() as u64,
+                fw::tvb_block_stride(),
             )
         {
             return Err(EFAULT);
@@ -868,20 +870,20 @@ impl Manager {
         let plan = Growth::new(before, target - previous)?;
         let firmware_request = descriptor.is_none();
         let pages = target
-            .checked_mul(cfg::TVB_PAGES_PER_BLOCK)
+            .checked_mul(fw::tvb_pages_per_block())
             .ok_or(EOVERFLOW)? as u32;
         let mut added = KVec::with_capacity(growth.addresses.len(), GFP_KERNEL)?;
         for (index, &address) in growth.addresses.iter().enumerate() {
             let first = fw::compact_page(address)?;
             first
-                .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
+                .checked_add(fw::tvb_pages_per_block() as u32 - 1)
                 .ok_or(EOVERFLOW)?;
             added.push((plan.added_slot(index)?, first), GFP_KERNEL)?;
         }
         let rebuilt_count = if firmware_request {
             0
         } else {
-            plan.available() * cfg::TVB_PAGES_PER_BLOCK
+            plan.available() * fw::tvb_pages_per_block()
         };
         let mut rebuilt = KVec::with_capacity(rebuilt_count, GFP_KERNEL)?;
         if !firmware_request {
@@ -898,9 +900,9 @@ impl Manager {
                     added[ordinal - plan.retained()].1
                 };
                 first
-                    .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
+                    .checked_add(fw::tvb_pages_per_block() as u32 - 1)
                     .ok_or(EOVERFLOW)?;
-                for page in 0..cfg::TVB_PAGES_PER_BLOCK {
+                for page in 0..fw::tvb_pages_per_block() {
                     rebuilt.push(first + page as u32, GFP_KERNEL)?;
                 }
             }
@@ -1057,7 +1059,7 @@ impl Manager {
         };
         for &address in &self.tvb.addresses[..kept] {
             fw::compact_page(address)?
-                .checked_add(cfg::TVB_PAGES_PER_BLOCK as u32 - 1)
+                .checked_add(fw::tvb_pages_per_block() as u32 - 1)
                 .ok_or(EOVERFLOW)?;
         }
         let base = self.graph.pointer(0, fw::SIZE)?.cast::<u32>();
@@ -1082,13 +1084,13 @@ impl Manager {
             let at = fw::BLOCK_TABLE + slot * size_of::<fw::Block>();
             write(at, first);
             write(at + 4, 0);
-            for page in 0..cfg::TVB_PAGES_PER_BLOCK {
-                let entry = index * cfg::TVB_PAGES_PER_BLOCK + page;
+            for page in 0..fw::tvb_pages_per_block() {
+                let entry = index * fw::tvb_pages_per_block() + page;
                 write(fw::PAGE_LIST + entry * 4, first + page as u32);
             }
         }
         let total = ((before.read as usize + kept) % cfg::TVB_BLOCK_SLOTS) as u32;
-        let pages = (kept * cfg::TVB_PAGES_PER_BLOCK) as u32;
+        let pages = (kept * fw::tvb_pages_per_block()) as u32;
         write(core::mem::offset_of!(fw::State, pages), pages);
         write(core::mem::offset_of!(fw::State, producer), total);
         write(core::mem::offset_of!(fw::State, consumer), before.read);

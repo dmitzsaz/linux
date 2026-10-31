@@ -116,6 +116,11 @@ impl Output {
                     }
                 }
             }
+            // HAL300: this is the fence userspace waits on and passes on to the next frame and to
+            // the compositor. A cancelled command (ECANCELED, see signal_terminal) completes it
+            // without an error: an errored fence here was the first link of the asahi-pw57-boot
+            // chain in which every later frame of the compositor inherited the cancellation.
+            Err(error) if error == ECANCELED && crate::g17::fw::compute::g17g_selected() => {}
             Err(error) => self.fence.set_error(error),
         }
         self.fence.signal();
@@ -337,7 +342,13 @@ impl Completion {
     fn signal_terminal(&self, result: Result<[u64; 4]>) {
         if let Some(fence) = &self.terminal {
             if let Err(error) = result {
-                fence.set_error(error);
+                // HAL300: an ECANCELED fence is work a recovery cancelled for an innocent client
+                // (or work of a closing queue). Zink treats an errored fence as a lost device
+                // (asahi-pw56-boot: glxgears died on one such pass while nothing reached its VM
+                // status), so the fence completes without an error; that frame is just missing.
+                if !(error == ECANCELED && crate::g17::fw::compute::g17g_selected()) {
+                    fence.set_error(error);
+                }
             }
             fence.signal();
         }
@@ -528,11 +539,7 @@ impl Completion {
             feed.note_render_pass(ticks[2], ticks[3]);
         }
         if let Err(error) = result {
-            if self.spared() {
-                self.status.report_failure(error);
-            } else if error != ECANCELED {
-                self.status.record(error);
-            }
+            self.report_error(error);
         }
         self.release_healthy();
         self.signal_terminal(result);
@@ -546,7 +553,12 @@ impl Completion {
             return;
         }
         self.status.record_if_device_loss(error);
-        if self.accepted.load(Ordering::Acquire) {
+        // On HAL300 a recovery that cancels an innocent client's render pass also retires that
+        // pair, and the client's already-queued passes are cancelled before publication; it
+        // continues on a fresh pair. Reporting those (asahi-pw55-boot, runtime/backend.rs) made
+        // Zink declare the device lost and the compositor crash, like the cancelled pass itself.
+        let silent = error == ECANCELED && crate::g17::fw::compute::g17g_selected();
+        if self.accepted.load(Ordering::Acquire) && !silent {
             self.status.report_failure(error);
         }
         self.release_healthy();
@@ -564,13 +576,26 @@ impl Completion {
         if let Some(guard) = self.vm_job.lock().as_ref() {
             guard.quarantine();
         }
+        self.report_error(error);
+        self.signal_terminal(Err(error));
+        self.output.finish(Err(error));
+    }
+
+    /// Records a failed completion in the VM status and its client mirror. A spared pass that a
+    /// HAL300 recovery cancelled (ECANCELED: an innocent client's in-flight render, whose TPC the
+    /// recovery scrubbed) is not reported to the client: Zink turns any reported failure into a
+    /// lost device and the compositor then dies (asahi-pw53-boot: Hyprland crashed minutes after
+    /// such a cancellation). Only that one frame is incomplete; the next one redraws.
+    #[track_caller]
+    fn report_error(&self, error: Error) {
         if self.spared() {
+            if error == ECANCELED && crate::g17::fw::compute::g17g_selected() {
+                return;
+            }
             self.status.report_failure(error);
         } else if error != ECANCELED {
             self.status.record(error);
         }
-        self.signal_terminal(Err(error));
-        self.output.finish(Err(error));
     }
 }
 

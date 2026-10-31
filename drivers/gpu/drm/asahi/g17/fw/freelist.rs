@@ -100,7 +100,17 @@ pub(crate) struct PagePoolState {
 
 impl PagePoolState {
     /// The fourth descriptor word belongs to firmware and survives every load.
-    pub(crate) const fn descriptor(self, unk_18: u64) -> super::initdata::PagePoolDescriptor {
+    pub(crate) fn descriptor(self, unk_18: u64) -> super::initdata::PagePoolDescriptor {
+        if super::compute::g17g_selected() {
+            return super::initdata::PagePoolDescriptor::g17g(
+                self.page_list_va,
+                self.unk_20,
+                self.unk_24,
+                self.unk_28,
+                self.page_count,
+                self.unk_1c,
+            );
+        }
         super::initdata::PagePoolDescriptor {
             page_list: ((self.unk_1c as u64) << 41) | (self.page_list_va >> 7),
             counters: ((self.unk_24 as u64) << 33)
@@ -112,7 +122,17 @@ impl PagePoolState {
     }
 
     /// Address and allocation unit remain properties of the retained pool.
-    pub(crate) const fn updated(self, descriptor: &super::initdata::PagePoolDescriptor) -> Self {
+    pub(crate) fn updated(self, descriptor: &super::initdata::PagePoolDescriptor) -> Self {
+        if super::compute::g17g_selected() {
+            // Native halStoreUMADesc.
+            return Self {
+                unk_20: (descriptor.counters & 0x0fff_ffff) as u32,
+                unk_24: ((descriptor.counters >> 32) & 0x0fff_ffff) as u32,
+                unk_28: ((descriptor.page_list >> 61) & 1) as u32,
+                page_count: (descriptor.page_count & 0x0fff_ffff) as u32,
+                ..self
+            };
+        }
         Self {
             unk_20: ((descriptor.counters >> 5) & 0x0fff_ffff) as u32,
             unk_24: ((descriptor.counters >> 33) & 0x0fff_ffff) as u32,

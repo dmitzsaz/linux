@@ -69,6 +69,16 @@ pub(super) trait Control {
     fn powered(&self) -> bool;
     fn counters(&self) -> kernel::error::Result<[u32; 3]>;
     fn set_idle(&mut self, enabled: bool) -> kernel::error::Result<u32>;
+    /// Whether this firmware accepts the idle power-off record at all. HAL300 does not: the
+    /// record is unqualified there and its GPU is never asked to descend, so the pair
+    /// registration around a render has nothing to assert or restore.
+    fn idle_policy_qualified(&self) -> bool {
+        true
+    }
+    /// Whether `release` may publish allow = 1 again. The HAL300 seed-only start never does.
+    fn release_permitted(&self) -> bool {
+        true
+    }
     fn wait_tick(&self);
     fn registration_release_failed(&mut self) {}
     fn registration_release_succeeded(&mut self) {}
@@ -94,20 +104,33 @@ fn wait<C: Control>(control: &C, target: u32, require_powered: bool) -> kernel::
         }
         control.wait_tick();
     }
-    Err(ETIMEDOUT)
+    // A keep-powered record that retired while the GPU was still descending leaves it down
+    // with nothing pending to wake it (asahi-pw44-boot: one allow = 0 retired, powered stayed
+    // false for 250 ms, the render registration failed with ETIMEDOUT). The caller may publish
+    // another allow = 0, as the post-wake reassertion below already does.
+    Err(if retired { EAGAIN } else { ETIMEDOUT })
 }
 
 /// Disable idle descent through fresh pair registration, including a post-wake reassertion.
 pub(super) fn acquire<C: Control>(control: &mut C) -> kernel::error::Result {
     use kernel::prelude::*;
+    if !control.idle_policy_qualified() {
+        return Ok(());
+    }
     let result = (|| {
-        for _ in 0..3 {
+        for _ in 0..4 {
             let powered = control.powered();
             let target = control.set_idle(false)?;
-            wait(control, target, true)?;
+            match wait(control, target, true) {
+                Err(e) if e == EAGAIN => continue,
+                other => other?,
+            }
             if !powered {
                 let target = control.set_idle(false)?;
-                wait(control, target, true)?;
+                match wait(control, target, true) {
+                    Err(e) if e == EAGAIN => continue,
+                    other => other?,
+                }
             }
             if control.powered() {
                 return Ok(());
@@ -122,6 +145,10 @@ pub(super) fn acquire<C: Control>(control: &mut C) -> kernel::error::Result {
 }
 
 pub(super) fn release<C: Control>(control: &mut C) -> kernel::error::Result {
+    if !control.idle_policy_qualified() || !control.release_permitted() {
+        control.registration_release_succeeded();
+        return Ok(());
+    }
     let target = match control.set_idle(true) {
         Ok(target) => target,
         Err(error) => {

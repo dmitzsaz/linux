@@ -373,6 +373,12 @@ pub(crate) struct KickArgs<'a> {
     pub(crate) scs_enabled: bool,
     /// Priority class of the queue.
     pub(crate) priority: u8,
+    /// Write the parent dependency type list at entry offset 0x180 (G17G). The native
+    /// encoder (`encodeDependencyList`, 0xfffffe0008bd9f54) stores two bits per valid
+    /// dependency entry; every explicit barrier and the own-queue parent are type 1 unless a
+    /// pipeline-dependency input selects the engine type, which this driver never requests.
+    /// Without it the list stays zero (G17P).
+    pub(crate) typed_dependencies: bool,
 }
 
 /// One kick ring entry.
@@ -488,7 +494,14 @@ impl KickEntry {
             register_arrays: args.register_arrays.map(RegisterArrayBinding::word),
             unk_170: 0,
             unk_178: Self::UNK_178,
-            pad_180: [0; KICK_ENTRY_STRIDE - 0x180],
+            pad_180: {
+                let mut pad = [0; KICK_ENTRY_STRIDE - 0x180];
+                if args.typed_dependencies {
+                    let types = (0..count).fold(0u64, |types, entry| types | 1 << (2 * entry));
+                    pad[..8].copy_from_slice(&types.to_le_bytes());
+                }
+                pad
+            },
         })
     }
 }

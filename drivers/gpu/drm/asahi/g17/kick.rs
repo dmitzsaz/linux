@@ -29,7 +29,19 @@ pub(super) const QID_COUNT: usize = QID_MAX as usize + 1;
 // the two unpublished bootstrap reservations. The remaining ten compute
 // channels are shared after exact retirement, rather than pinned per client.
 const COMPUTE_RENDER_RESERVE: usize = 2 * crate::mmu::MAX_EXECUTION_CONTEXTS as usize + 2;
-pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT - COMPUTE_RENDER_RESERVE;
+/// HAL300 never releases a closed client's queues (no scheduler-state release record is
+/// published, see InitData::control_qualified), so each client pins one compute channel for the
+/// rest of the boot: ten of them ran out after ten clients (asahi-render65-boot). Protect a
+/// render pair for 32 contexts instead, which leaves 62 compute channels.
+const COMPUTE_RENDER_RESERVE_G17G: usize = 2 * 32 + 2;
+fn compute_render_reserve() -> usize {
+    if super::fw::compute::g17g_selected() {
+        COMPUTE_RENDER_RESERVE_G17G
+    } else {
+        COMPUTE_RENDER_RESERVE
+    }
+}
+pub(super) const COMPUTE_CHANNELS: usize = QID_COUNT - COMPUTE_RENDER_RESERVE_G17G;
 const _: () = {
     assert!(COMPUTE_CHANNELS >= 4);
     assert!(crate::hw::t8140::queues::RENDER_PAIRS_PER_OWNER == 1);
@@ -146,7 +158,7 @@ impl QueueIds {
             // count the replacement as available compute capacity.
             let replacement = usize::from(initial.is_some());
             if QID_COUNT - self.leased + replacement
-                <= COMPUTE_RENDER_RESERVE.saturating_sub(render - replacement)
+                <= compute_render_reserve().saturating_sub(render - replacement)
             {
                 return Err(crate::g17::capacity::refused(crate::g17::capacity::Site::ComputeReserve));
             }

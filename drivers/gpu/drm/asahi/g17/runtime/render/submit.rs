@@ -150,6 +150,7 @@ impl Backend {
         }
         let now = super::super::now_ns();
         if now.saturating_sub(*since.get_or_insert(now)) >= super::super::WORK_RING_WAIT_NS {
+            pr_warn!("asahi: render owner {} gave up waiting for a busy pair or its turn\n", self.owner);
             return Err(ETIMEDOUT);
         }
         self.shared.queue_events();
@@ -224,6 +225,7 @@ impl Backend {
                         return Err(FALLBACK);
                     }
                     if state_polls == 1000 {
+                        pr_warn!("asahi: render owner {} work state stayed busy\n", self.owner);
                         return Err(ETIMEDOUT);
                     }
                     state_polls += 1;

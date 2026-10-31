@@ -156,6 +156,9 @@ pub(crate) struct Pair {
     clusters: u32,
     descriptor_flags: [u32; 2],
     installed: [bool; 2],
+    /// The pair changed to a foreign owner with its own queue memory, so both QIDs must be
+    /// re-registered (tag-15 install) to name the new rings and records.
+    reinstall: [bool; 2],
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
     recovery_generation: u64,
@@ -257,6 +260,7 @@ impl Pair {
             clusters,
             descriptor_flags,
             installed: [false; 2],
+            reinstall: [false; 2],
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: 0,
@@ -272,6 +276,10 @@ impl Pair {
             executed: 0,
             switch: None,
         }))
+    }
+    /// Recovery: clears this pair's tail-pointer cache after the firmware cancelled its TA.
+    pub(crate) fn scrub_tpc(&mut self) {
+        self.memory.target.scrub_tpc();
     }
     pub(crate) fn qids(&self) -> [u8; 2] {
         self.kicks.each_ref().map(|kick| kick.id().qid())
@@ -374,7 +382,7 @@ impl Pair {
             self.memory.lifecycle
         };
         let (scratch, metric) = self.memory.manager.scene_registers(scene)?;
-        let timestamp_offset = ordinal as usize % memory::RECORDS * 16;
+        let timestamp_offset = ordinal as usize % memory::RECORDS * memory::TIMESTAMP_STRIDE;
         let timestamp = self.memory.timestamps.gpu_va() + timestamp_offset as u64;
         let resources = abi::RenderResources {
             context_id: packet.context.id().try_into()?,
@@ -440,7 +448,7 @@ impl Pair {
                 return Err(error);
             }
         };
-        self.memory.timestamps.write(timestamp_offset, [0u64; 2])?;
+        self.memory.timestamps.write(timestamp_offset, [0u64; 4])?;
         self.memory.manager.claim_scene(ordinal, scene)?;
         self.prepared = Some(Prepared {
             packet: packet.clone(),
@@ -578,7 +586,7 @@ impl Pair {
                 kick_ring_va: self.kicks[stage].low_va(),
                 kick_ring_fw_va: self.kicks[stage].firmware_va(),
                 qid: qids[stage],
-                install: !self.installed[stage],
+                install: !self.installed[stage] || self.reinstall[stage],
                 completion_seed: covered[stage].then(|| {
                     kicks[stage]
                         .prev()
@@ -642,6 +650,7 @@ impl Pair {
             register_arrays: arrays,
             scs_enabled: ray_query[stage].scratch.enabled(),
             priority: policy.priority(),
+            typed_dependencies: crate::g17::fw::compute::g17g_selected(),
         };
         let ta_args = args(
             0,
@@ -661,6 +670,58 @@ impl Pair {
             )?,
             mcache,
         );
+        // Always kept for the newest passes (debugfs asahi-g17/pubs): a stall can then be
+        // inspected afterwards without the printk trace below changing its timing.
+        if crate::g17::fw::compute::g17g_selected() {
+            crate::g17::pubring::render(
+                ordinal,
+                qids,
+                [kicks[0].get(), kicks[1].get()],
+                [
+                    self.memory.graph.descriptor_va(0, ordinal),
+                    self.memory.graph.descriptor_va(1, ordinal),
+                ],
+                [
+                    self.memory.graph.descriptor_client(0, ordinal),
+                    self.memory.graph.descriptor_client(1, ordinal),
+                ],
+                [
+                    self.kicks[0].firmware_va() + kicks[0].entry_offset() as u64,
+                    self.kicks[1].firmware_va() + kicks[1].entry_offset() as u64,
+                ],
+                queues,
+                self.memory.manager.state_va(),
+                self.free_list.control_va(),
+                context.scheduler_va(),
+            );
+        }
+        // Bit 62 of the debug_flags module parameter enables this per-pass trace.
+        if crate::g17::fw::compute::g17g_selected()
+            && crate::module_parameters::debug_flags.value() & (1 << 62) != 0
+        {
+            // Addresses a stalled HAL300 pass is inspected at (debugfs asahi-g17/peek).
+            pr_info!(
+                "asahi: HAL300 render publication ordinal {} qids {}/{} kicks {:#x}/{:#x} \
+                 descriptors {:#x}/{:#x} client {:#x}/{:#x} kick_entries {:#x}/{:#x} \
+                 queues {:#x}/{:#x} pb_state {:#x} free_list {:#x} scheduler {:#x}\n",
+                ordinal,
+                qids[0],
+                qids[1],
+                kicks[0].get(),
+                kicks[1].get(),
+                self.memory.graph.descriptor_va(0, ordinal),
+                self.memory.graph.descriptor_va(1, ordinal),
+                self.memory.graph.descriptor_client(0, ordinal),
+                self.memory.graph.descriptor_client(1, ordinal),
+                self.kicks[0].firmware_va() + kicks[0].entry_offset() as u64,
+                self.kicks[1].firmware_va() + kicks[1].entry_offset() as u64,
+                queues[0],
+                queues[1],
+                self.memory.manager.state_va(),
+                self.free_list.control_va(),
+                context.scheduler_va(),
+            );
+        }
         let registration = RenderRegistration::new(
             (qids[1], self.kicks[1].low_va()),
             (qids[0], self.kicks[0].low_va()),
@@ -804,6 +865,7 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
+        self.reinstall = [false; 2];
         self.outer_started |= ring;
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
             previous.publication = Some(ordinal);
@@ -927,7 +989,7 @@ impl<H: Host> retirement::Memory for Observer<'_, H> {
     fn stamps(&mut self) -> Result<[u32; 2]> {
         self.host.stamps(self.qids)
     }
-    fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]> {
+    fn pass(&mut self, ordinal: u64) -> Result<[u64; 4]> {
         self.memory.pass(ordinal)
     }
 }
@@ -987,8 +1049,19 @@ impl Pair {
         let Validated::Render { pass, .. } = &packet.command else {
             return Err(EINVAL);
         };
-        let required = target::Layout::new(pass, self.clusters)?.tvb_blocks;
+        let required = crate::g17::fw::buffer::layout_blocks(
+            target::Layout::new(pass, self.clusters)?.tvb_blocks,
+        );
         self.memory.manager.note_required(required, crate::g17::now_ns());
+        if !crate::g17::fw::buffer::host_resize_qualified() {
+            // HAL300 keeps its preallocated parameter buffer; a larger layout runs and lets
+            // firmware ask for growth (refused, or grown in 512-KiB units with bit 54).
+            if required > self.memory.manager.blocks() {
+                kernel::pr_warn_once!("asahi: HAL300 pass needs {} parameter-buffer blocks, has {}\n",
+                              required, self.memory.manager.blocks());
+            }
+            return Ok(None);
+        }
         if self.in_flight() {
             return Ok(None);
         }
@@ -1436,6 +1509,21 @@ impl Pair {
         Ok(true)
     }
 
+    /// A crashed HAL300 session is retained, not torn down: wake every waiter of this pair's
+    /// commands with `error` while each command stays owned. Nothing is retired or released,
+    /// because the hardware may still hold the mappings.
+    pub(crate) fn fail_owned(&self, error: Error) {
+        if let Some(prepared) = self.prepared.as_ref() {
+            prepared.packet.completion.fail_while_owned(error);
+        }
+        for active in self.active.iter() {
+            active.packet.completion.fail_while_owned(error);
+        }
+        if let Some(packet) = self.replay.as_ref() {
+            packet.completion.fail_while_owned(error);
+        }
+    }
+
     /// Both processors have stopped before the caller reaches this method.
     /// VM ownership settles before quarantined admission is rehabilitated.
     pub(crate) fn stopped(&mut self, defer: &mut impl FnMut(Deferred) -> Result) -> Result {
@@ -1521,7 +1609,7 @@ fn install_memory(
         ];
         let previous = words.map(|word| word.load(Ordering::Relaxed));
         let pages: u32 = (memory.manager.blocks()
-            * crate::hw::t8140::resources::TVB_PAGES_PER_BLOCK)
+            * crate::g17::fw::buffer::tvb_pages_per_block())
             .try_into()?;
         let next = crate::g17::fw::buffer::reload_descriptor(
             previous,
@@ -1622,6 +1710,10 @@ impl Pair {
         let (from, first) = self.switch?;
         (self.replay.is_some() || self.active.iter().any(|active| active.ticket.ordinal == first))
             .then_some(from)
+    }
+    /// Scheduler page of the last command published on this pair (zero before the first).
+    pub(crate) fn executed_scheduler(&self) -> u64 {
+        self.executed
     }
     pub(crate) fn take_retired_binding(&mut self) -> Option<RetiredBinding> {
         if self.displaced.is_some() {
@@ -1790,6 +1882,12 @@ impl Pair {
         if foreign {
             self.cursors = [0; 2];
             self.configs = [None; 2];
+            // New queue memory: the firmware's rows still name the previous owner's rings.
+            if crate::g17::fw::compute::g17g_selected()
+                && crate::g17::runtime::queue_reuse_enabled()
+            {
+                self.reinstall = [true; 2];
+            }
         }
         Ok(())
     }

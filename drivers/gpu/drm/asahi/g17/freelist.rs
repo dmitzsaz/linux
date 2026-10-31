@@ -309,6 +309,15 @@ impl RenderPool {
         })
     }
 
+    pub(crate) fn blocks(&self) -> usize {
+        self.blocks
+    }
+    /// HAL300 pool reuse: alias this pool's existing backing into another client VM at the
+    /// same lower-window address. Its id, control, state and firmware registration are
+    /// unchanged, so the next owner continues the same drained registration.
+    pub(crate) fn alias_client(&self, client: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing.lock().as_ref().ok_or(EAGAIN)?.pages.map_client(client)
+    }
     /// No backing is installed: the pool must be re-armed before staging.
     pub(crate) fn vacant(&self) -> bool {
         self.page_list.load(Ordering::Acquire) == 0
@@ -588,7 +597,15 @@ impl ComputePool {
     /// over so it stays consistent with the host submitted counter in `state`.
     pub(crate) fn rearm(&mut self, pages: Pages) -> Result {
         if self.pages.is_some() {
-            return Err(EBUSY);
+            // A HAL300 queue offered for reuse keeps the pages of its closed owner even
+            // after the firmware consumed their free-list release (the phase is Vacant).
+            // Installing the successor's backing replaces them; the old pages are only
+            // dropped here, after that release was witnessed.
+            if !(super::fw::compute::g17g_selected()
+                && super::runtime::queue_reuse_enabled())
+            {
+                return Err(EBUSY);
+            }
         }
         self.write_pages(&pages)?;
         self.pages = Some(pages);
@@ -685,6 +702,9 @@ pub(crate) struct Lease {
     commands: u32,
     phase: LeasePhase,
     previous_release: Option<u32>,
+    /// HAL300: this registration's owner is gone, so its next drained state is the final
+    /// reference the native AGXUSCPrivMemPool::complete publishes 0x2e for.
+    final_release: bool,
 }
 
 impl Lease {
@@ -700,6 +720,7 @@ impl Lease {
                 commands: 2,
                 phase: LeasePhase::Preparing,
                 previous_release: None,
+                final_release: false,
             });
         };
         if previous.owner.buffer_slot != owner.buffer_slot {
@@ -707,10 +728,19 @@ impl Lease {
         }
         let generation = previous.generation.checked_add(1).ok_or(EOVERFLOW)?;
         let same_owner = previous.owner == owner;
+        // HAL300 keeps a drained registration instead of releasing it after every idle gap
+        // (native AGXUSCPrivMemPool publishes 0x2e only for its final reference). Each 0x2e makes
+        // the firmware pause KSM scheduling; a pause that missed its 150 us acknowledgement
+        // behind busy work requested recovery (sol-render-heavy-study.md, Minecraft loading).
+        let retained = same_owner
+            && super::fw::compute::g17g_selected()
+            && previous.phase == LeasePhase::Ready
+            && previous.previous_release.is_none()
+            && previous.references == 0
+            && previous.commands == 0;
         let overlapping = same_owner
             && previous.phase == LeasePhase::Ready
-            && previous.references >= 2
-            && previous.commands >= 2;
+            && ((previous.references >= 2 && previous.commands >= 2) || retained);
         let reacquire = previous.reacquirable();
         if !overlapping && !reacquire {
             return Err(EBUSY);
@@ -728,6 +758,7 @@ impl Lease {
             commands,
             phase: LeasePhase::Preparing,
             previous_release: previous.release_witness(),
+            final_release: previous.final_release,
         })
     }
 
@@ -782,7 +813,17 @@ impl Lease {
         self.commands -= 2;
         Ok(self.pending_release())
     }
+    /// HAL300 only: the owner closed, so this registration may publish its final release once
+    /// it drains. Native publishes 0x2e for a pool's last reference, not for every idle gap.
+    pub(crate) fn mark_final(&mut self) {
+        self.final_release = true;
+    }
     pub(crate) fn pending_release(&self) -> Option<super::fw::channels::FreeListRelease> {
+        // HAL300 keeps a drained registration across idle gaps (Lease::acquire); only a closed
+        // owner releases it.
+        if super::fw::compute::g17g_selected() && !self.final_release {
+            return None;
+        }
         (self.phase == LeasePhase::Ready && self.references == 0).then(|| {
             super::fw::channels::FreeListRelease::new(self.generation, self.owner.buffer_slot)
         })

@@ -157,9 +157,14 @@ impl State {
         }
         let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
-        // Reuse a closed, exactly retired owner before consuming a new graph.
+        // Reuse a closed, exactly retired owner before consuming a new graph. HAL300 keeps a
+        // closed owner's pair, pool and scheduler until reboot (no 0x2e/0x13 is published for
+        // them), so such a pair never parks: a new owner placed there waited until ETIMEDOUT
+        // (asahi-render58-boot). It takes an unused slot instead.
+        let reuse = !crate::g17::fw::compute::g17g_selected()
+            || crate::g17::runtime::queue_reuse_enabled();
         let slot = (0..cfg::RENDER_SLOTS)
-            .filter(|slot| eligible(*slot) && self.released & (1u64 << slot) != 0)
+            .filter(|slot| reuse && eligible(*slot) && self.released & (1u64 << slot) != 0)
             .min_by_key(|slot| self.epochs[*slot])
             .or_else(|| {
                 (0..cfg::RENDER_SLOTS).find(|slot| eligible(*slot) && self.owners[*slot] == 0)
@@ -174,9 +179,12 @@ impl State {
         }
         let free = !self.active & Self::MASK & !self.quarantined & !self.kill_hold;
         let eligible = |slot: usize| free & (1u64 << slot) != 0;
+        let reuse = !crate::g17::fw::compute::g17g_selected()
+            || crate::g17::runtime::queue_reuse_enabled();
         let sibling = (0..cfg::RENDER_SLOTS)
             .filter(|slot| {
-                eligible(*slot)
+                reuse
+                    && eligible(*slot)
                     && self.owners[*slot] != owner
                     && self.released & (1u64 << slot) != 0
             })

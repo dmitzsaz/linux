@@ -99,6 +99,11 @@ impl Rings {
                 ReportRing::Trace => init.status_read_words::<EVENT_WORDS>(role, offset)?[0],
                 ReportRing::Statistics => init.status_read_words::<1>(role, offset)?[0],
             };
+            // HAL300 statistics also carry tag 32 (native AGXStatistics::
+            // recordStatisticsEntryFromFW), but consuming those records with the HAL200 entry
+            // stride preceded two firmware crashes in its slot bookkeeping (asahi-render62/63).
+            // Quarantining this ring at the first unknown tag is what the qualified desktop ran
+            // with, so keep it until the HAL300 statistics record layout is recovered.
             if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
                 return Err(EIO);
             }
@@ -120,6 +125,11 @@ impl Rings {
     /// The returned cursor is the value the consumer must reach to retire it.
     /// The caller announces the publication through the coprocessor mailbox.
     pub(crate) fn publish_control(init: &InitData, record: &ControlRecord) -> Result<u32> {
+        if !init.control_qualified(record.opcode()) {
+            // An unqualified HAL300 record is never published: callers keep what it would have
+            // released, as on a busy ring.
+            return Err(EAGAIN);
+        }
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);
@@ -132,6 +142,12 @@ impl Rings {
         }
         // InitData validates every mapping before the first write, then writes
         // record, packed tally, barrier, producer, barrier without failure.
+        // Every published control record, with the per-pass trace (debug_flags bit 62): with the
+        // idle policy each render pair registration publishes keep/allow records.
+        if crate::module_parameters::debug_flags.value() & (1 << 62) != 0 {
+            let b = record.bytes();
+            pr_info!("asahi: control slot {} {:02x?}\n", producer, &b[..0x20]);
+        }
         init.publish_control(
             producer,
             record.bytes(),

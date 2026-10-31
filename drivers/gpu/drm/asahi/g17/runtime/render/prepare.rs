@@ -97,6 +97,7 @@ impl super::super::Backend {
                 return Ok(());
             }
             let resources = BuildResources::new(firmware)?;
+            firmware.queues.render.adopt_spare_pool(&self.context);
             let build =
                 if let Some(entry) = firmware.queues.render.entries[usize::from(slot)].as_ref() {
                     if entry.pending_error.is_some() || entry.pending_timeout {
@@ -628,6 +629,11 @@ impl super::super::Backend {
             if !lease.is_current() {
                 return Err(EAGAIN);
             }
+            if crate::g17::fw::compute::g17g_selected()
+                && firmware.queues.render_turn_blocked(self.owner, crate::g17::now_ns())
+            {
+                return Err(EBUSY);
+            }
             let qids = firmware
                 .queues
                 .render
@@ -731,7 +737,15 @@ impl super::super::Backend {
             if packet.cancel_requested() || firmware.queues.render.entry(slot)?.closed {
                 return Err(ECANCELED);
             }
-            firmware.publish_render(self.owner, slot, packet, deferred)
+            // HAL300 serializes render work across logical owners (Registry::render_turn_blocked).
+            if crate::g17::fw::compute::g17g_selected()
+                && firmware.queues.render_turn_blocked(self.owner, crate::g17::now_ns())
+            {
+                return Err(EBUSY);
+            }
+            let published = firmware.publish_render(self.owner, slot, packet, deferred);
+            firmware.queues.render_turn_release(self.owner);
+            published
         })();
         let result = (|| {
             if published.is_err() && !packet.is_published() {

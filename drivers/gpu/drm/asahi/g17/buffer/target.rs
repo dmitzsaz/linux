@@ -169,6 +169,15 @@ impl Target {
         self.tpc.address
     }
 
+    /// Zeroes the current tail-pointer cache (native processFirmwareTACommandsRecovery,
+    /// H+8bbed90: "Failed to clear gpu tail pointers"). A TA pass the firmware cancelled leaves
+    /// stale tail pointers that the pair's next pass would follow (asahi-pw13/pw14 recovery
+    /// cascades). A TPC displaced by growth is not touched: HAL300 does not grow targets.
+    pub(crate) fn scrub_tpc(&mut self) {
+        self.tpc.backing.bytes_mut().fill(0);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Only the span consumed by this render is cleared. A small render does
     /// not clear a previous large target's complete retained record capacity.
     pub(crate) fn prepare(&mut self, ordinal: u64, layout: &Layout) -> Result<Addresses> {

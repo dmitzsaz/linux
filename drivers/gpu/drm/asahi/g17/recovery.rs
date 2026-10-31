@@ -32,6 +32,11 @@ const RECOVERY_POLLS: usize = 500;
 pub(super) struct Entries {
     guilty: u128,
     cancelled: u128,
+    /// Every QID with a valid record. On HAL300 each record is one kick the firmware cancelled
+    /// in its kick walker (P+0xfe64), whatever its other bits say.
+    recorded: u128,
+    /// QIDs of valid records flagged as TA queues (bit3).
+    ta: u128,
 }
 
 impl Entries {
@@ -41,6 +46,10 @@ impl Entries {
         }
         let qid = (flags >> 4) & 0x7f;
         let bit = 1u128 << qid;
+        self.recorded |= bit;
+        if flags & (1 << 3) != 0 {
+            self.ta |= bit;
+        }
         if flags & u32::from(GUILTY) != 0 {
             self.guilty |= bit;
         }
@@ -75,6 +84,14 @@ pub(super) trait Queues {
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
     fn release_retired_compute(&mut self);
+    /// Fails every VM that has published work in flight (HAL300 fail-all policy).
+    fn fail_all_in_flight(&mut self, error: Error);
+    /// Fails every VM that owns work on one of `qids`; returns how many VMs were failed.
+    fn fail_qid_owners(&mut self, qids: u128, error: Error) -> usize;
+    /// QIDs of every retained render pair (both halves).
+    fn render_qids(&self) -> u128;
+    /// Clears the TPC of every render pair whose TA QID is in `qids`; returns the pair count.
+    fn scrub_render_tpc(&mut self, qids: u128) -> usize;
 }
 
 /// Live shared-memory operations. The handshake word uses aligned 32-bit accesses; transitions
@@ -88,6 +105,10 @@ pub(super) trait Memory {
     fn entries(&self) -> Result<Entries>;
     /// One millisecond wait; this is polled because the firmware sends no state-3 notification.
     fn wait_tick(&self);
+    /// Whether this firmware's recovery fails all in-flight work instead of attributing it.
+    fn fail_all_policy(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -203,7 +224,10 @@ pub(super) fn service<H: Host>(
         host.clear_timestamps()?;
     }
     let mut sources = host.fault_sources()?;
-    let target_error = host.publish_recovery_targets();
+    // Native restartWorkQueue copies producers to recovery targets only for host-initiated
+    // recovery; the firmware-initiated (MMU, hang) path HAL300 serves bypasses that copy, and its
+    // reconstruction never reads the targets (sol-hal300-recovery-innocents-study.md section 1).
+    let target_error = if host.fail_all_policy() { None } else { host.publish_recovery_targets() };
     host.transition(1, 2)?;
     let mut recovered = false;
     for _ in 0..RECOVERY_POLLS {
@@ -221,11 +245,65 @@ pub(super) fn service<H: Host>(
     }
     // A failed table read leaves only the explicit blamed QID as evidence of guilt.
     let entries = host.entries().unwrap_or_default();
+    // HAL300: before releasing the firmware, clear the tail-pointer cache of every render pair
+    // whose TA kick was cancelled, as native processFirmwareTACommandsRecovery does at state 3
+    // (sol-hal300-recovery-innocents-study.md section 2).
+    let scrubbed = if host.fail_all_policy() { host.scrub_render_tpc(entries.ta) } else { 0 };
     host.transition(3, 0)?;
+    if scrubbed != 0 {
+        pr_info!("G17: recovery cleared the tail pointers of {} cancelled render pair(s)\n", scrubbed);
+    }
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
+
+    if host.fail_all_policy() {
+        // HAL300 (asahi-pw7/pw8-boot): the firmware kept running, reconstructed its queues and
+        // left one cleanup record per kick it cancelled - exactly the faulting kick, with bit1
+        // (data master and hardware slot match the report) and its QID - while every other
+        // queue's in-flight work simply continued and retired. So only the owners of recorded
+        // or blamed QIDs lose their work. If none can be resolved, or debug_flags bit 52 asks
+        // for the first conservative policy, every VM with work in flight loses it. Nothing is
+        // replayed either way.
+        // A record with bit1 (data master and hardware slot match the report) or the event's
+        // QID is guilty. Other records are innocent kicks the firmware cancelled: a cancelled
+        // render pass fails alone (ECANCELED, its VM stays usable, asahi-pw13-boot showed that
+        // failing those VMs kills the compositor on every recovery that catches it mid-frame);
+        // a cancelled compute kick has no partial-failure path here, so its owner fails too.
+        let guilty = entries.guilty | request.blamed.map_or(0, |qid| 1u128 << qid);
+        let cancelled = entries.recorded & !guilty;
+        let cancelled_render = cancelled & host.render_qids();
+        let qids = guilty | (cancelled & !cancelled_render);
+        let fail_all = crate::module_parameters::debug_flags.value() & (1 << 52) != 0;
+        let failed = if fail_all || qids == 0 { 0 } else { host.fail_qid_owners(qids, EIO) };
+        if failed != 0 && cancelled_render != 0 {
+            host.classify_work(&|status| {
+                if status.get() != 0 { Class::Guilty } else { Class::Spared }
+            });
+            host.settle_cancelled_renders(cancelled_render);
+        }
+        let action = if failed != 0 {
+            "failing the owners of those queues"
+        } else {
+            "failing all in-flight work"
+        };
+        pr_warn!(
+            "G17: GPU recovery (reason {:?}, firmware blamed queue {:?}, recorded queues {:#x}, guilty {:#x}, cancelled renders {:#x}): {}\n",
+            sources.reason,
+            request.blamed,
+            entries.recorded,
+            guilty,
+            cancelled_render,
+            action
+        );
+        if failed == 0 {
+            host.fail_all_in_flight(EIO);
+        }
+        let scan_error = host.rescan_compute().err();
+        host.release_retired_compute();
+        return Ok(ServiceResult { scan_error, target_error });
+    }
 
     let (cancelled, blame) = classify(host, entries, request.blamed, &mut sources);
     if let Some(qid) = request.blamed {

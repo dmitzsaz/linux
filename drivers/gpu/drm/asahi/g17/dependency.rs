@@ -17,12 +17,24 @@ pub(crate) fn inherited_error(error: Error) -> Error {
     }
 }
 
+/// HAL300 (G17G): a signalled input never fails its consumer, whatever error the producer ended
+/// with. A failed or cancelled producer fails only its own VM; its consumer runs on whatever the
+/// producer left behind. Inheriting it made the error self-perpetuating (asahi-pw57-boot): one
+/// frame of the compositor that a recovery cancelled poisoned the next frame, which depended on
+/// it, and so on for every later frame, so the compositor rendered nothing for hours while its
+/// fences kept completing. A compositor sampling a faulted client's buffer is the same case.
+pub(crate) fn producer_failure(status: i32) -> Result {
+    if status < 0 && !super::fw::compute::g17g_selected() {
+        Err(inherited_error(Error::from_errno(status)))
+    } else {
+        Ok(())
+    }
+}
+
 /// A replay's original host inputs must still be signalled. Treat an unmet
 /// input as a failed replay, never as a wait under the device mutex.
 pub(crate) fn replay_status(status: i32) -> Result {
-    if status == 0 { Err(EBUSY) }
-    else if status < 0 { Err(inherited_error(Error::from_errno(status))) }
-    else { Ok(()) }
+    if status == 0 { Err(EBUSY) } else { producer_failure(status) }
 }
 
 pub(crate) struct Frontier {

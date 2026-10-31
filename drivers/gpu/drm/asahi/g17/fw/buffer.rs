@@ -11,6 +11,110 @@ use kernel::prelude::*;
 pub(crate) const SCENES: usize = 0x50;
 pub(crate) const SCRATCH_SLOTS: usize = 0x24;
 pub(crate) const SCRATCH_STRIDE: u64 = 0x20;
+
+/// Distance between scene PB scratch slots. G17G (HAL300) addresses each slot at 64-byte
+/// granularity: its TA constructor masks scene+0x28 with !0x3f (0xfffffe0008bdfa70) while the
+/// fragment keeps !0xf, and the native allocator sizes slots in multiples of 0x40
+/// (0xfffffe0008bf2760). With 0x20 odd slots gave TA and fragment different records and the
+/// pages of every odd scene were never returned (sol-render-pb-return-study.md).
+pub(crate) fn scratch_stride() -> u64 {
+    if super::compute::g17g_selected() {
+        0x40
+    } else {
+        SCRATCH_STRIDE
+    }
+}
+/// Blocks every G17G (HAL300) parameter buffer starts with: 960 blocks (120 MiB, 3840 pages).
+/// 64 MiB filled up (control high-water 4074) at 120k full-window quads and a larger pass hung,
+/// since growth and partial rendering are not qualified (asahi-render49/53-boot). The normal
+/// maximum 0x45e (4472 pages) itself stalled Hyprland's fragment after ~1150 passes
+/// (asahi-render50-boot): at that size the PB reports that it can no longer grow. HAL300 reads its block inventory in another format
+/// (sol-render-pb-tiles-study.md), and host growth there left the primary firmware hung after
+/// a fragment retirement once Hyprland's small first pass had to grow (asahi-render37-boot),
+/// so the host never resizes a HAL300 parameter buffer.
+pub(crate) const HAL300_TVB_BLOCKS: usize = 960;
+pub(crate) fn host_resize_qualified() -> bool {
+    // HAL300 grows like the native host's checkUsage(): between passes, from the PB's own
+    // usage statistics (sol-hal300-pb-growth-study.md 4.2). Only in 512-KiB units: 128-KiB rows
+    // cannot be expanded by the HAL300 grow worker, and host growth in them hung (render37).
+    !super::compute::g17g_selected() || hal300_units()
+}
+/// Host shrink of an idle grown PB; not yet qualified on HAL300.
+pub(crate) fn host_shrink_qualified() -> bool {
+    !super::compute::g17g_selected()
+}
+/// HAL300 parameter-buffer inventory in the native 512-KiB unit (sixteen 32-KiB PB pages per
+/// block-table row): the HAL300 grow worker P+0x21868 expands each committed row into 16
+/// pages, so 128-KiB rows can only be preallocated, never grown (sol-render-pb-tiles-study.md
+/// section 2). Opt-in with debug_flags bit 54 until a boot qualifies it; the format then also
+/// admits event-driven growth. Bit 53 additionally starts every PB at the 32-unit minimum so
+/// ordinary loads exercise growth.
+pub(crate) fn hal300_units() -> bool {
+    // Default since phase2n59 (asahi-pw42/pw43: growth soaks clean); debug_flags bit 49
+    // restores the old 128-KiB preallocation. Bit 54, the former opt-in, is ignored.
+    super::compute::g17g_selected()
+        && crate::module_parameters::debug_flags.value() & (1 << 49) == 0
+}
+const HAL300_UNIT: usize = 0x8_0000;
+/// Bytes per parameter-buffer block (one inventory row).
+pub(crate) fn tvb_block_size() -> usize {
+    if hal300_units() {
+        HAL300_UNIT
+    } else {
+        cfg::TVB_BLOCK_SIZE
+    }
+}
+/// PB pages per block.
+pub(crate) fn tvb_pages_per_block() -> usize {
+    tvb_block_size() / cfg::TVB_PAGE as usize
+}
+/// Virtual stride per block: the block plus one unmapped 32-KiB guard page.
+pub(crate) fn tvb_block_stride() -> u64 {
+    tvb_block_size() as u64 + (cfg::TVB_BLOCK_STRIDE - cfg::TVB_BLOCK_SIZE as u64)
+}
+/// Most blocks one PB may hold: the inventory ring keeps one empty slot, and the typed page
+/// list holds TVB_BLOCK_SLOTS * 4 entries (838 sixteen-page units).
+pub(crate) fn tvb_max_blocks() -> usize {
+    cfg::TVB_MAX_BLOCKS
+        .min(cfg::TVB_BLOCK_SLOTS * cfg::TVB_PAGES_PER_BLOCK / tvb_pages_per_block())
+}
+/// Normal maximum the firmware grows a PB to on its own, in blocks (the same 140-MiB budget;
+/// in units the native host derives page thresholds with <<4).
+pub(crate) fn normal_max_blocks() -> usize {
+    if hal300_units() {
+        NORMAL_MAX_BLOCKS * cfg::TVB_BLOCK_SIZE / HAL300_UNIT
+    } else {
+        NORMAL_MAX_BLOCKS
+    }
+}
+/// Blocks added per firmware grow request (1.25 MiB on G17P, 2 MiB in HAL300 units).
+pub(crate) fn grow_blocks() -> usize {
+    if hal300_units() {
+        4
+    } else {
+        GROW_BLOCKS
+    }
+}
+/// A layout's block count (counted in 128-KiB blocks) in the current block unit.
+pub(crate) fn layout_blocks(layout: usize) -> usize {
+    (layout * cfg::TVB_BLOCK_SIZE).div_ceil(tvb_block_size())
+}
+pub(crate) fn initial_tvb_blocks(layout: usize) -> usize {
+    if hal300_units() {
+        // 240 units keep today's 120-MiB preallocation unless bit 53 asks for the minimum
+        // (the 32 rows the graph always lays out) to exercise growth.
+        let minimum = cfg::TVB_INITIAL_PAGES.len();
+        // Native-style small start (16 MiB) that the host grows from usage statistics; bit 53
+        // (the former opt-in) is ignored.
+        let start = minimum;
+        return layout_blocks(layout).max(start).max(minimum);
+    }
+    if host_resize_qualified() {
+        layout
+    } else {
+        layout.max(HAL300_TVB_BLOCKS)
+    }
+}
 pub(crate) const FIRST_SCENE: usize = 1;
 pub(crate) const PAGE_LIST: usize = 0x8000;
 pub(crate) const PAGE_LIST_BYTES: usize = 0x10000;
@@ -142,7 +246,7 @@ pub(crate) fn compact_page(address: u64) -> Result<u32> {
     let relative = address.checked_sub(cfg::USER_BASE).ok_or(EINVAL)?;
     if relative % cfg::TVB_PAGE != 0
         || address
-            .checked_add(cfg::TVB_BLOCK_SIZE as u64)
+            .checked_add(tvb_block_size() as u64)
             .ok_or(EOVERFLOW)?
             > cfg::USER_END
     {
@@ -155,7 +259,7 @@ impl Graph {
     pub(crate) fn init(&mut self, args: &GraphArgs<'_>) -> Result {
         if args.generation == 0
             || args.blocks.len() < cfg::TVB_INITIAL_PAGES.len()
-            || args.blocks.len() > cfg::TVB_MAX_BLOCKS
+            || args.blocks.len() > tvb_max_blocks()
         {
             return Err(EINVAL);
         }
@@ -166,24 +270,25 @@ impl Graph {
         }
         let stats = offset_va(args.fw_va, (CONTROL + 0x40) as u64)?;
         clear(self);
+        let per_block = tvb_pages_per_block();
         for (index, &address) in args.blocks.iter().enumerate() {
             let first = compact_page(address)?;
             self.blocks[index].first_page = first;
-            for page in 0..cfg::TVB_PAGES_PER_BLOCK {
-                self.pages[index * cfg::TVB_PAGES_PER_BLOCK + page] = first + page as u32;
+            for page in 0..per_block {
+                self.pages[index * per_block + page] = first + page as u32;
             }
         }
         for (index, scene) in self.scenes.iter_mut().enumerate() {
             scene.metric_client = offset_va(args.metrics.client, (index * 4) as u64)?;
             scene.metric_fw = offset_va(args.metrics.firmware, (index * 4) as u64)?;
-            scene.scratch = scratch + (index % SCRATCH_SLOTS) as u64 * SCRATCH_STRIDE;
+            scene.scratch = scratch + (index % SCRATCH_SLOTS) as u64 * scratch_stride();
             scene.statistics = stats;
         }
         self.scenes[FIRST_SCENE].generation = args.generation;
         self.control.total = args.blocks.len() as u32;
         self.control.committed = self.control.total;
         self.control.reset = 1;
-        let pages = (args.blocks.len() * cfg::TVB_PAGES_PER_BLOCK) as u32;
+        let pages = (args.blocks.len() * per_block) as u32;
         self.state.buffer_id = args.buffer_id;
         self.state.page_list_fw = offset_va(args.fw_va, PAGE_LIST as u64)?;
         self.state.page_list_client = args.page_list_client;
@@ -194,10 +299,16 @@ impl Graph {
         self.state.block_table = offset_va(args.fw_va, BLOCK_TABLE as u64)?;
         self.state.control = offset_va(args.fw_va, CONTROL as u64)?;
         self.state.last_page = pages - 1;
-        self.state.block_size = cfg::TVB_BLOCK_SIZE as u32;
+        self.state.block_size = tvb_block_size() as u32;
         self.state.counter = offset_va(args.fw_va, COUNTER as u64)?;
-        self.state.maximum_size = (cfg::TVB_BLOCK_SLOTS * 4) as u32;
-        self.state.normal_maximum_size = (NORMAL_MAX_BLOCKS * 4) as u32;
+        // Page thresholds: G17P keeps the public values; HAL300 units use blocks << 4.
+        if hal300_units() {
+            self.state.maximum_size = (tvb_max_blocks() * per_block) as u32;
+            self.state.normal_maximum_size = (normal_max_blocks() * per_block) as u32;
+        } else {
+            self.state.maximum_size = (cfg::TVB_BLOCK_SLOTS * 4) as u32;
+            self.state.normal_maximum_size = (NORMAL_MAX_BLOCKS * 4) as u32;
+        }
         self.state.discard = discard;
         Ok(())
     }
@@ -233,7 +344,7 @@ pub(crate) fn scene_registers(index: usize, scratch: u64, metrics: u64) -> Resul
     let scratch = scratch
         .checked_sub(cfg::USER_BASE)
         .ok_or(EINVAL)?
-        .checked_add((index % SCRATCH_SLOTS) as u64 * SCRATCH_STRIDE)
+        .checked_add((index % SCRATCH_SLOTS) as u64 * scratch_stride())
         .ok_or(EOVERFLOW)?;
     if scratch > u64::from(u32::MAX) || scratch & 0xf != 0 {
         return Err(EINVAL);

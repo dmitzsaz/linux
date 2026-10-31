@@ -69,6 +69,13 @@ impl Pools {
             .is_some_and(|lease| lease.released())
     }
 
+    /// Marks the registration of a closed owner's pool as releasable (HAL300 final reference).
+    pub(super) fn mark_final(&mut self, id: u16) {
+        if let Some(lease) = Self::slot(id).ok().and_then(|slot| self.leases[slot].as_mut()) {
+            lease.mark_final();
+        }
+    }
+
     pub(super) fn released(&self, id: u32, _control: u64) -> bool {
         self.leases
             .get(id as usize)
@@ -223,7 +230,9 @@ impl Pools {
             page_count: words[2].load(Ordering::Relaxed),
             unk_18: words[3].load(Ordering::Relaxed),
         };
-        if descriptor.page_list != state.descriptor(descriptor.unk_18).page_list {
+        // Bits 61..63 carry firmware state on G17G (native halStoreUMADesc), not the address.
+        const ADDRESS: u64 = !(7u64 << 61);
+        if descriptor.page_list & ADDRESS != state.descriptor(descriptor.unk_18).page_list & ADDRESS {
             return Err(EIO);
         }
         pool.store_page_pool_state(state.updated(&descriptor))

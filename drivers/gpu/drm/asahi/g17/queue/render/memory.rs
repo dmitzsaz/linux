@@ -21,6 +21,8 @@ use core::sync::atomic::Ordering;
 use kernel::{prelude::*, sync::Arc};
 
 pub(super) const RECORDS: usize = 32;
+/// Bytes per pass in the timestamp page: `{u64 ta_start, ta_end, fragment_start, fragment_end}`.
+pub(super) const TIMESTAMP_STRIDE: usize = 32;
 pub(super) const TA_BYTES: usize = 0x14000;
 pub(super) const FRAGMENT_BYTES: usize = 0x48000;
 pub(super) const GRAPH_SIZE: usize = 0x1c000;
@@ -389,7 +391,8 @@ impl Memory {
         let state = Generation::allocate_state(alloc, vm)?;
         let scratch = Compact::new(alloc, vm, cfg::SCENE_SIZE as usize)?;
         let discard = Compact::new(alloc, vm, cfg::DISCARD_SIZE as usize)?;
-        let (tvb, mappings) = buffer::Tvb::new(alloc.dev, vm, layout.tvb_blocks)?;
+        let (tvb, mappings) =
+            buffer::Tvb::new(alloc.dev, vm, fw::buffer::initial_tvb_blocks(layout.tvb_blocks))?;
         let count = DEPTH;
         let initial = if ordinal == 0 {
             0
@@ -450,6 +453,38 @@ impl Memory {
             mmu::PROT_GPU_SHARED_RO,
             0,
         )?;
+        // One line per render pair: the client-lower layout the seeded-DVFS UMA_CORE fault
+        // (VA 0x708024c000, another client's context) is located against.
+        // Per-client address map, with the per-pass trace (debug_flags bit 62).
+        if crate::g17::fw::compute::g17g_selected()
+            && crate::module_parameters::debug_flags.value() & (1 << 62) != 0
+        {
+            let state = |index: usize| {
+                generations[index].as_ref().map_or(0, |generation: &KBox<Generation>| {
+                    generation.state.gpu_va()
+                })
+            };
+            pr_info!(
+                "asahi: HAL300 render memory context {} qids {}/{} states {:#x} {:#x} \
+                 (size {:#x}, ta_status +{:#x}) registers {:#x} fragment_view {:#x} \
+                 pb {} x {:#x} (normal max {}, max {}) buffer {} page_list {:#x}\n",
+                context.id(),
+                qids[0],
+                qids[1],
+                state(0),
+                if DEPTH > 1 { state(1) } else { 0 },
+                storage::STATE_SIZE,
+                storage::TA_STATUS,
+                registers.gpu_va(),
+                fragment_view.iova(),
+                fw::buffer::initial_tvb_blocks(layout.tvb_blocks),
+                fw::buffer::tvb_block_size(),
+                fw::buffer::normal_max_blocks(),
+                fw::buffer::tvb_max_blocks(),
+                buffer_id.0,
+                manager.page_list_va(),
+            );
+        }
         Ok((
             storage.write_init(kernel::try_init!(Self {
                 graph,
@@ -480,15 +515,20 @@ impl Memory {
                 .as_ref()
                 .is_some_and(|generation| generation.ordinal == Some(ordinal))
     }
-    pub(super) fn pass(&self, ordinal: u64) -> Result<[u64; 2]> {
+    /// This pass's four raw 24 MHz timestamps: TA start/end then fragment start/end, each
+    /// written by the firmware through its own descriptor field (TA 0x8fe/0x906, fragment
+    /// 0x2198/0x21a0; sol-hal300-timestamp-study.md).
+    pub(super) fn pass(&self, ordinal: u64) -> Result<[u64; 4]> {
         if !self.owns(ordinal) {
             return Err(EIO);
         }
-        let offset = ordinal as usize % RECORDS * 16;
-        Ok([
-            self.timestamps.dword(offset)?.load(Ordering::Relaxed),
-            self.timestamps.dword(offset + 8)?.load(Ordering::Relaxed),
-        ])
+        let offset = ordinal as usize % RECORDS * TIMESTAMP_STRIDE;
+        let word = |index: usize| {
+            self.timestamps
+                .dword(offset + index * 8)
+                .map(|w| w.load(Ordering::Relaxed))
+        };
+        Ok([word(0)?, word(1)?, word(2)?, word(3)?])
     }
     pub(super) fn owners(&self) -> [Option<u64>; DEPTH] {
         core::array::from_fn(|index| self.generations[index].as_ref().and_then(|g| g.ordinal))

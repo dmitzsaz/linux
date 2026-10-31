@@ -16,6 +16,8 @@ mod events;
 mod feed;
 mod render;
 pub(super) mod teardown;
+pub(super) use render::{render_serialize, set_render_serialize};
+pub(super) use events::POLL_WANTED;
 
 pub(super) use super::now_ns;
 use super::{
@@ -28,6 +30,27 @@ use super::{
 use super::preparation::Admission;
 use core::sync::atomic::{fence, Ordering};
 use kernel::{prelude::*, sync::Arc};
+
+/// HAL300 queue, context, pair-memory and render-pool reuse. On by default since
+/// asahi-reuse18-boot (80 GL clients, desktop transitions and Minecraft relaunches with flat
+/// resources); debug_flags bit 57 restores the earlier retain-until-reboot behaviour.
+pub(crate) fn queue_reuse_enabled() -> bool {
+    super::fw::compute::g17g_selected()
+        && crate::module_parameters::debug_flags.value() & (1 << 57) == 0
+}
+
+/// J704_REUSE diagnostics, with the per-pass trace (debug_flags bit 62).
+pub(crate) fn reuse_trace_enabled() -> bool {
+    queue_reuse_enabled() && crate::module_parameters::debug_flags.value() & (1 << 62) != 0
+}
+
+/// Names the step of a compute publication that failed, while queue reuse is enabled.
+fn reuse_trace(step: &str, error: Error) -> Error {
+    if reuse_trace_enabled() {
+        pr_info!("J704_REUSE step={} error={:?}\n", step, error);
+    }
+    error
+}
 
 const QIDS: usize = 128;
 const FIRST_COMPUTE_QID: u8 = 4;
@@ -131,7 +154,15 @@ impl Registry {
         }
         // Physical channels are a device budget, not a permanent entitlement
         // of each open logical queue. Only exact idle retirement can yield one.
+        // HAL300: a live owner keeps its channel. Handing an idle queue of a running client
+        // to another VM left the new owner's compute kick without completion, and a render
+        // pass that waited on it blocked every later TA of all clients (asahi-render38-boot:
+        // Hyprland + XWayland + glxgears). Queues of exited owners are still reused.
+        let share = !super::fw::compute::g17g_selected();
         for queue in self.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+            if !share {
+                break;
+            }
             admission.check()?;
             queue.share_idle()?;
         }
@@ -148,7 +179,18 @@ impl Registry {
             // The release of the scheduler these records were bound to is armed
             // or not yet consumed: the firmware may process it against this
             // queue, which therefore must not change owner until it has.
-            if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+            //
+            // HAL300 publishes no scheduler release at all, so a closed owner's entry
+            // stays Draining for the rest of the boot and this test would reject every
+            // queue forever: each client then consumed one more QID (measured: ten
+            // sequential clients, scan mask 0xfc -> 0x1fffc) until the channel budget
+            // refused the next one. There is no release in flight to race here, and the
+            // retirement witnesses in reusable() are unchanged; the successor
+            // re-registers the QID (Compute::reinstall).
+            let releasing = queue
+                .context()
+                .is_some_and(|bound| teardown.releasing(bound));
+            if releasing && !(super::fw::compute::g17g_selected() && queue_reuse_enabled()) {
                 continue;
             }
             if queue.pool_vacant() {
@@ -159,7 +201,13 @@ impl Registry {
             queue.bind_owner(owner, context.clone())?;
             return Ok(Rebind::Done);
         }
-        Ok(vacant.map_or(Rebind::Fresh, Rebind::Rearm))
+        let decision = vacant.map_or(Rebind::Fresh, Rebind::Rearm);
+        if reuse_trace_enabled() {
+            pr_info!("J704_REUSE rebind decision={}\n",
+                match decision { Rebind::Rearm(qid) => qid as i32, Rebind::Fresh => -1,
+                                 Rebind::Done => -2, Rebind::Grow => -3 });
+        }
+        Ok(decision)
     }
 
     /// Installs fresh USC backing into the vacant queue `qid`; the caller writes
@@ -177,7 +225,11 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid)
             .ok_or(EAGAIN)?;
-        queue.rearm(pages, ring)
+        let result = queue.rearm(pages, ring);
+        if reuse_trace_enabled() {
+            pr_info!("J704_REUSE rearm qid={} ok={}\n", qid, result.is_ok());
+        }
+        result
     }
 
     pub(super) fn bind_rearmed(&mut self, qid: u8, owner: u64, context: &Arc<Context>) -> Result {
@@ -189,11 +241,19 @@ impl Registry {
             .filter_map(|entry| entry.queue.as_deref_mut())
             .find(|queue| queue.qid() == qid && queue.reusable())
             .ok_or(EAGAIN)?;
-        // Its last owner may have closed while the backing was rebuilt.
-        if queue.context().is_some_and(|bound| teardown.releasing(bound)) {
+        // Its last owner may have closed while the backing was rebuilt. On HAL300 that
+        // entry never leaves Draining (no scheduler release is published), so it cannot
+        // mean a release is in flight; see rebind_compute.
+        if queue.context().is_some_and(|bound| teardown.releasing(bound))
+            && !(super::fw::compute::g17g_selected() && queue_reuse_enabled())
+        {
             return Err(EAGAIN);
         }
-        queue.bind_owner(owner, context.clone())
+        let result = queue.bind_owner(owner, context.clone());
+        if reuse_trace_enabled() {
+            pr_info!("J704_REUSE bind_rearmed qid={} ok={}\n", qid, result.is_ok());
+        }
+        result
     }
 
     /// Delay before retrying pools a turn could not release.
@@ -846,6 +906,13 @@ impl Backend {
                         Err(error) if error == EAGAIN => continue,
                         result => result?,
                     };
+                    if super::fw::compute::g17g_selected() && queue_reuse_enabled() {
+                        let view = crate::g17::qos::View::new(firmware.init.qos()?)?;
+                        let stale = firmware.queues.accounting.retire_stale(&view, qid)?;
+                        if reuse_trace_enabled() {
+                            pr_info!("J704_REUSE qid={} stale_qos_tickets={}\n", qid, stale);
+                        }
+                    }
                     // The firmware consumed this slot's release before the backing
                     // was dropped; the row is rewritten before the queue is kicked.
                     firmware.init.initialize_compute_pool_blocks(slot, page_list, required)?;
@@ -1116,6 +1183,16 @@ impl super::Firmware {
         {
             return Err(EAGAIN);
         }
+        // The lab recipe invalidated the USC caches (control 0x33, three domains) before every
+        // compute kick. Natively that control is a user-client request
+        // (AGXDeviceUserClient::invalidateICache), not part of each dispatch, and render kicks
+        // never had it. Issued per kick it deadlocked mixed workloads: the firmware defers the
+        // control while a fragment pass is in flight, and that pass can wait for the compute
+        // kick queued behind it (Hyprland through Zink: fragment 150 of 151 stuck, two compute
+        // slots never consumed). Kept for an explicit request only.
+        if self.retained && USC_CACHE_INVALIDATE_PER_KICK {
+            self.invalidate_usc_caches(packet.context.id())?;
+        }
         let queues = &mut self.queues;
         let queue = queues
             .compute
@@ -1147,6 +1224,48 @@ impl super::Firmware {
     }
 }
 
+/// Whether every HAL300 compute kick is preceded by the USC cache controls (see the call site).
+const USC_CACHE_INVALIDATE_PER_KICK: bool = false;
+
+/// Bound of the wait for the HAL300 USC cache controls to retire, in 100 µs polls.
+const USC_CACHE_RETIRE_POLLS: usize = 3000;
+
+impl super::Firmware {
+    /// HAL300: publishes the three native USC cache controls of UAT context `context`, as before
+    /// every qualified M5 dispatch, and waits a bounded time for the last one to retire. The
+    /// device mutex is held.
+    ///
+    /// Not retiring is not fatal: the firmware can defer the invalidation while render work of
+    /// the same client is in flight, and that render may itself wait for the compute kick that
+    /// follows (Hyprland through Zink). Failing the kick then deadlocked into a lost device; the
+    /// published controls still retire in ring order once the pipeline drains.
+    fn invalidate_usc_caches(&mut self, context: u32) -> Result {
+        use super::fw::channels::{ControlRecord, UscCacheInvalidate};
+        let mut target = 0;
+        for domain in UscCacheInvalidate::DOMAINS {
+            target = self.publish_control(&ControlRecord::UscCacheInvalidate(
+                UscCacheInvalidate::new(domain, context),
+            ))?;
+        }
+        for _ in 0..USC_CACHE_RETIRE_POLLS {
+            let [consumer, unk_10, _] = self.init.control_counters()?;
+            if consumer == target && unk_10 == target {
+                return Ok(());
+            }
+            kernel::time::delay::fsleep(kernel::time::Delta::from_micros(100));
+        }
+        static REPORTED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+        if REPORTED.fetch_add(1, Ordering::Relaxed) < 8 {
+            dev_warn!(
+                self.primary.state.shared.dev.as_ref(),
+                "USC cache controls of context {} still pending after 0.3 s; publishing the kick\n",
+                context
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Registry {
     fn release_compute_witness(
         &mut self,
@@ -1175,7 +1294,7 @@ impl Registry {
         Ok(queue.spared_pending())
     }
 
-    fn fail_compute_vm(
+    pub(in crate::g17) fn fail_compute_vm(
         &mut self,
         status: &Arc<super::status::VmStatus>,
         error: Error,
@@ -1203,6 +1322,21 @@ impl super::Firmware {
     /// Latch one shared snapshot for all selected queues before settling any VM.
     /// A later queue's exact success in this batch wins over a peer's failure.
     fn scan_compute(&mut self, masks: Option<[u64; 2]>, deferred: &mut DeferredBatch) -> Result {
+        self.scan_compute_ring(masks, false, deferred)
+    }
+
+    /// As [`Self::scan_compute`], reading the whole completion ring instead of only the slots
+    /// written since the last scan (recovery rescans).
+    fn scan_compute_full(&mut self, masks: Option<[u64; 2]>, deferred: &mut DeferredBatch) -> Result {
+        self.scan_compute_ring(masks, true, deferred)
+    }
+
+    fn scan_compute_ring(
+        &mut self,
+        masks: Option<[u64; 2]>,
+        full: bool,
+        deferred: &mut DeferredBatch,
+    ) -> Result {
         let state = super::recovery::Memory::recovery_state(&self.init)?;
         let generation = self.recovery.generation();
         let registry = &mut self.queues;
@@ -1218,7 +1352,7 @@ impl super::Firmware {
         }
         if requested {
             self.init
-                .scan_compute_completions(|record| registry.observations.fold(record))?;
+                .scan_compute_completions(full, |record| registry.observations.fold(record))?;
         }
         let view = qos::View::new(self.init.qos()?)?;
         for queue in registry
@@ -1299,7 +1433,7 @@ impl Backend {
         // No new command has been accepted. Keep the spared queue and its
         // retained work intact until a later admission observes its witness.
         admission.check()?;
-        Err(EBUSY)
+        Err(reuse_trace("spared_wait", EBUSY))
     }
 
     /// Called after taking this packet's publication claim. All waits and work
@@ -1326,9 +1460,11 @@ impl Backend {
             // All DRM dependencies were satisfied before this scheduler callback.
             // Recheck on every retry: pressure may yield an idle binding between
             // admission and publication without changing this logical queue.
-            Backend::ensure_compute(self, scratch.pages(), &admission)?;
+            Backend::ensure_compute(self, scratch.pages(), &admission)
+                .map_err(|e| reuse_trace("ensure_compute", e))?;
             admission.check()?;
-            let lease = self.shared.preparations.enter_until(&admission)?;
+            let lease = self.shared.preparations.enter_until(&admission)
+                .map_err(|e| reuse_trace("preparations", e))?;
             // Work states free as this context's earlier commands retire.
             // Wait for one under the packet's admission deadline, as render
             // publication does, instead of failing the packet.
@@ -1362,7 +1498,7 @@ impl Backend {
             let recovery_state = super::recovery::Memory::recovery_state(&firmware.init)?;
             if firmware.recovery.pending() || recovery_state != 0 {
                 if recovery_polls == RECOVERY_SETTLE_POLLS {
-                    return Err(EBUSY);
+                    return Err(reuse_trace("recovery_settle", EBUSY));
                 }
                 recovery_polls += 1;
                 drop(state);
@@ -1371,13 +1507,15 @@ impl Backend {
                 kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
                 continue;
             }
-            firmware.replay_compute(deferred)?;
+            firmware.replay_compute(deferred)
+                .map_err(|e| reuse_trace("replay_compute", e))?;
             if firmware.queues.compute(self.owner).is_none() {
                 drop(state);
                 drop(lease);
                 continue;
             }
-            let dependencies = firmware.queues.render_prefix(self.owner, packet)?;
+            let dependencies = firmware.queues.render_prefix(self.owner, packet)
+                .map_err(|e| reuse_trace("render_prefix", e))?;
             admission.check()?;
             let result = firmware.publish_compute(
                 self.owner,
@@ -1385,6 +1523,9 @@ impl Backend {
                 dependencies.as_slice(),
                 deferred,
             );
+            if let Err(error) = result {
+                reuse_trace("publish_compute", error);
+            }
             if matches!(result, Err(EBUSY) | Err(EAGAIN))
                 && !packet.is_published()
                 && (firmware.recovery.pending()
@@ -1415,6 +1556,21 @@ impl Backend {
 }
 
 impl super::Firmware {
+    /// Wakes every in-flight render and compute command of a retained (HAL300) session with
+    /// `error`. The commands, their mappings and the queues stay owned by the leaked session.
+    fn fail_retained_in_flight(&self, error: Error) {
+        self.fail_render_owned(error);
+        for queue in self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            queue.fail_owned(error);
+        }
+    }
+
     /// Both processors are stopped and their owner detached before this call.
     /// Error fences release their command mappings without the device mutex
     /// or an allocation-dependent collector.
@@ -1475,7 +1631,18 @@ impl super::Shared {
             return;
         }
         let firmware = self.state.lock().take();
-        if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
+        if let Some(mut firmware) = firmware {
+            if firmware.retained {
+                // A HAL300 session is never stopped or released; its coprocessors keep it.
+                // Its in-flight commands must still complete: an unsignalled fence kept the
+                // display's atomic commit waiting for ever after a primary crash (Arch SD boot,
+                // 2026-10-30: frozen panel, kworker in drm_atomic_helper_wait_for_fences).
+                firmware.fail_retained_in_flight(EIO);
+                KBox::leak(firmware);
+                return;
+            }
+            firmware.finish_stopped_queues();
+        }
     }
 
     /// Joins construction and complete host teardown, including RTKit drops.
@@ -1496,6 +1663,10 @@ impl super::Shared {
             state.take()
         };
         if let Some(mut firmware) = firmware {
+            if firmware.retained {
+                KBox::leak(firmware);
+                return;
+            }
             firmware.finish_stopped_queues();
             // RTKit destruction still dereferences the mailbox provider.
             drop(firmware);
@@ -1568,6 +1739,13 @@ impl super::Firmware {
 
 
 impl Registry {
+    pub(super) fn write_render_observation(
+        &self,
+        f: &mut kernel::fmt::Formatter<'_>,
+    ) -> kernel::fmt::Result {
+        self.render.write_observation(f)
+    }
+
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         self.qids.write_capacity(f)?;
         self.admission.write_capacity(f)?;
@@ -1611,7 +1789,12 @@ impl Backend {
             if firmware.recovery.pending() || super::recovery::Memory::recovery_state(&firmware.init)? != 0 {
                 return Ok(());
             }
+            // HAL300 never hands a live owner's channel to another VM (see rebind_compute).
+            let share = !super::fw::compute::g17g_selected();
             for queue in firmware.queues.compute.iter_mut().flatten().filter_map(|entry| entry.queue.as_deref_mut()) {
+                if !share {
+                    break;
+                }
                 admission.check()?;
                 queue.share_idle()?;
             }

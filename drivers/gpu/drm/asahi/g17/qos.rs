@@ -185,6 +185,31 @@ impl Accounting {
         self.complete(view, &[ticket.owner])
     }
 
+    /// Completes whatever this QID still counts as in flight for its previous owner and
+    /// returns how many tickets that was. Only for a physical queue whose own retirement
+    /// was already witnessed (no active work), when it changes owner: on HAL300 a closed
+    /// owner's last tickets are not completed through the ordinary witness, so the row
+    /// still names the old QoS slot and the successor's first publication is refused.
+    pub(crate) fn retire_stale(&mut self, view: &View<'_>, qid: u8) -> Result<u32> {
+        let index = usize::from(qid);
+        if index >= fw::QUEUES {
+            return Err(EINVAL);
+        }
+        let count = self.in_flight[index];
+        if count == 0 {
+            return Ok(0);
+        }
+        let owner = Owner {
+            qid,
+            qos: view.rows[index][0].load(Ordering::Relaxed),
+            data_master: self.dm_by_qid[index],
+        };
+        for _ in 0..count {
+            self.complete(view, &[owner])?;
+        }
+        Ok(count)
+    }
+
     /// Preflights the entire set before clearing any final row. QID membership,
     /// scheduler mappings and monotonically increasing counts remain intact.
     pub(crate) fn complete(&mut self, view: &View<'_>, owners: &[Owner]) -> Result {

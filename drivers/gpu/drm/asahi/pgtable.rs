@@ -117,6 +117,102 @@ pub(crate) fn clean_invalidate_poc(ptr: *const u8, len: usize) {
     }
 }
 
+/// A bootloader-reserved range of page-table pages outside the kernel linear map.
+///
+/// T8142 (M5) keeps the firmware kernel roots and the shared second-level table of the kernel
+/// window outside System RAM, so the driver reaches them through a mapping created for the
+/// lifetime of the firmware session. Pages below them are ordinary driver-allocated RAM.
+struct ForeignTables {
+    base: AtomicU64,
+    size: AtomicU64,
+    map: AtomicU64,
+}
+
+const NO_FOREIGN: ForeignTables = ForeignTables {
+    base: AtomicU64::new(0),
+    size: AtomicU64::new(0),
+    map: AtomicU64::new(0),
+};
+
+static FOREIGN_TABLES: [ForeignTables; 4] = [NO_FOREIGN; 4];
+
+/// Registers the kernel mapping of a reserved range of page-table pages, once per range.
+///
+/// # Safety
+///
+/// `map` must map `size` bytes at physical `base`, stay valid until reboot, and the range must
+/// not be System RAM.
+pub(crate) unsafe fn register_foreign_tables(
+    base: PhysicalAddr,
+    size: usize,
+    map: *mut u8,
+) -> Result {
+    if base & (UAT_PGMSK as PhysicalAddr) != 0 || size == 0 || size % UAT_PGSZ != 0 {
+        return Err(EINVAL);
+    }
+    for slot in &FOREIGN_TABLES {
+        let start = slot.base.load(Ordering::Acquire);
+        if start == 0 {
+            slot.map.store(map as u64, Ordering::Relaxed);
+            slot.size.store(size as u64, Ordering::Relaxed);
+            slot.base.store(base, Ordering::Release);
+            return Ok(());
+        }
+        let end = start + slot.size.load(Ordering::Relaxed);
+        if base < end && start < base + size as u64 {
+            return Err(EBUSY);
+        }
+    }
+    Err(ENOSPC)
+}
+
+/// The kernel address of the registered foreign table page at `phys`, if any.
+fn foreign_table(phys: PhysicalAddr) -> Option<*mut u8> {
+    for slot in &FOREIGN_TABLES {
+        let start = slot.base.load(Ordering::Acquire);
+        if start == 0 {
+            return None;
+        }
+        let size = slot.size.load(Ordering::Relaxed);
+        if phys >= start && phys - start < size {
+            let map = slot.map.load(Ordering::Relaxed) as usize;
+            return Some((map + (phys - start) as usize) as *mut u8);
+        }
+    }
+    None
+}
+
+/// Runs `f` on `len` bytes at `off` in the page-table page at `phys`, which is either a
+/// registered foreign table page or a page in RAM.
+///
+/// # Safety
+///
+/// `phys` must be a page-table page that stays allocated while `f` runs.
+unsafe fn with_table_page<T>(
+    phys: PhysicalAddr,
+    off: usize,
+    len: usize,
+    f: impl FnOnce(*mut u8) -> Result<T>,
+) -> Result<T> {
+    if off > UAT_PGSZ || len > UAT_PGSZ - off {
+        return Err(EINVAL);
+    }
+    if let Some(page) = foreign_table(phys & !(UAT_PGMSK as PhysicalAddr)) {
+        // SAFETY: The registered mapping covers the whole page, and `off + len` is in bounds.
+        return f(unsafe { page.add(off) });
+    }
+    // SAFETY: Per the safety requirements this is a live page-table page; a page that is not
+    // foreign is a RAM page the driver or the bootloader allocated.
+    let page = unsafe { Page::borrow_phys_unchecked(&phys) };
+    page.with_pointer_into_page(off, len, f)
+}
+
+/// Whether `phys` is a page the driver can reach: in RAM or a registered foreign table.
+fn table_reachable(phys: PhysicalAddr) -> bool {
+    // SAFETY: Only checks whether a struct page exists for RAM.
+    foreign_table(phys).is_some() || unsafe { Page::borrow_phys(&phys) }.is_some()
+}
+
 /// Completes earlier point-of-coherency maintenance for the whole system (`dsb sy`).
 pub(crate) fn poc_barrier() {
     // SAFETY: Barriers are always safe.
@@ -138,15 +234,18 @@ pub(crate) unsafe fn with_root_entries<R>(
     if count > UAT_NPTE {
         return Err(EINVAL);
     }
-    // SAFETY: The caller guarantees that `ttb` is an allocated page in RAM.
-    let page = unsafe { Page::borrow_phys(&ttb) }.ok_or(EIO)?;
-    page.with_pointer_into_page(0, count * PTE_SIZE, |p| {
-        // SAFETY: with_pointer_into_page() ensures the pointer is valid for `count` PTEs, and page
-        // table entries are naturally aligned.
-        Ok(f(unsafe {
-            core::slice::from_raw_parts(p as *const AtomicU64, count)
-        }))
-    })
+    if !table_reachable(ttb) {
+        return Err(EIO);
+    }
+    // SAFETY: The caller guarantees that `ttb` is an allocated root, in RAM or registered as a
+    // foreign table page.
+    unsafe {
+        with_table_page(ttb, 0, count * PTE_SIZE, |p| {
+            // SAFETY: The pointer is valid for `count` PTEs, and page table entries are naturally
+            // aligned.
+            Ok(f(core::slice::from_raw_parts(p as *const AtomicU64, count)))
+        })
+    }
 }
 
 const PTE_TYPE_BITS: u64 = 3;
@@ -341,12 +440,16 @@ impl UatPageTable {
     #[cfg(CONFIG_DRM_ASAHI_G16)]
     pub(crate) fn enable_clean_poc(&mut self) -> Result {
         self.clean_poc = true;
-        // SAFETY: The root is a RAM page owned or borrowed by this page table for its lifetime.
-        let root = unsafe { Page::borrow_phys(&self.ttb) }.ok_or(EIO)?;
-        root.with_pointer_into_page(0, UAT_PGSZ, |p| {
-            clean_poc(p, UAT_PGSZ);
-            Ok(())
-        })?;
+        if !table_reachable(self.ttb) {
+            return Err(EIO);
+        }
+        // SAFETY: The root is a page owned or borrowed by this page table for its lifetime.
+        unsafe {
+            with_table_page(self.ttb, 0, UAT_PGSZ, |p| {
+                clean_poc(p, UAT_PGSZ);
+                Ok(())
+            })
+        }?;
         poc_barrier();
         Ok(())
     }
@@ -387,7 +490,7 @@ impl UatPageTable {
             return Err(EINVAL);
         }
         // SAFETY: The bootloader-managed root stays valid while this page table exists.
-        if unsafe { Page::borrow_phys(&ttb) }.is_none() {
+        if !table_reachable(ttb) {
             pr_err!(
                 "UATPageTable::new_with_ttb: ttb at {:#x} is not mapped (DT using no-map?)\n",
                 ttb
@@ -526,14 +629,10 @@ impl UatPageTable {
                     );
                     let upidx = ((iova >> (UAT_PGBIT + (level + 1) * UAT_LVBIT) as u64) & UAT_LVMSK)
                         as usize;
-                    // SAFETY: Page table addresses are either allocated by us, or
-                    // firmware-managed and safe to borrow a struct page from.
-                    let upt = unsafe { Page::borrow_phys_unchecked(&phys) };
                     mod_pr_debug!("UATPageTable::with_pages: borrowed phys {:#x}\n", phys);
-                    pt_addr[level] =
-                        upt.with_pointer_into_page(upidx * PTE_SIZE, PTE_SIZE, |p| {
+                    let entry = |p: *mut u8| -> Result<Option<PhysicalAddr>> {
                             let uptep = p as *const _ as *const Pte;
-                            // SAFETY: with_pointer_into_page() ensures the pointer is valid,
+                            // SAFETY: with_table_page() ensures the pointer is valid,
                             // and our index is aligned so it is safe to deref as an AtomicU64.
                             let upte = unsafe { &*uptep };
                             let mut upte_val = upte.load(Ordering::Relaxed);
@@ -574,7 +673,11 @@ impl UatPageTable {
                                         iova, level + 1, phys + ((upidx * PTE_SIZE) as PhysicalAddr));
                                 Ok(None)
                             }
-                        })?;
+                        };
+                    // SAFETY: Page table addresses are either allocated by us, or
+                    // firmware-managed RAM or registered foreign table pages.
+                    pt_addr[level] =
+                        unsafe { with_table_page(phys, upidx * PTE_SIZE, PTE_SIZE, entry) }?;
                     if pt_addr[level].is_some() {
                         pt_parent[level] = Some((phys, upidx));
                     }
@@ -610,13 +713,10 @@ impl UatPageTable {
                 count,
                 iova
             );
-            // SAFETY: Page table addresses are either allocated by us, or
-            // firmware-managed and safe to borrow a struct page from.
-            let pt = unsafe { Page::borrow_phys_unchecked(&phys) };
-            pt.with_pointer_into_page(idx * PTE_SIZE, count * PTE_SIZE, |p| {
+            let leaves = |p: *mut u8| -> Result {
                 let ptep = p as *const _ as *const Pte;
                 // SAFETY: We know this is a valid pointer to PTEs and the range is valid and
-                // checked by with_pointer_into_page().
+                // checked by with_table_page().
                 let ptes = unsafe { core::slice::from_raw_parts(ptep, count) };
                 let result = cb(iova, ptes);
                 if clean && mutate {
@@ -624,7 +724,10 @@ impl UatPageTable {
                     clean_poc(p, count * PTE_SIZE);
                 }
                 result
-            })?;
+            };
+            // SAFETY: Page table addresses are either allocated by us, or
+            // firmware-managed RAM or registered foreign table pages.
+            unsafe { with_table_page(phys, idx * PTE_SIZE, count * PTE_SIZE, leaves) }?;
 
             let block = 1 << (UAT_PGBIT + UAT_LVBIT);
             iova = align(iova + 1, block);
@@ -663,23 +766,29 @@ impl UatPageTable {
             // its child descriptor is detached. A changed descriptor indicates
             // an ownership violation; fail closed instead of freeing a table
             // that may still be reachable.
-            let page = unsafe { Page::borrow_phys(&parent_phys) }.ok_or(EIO)?;
-            page.with_pointer_into_page(parent_index * PTE_SIZE, PTE_SIZE, |p| {
+            if !table_reachable(parent_phys) {
+                return Err(EIO);
+            }
+            let clean = self.cleans_poc();
+            let oas_mask = self.oas_mask;
+            let detach = |p: *mut u8| -> Result {
                 // SAFETY: The live page-table page contains aligned u64 PTEs.
-                // with_pointer_into_page bounds this access to one PTE, and
+                // with_table_page bounds this access to one PTE, and
                 // the parent remains allocated throughout the traversal.
                 let pte = unsafe { &*(p as *const AtomicU64) };
                 let current = pte.load(Ordering::Acquire);
-                let expected = phys & self.oas_mask & (!UAT_PGMSK as u64);
-                if current & self.oas_mask & (!UAT_PGMSK as u64) != expected {
+                let expected = phys & oas_mask & (!UAT_PGMSK as u64);
+                if current & oas_mask & (!UAT_PGMSK as u64) != expected {
                     return Err(EIO);
                 }
                 pte.store(0, Ordering::Release);
-                if self.cleans_poc() {
+                if clean {
                     clean_poc(p, PTE_SIZE);
                 }
                 Ok(())
-            })?;
+            };
+            // SAFETY: The parent is a live page-table page (checked reachable above).
+            unsafe { with_table_page(parent_phys, parent_index * PTE_SIZE, PTE_SIZE, detach) }?;
         }
         if let Some(tables) = self.driver_tables.as_mut() {
             let index = tables.iter().position(|&table| table == phys).ok_or(EIO)?;

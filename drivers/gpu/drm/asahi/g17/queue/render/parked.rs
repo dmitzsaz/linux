@@ -231,6 +231,15 @@ impl ParkedPair {
             clusters: self.clusters,
             descriptor_flags: self.descriptor_flags,
             installed: self.installed,
+            // A parked pair takes a new owner with fresh queue memory: on HAL300 every stage
+            // the firmware already registered must be re-registered to name the new rings.
+            reinstall: if crate::g17::fw::compute::g17g_selected()
+                && crate::g17::runtime::queue_reuse_enabled()
+            {
+                self.installed
+            } else {
+                [false; 2]
+            },
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: self.recovery_generation,

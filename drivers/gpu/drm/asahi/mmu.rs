@@ -1462,8 +1462,27 @@ impl KernelMapping {
 }
 no_debug!(KernelMapping);
 
+/// HAL300 diagnostic: every mapping that covers this lower-arena address logs its creation and
+/// removal. It was 0x700a010380 (gUPM write fault after a GL client exited, render39/41); now
+/// 0x708024c000, the MMU fault VA of the intermittent client-transition recoveries with the
+/// idle policy enabled (asahi-pw20-boot, fault info 0x822b114001, twice).
+const LOWER_WATCH: u64 = 0x70_8024_c000;
+fn watch_lower(range: Range<u64>, what: &str) {
+    // Diagnostic only (debug_flags bit 62): the 0x708024c000 writer was the undersized compute
+    // operand object (phase2n52), and every client VM maps something there.
+    if crate::module_parameters::debug_flags.value() & (1 << 62) != 0 && range.contains(&LOWER_WATCH) {
+        pr_warn!("asahi: lower watch {} {:#x}+{:#x}\n", what, range.start, range.end - range.start);
+        extern "C" {
+            fn asahi_hal300_dump_stack();
+        }
+        // SAFETY: dump_stack() only prints the current stack.
+        unsafe { asahi_hal300_dump_stack() };
+    }
+}
+
 impl Drop for KernelMapping {
     fn drop(&mut self) {
+        watch_lower(self.iova_range(), "unmap");
         // An ASC-cached M4 mapping has no qualified cache-flush teardown. Even an unexpected
         // failed construction must retain its complete node/backing instead of invoking the
         // unrelated G13/G14 FwCtl protocol.
@@ -2102,6 +2121,91 @@ impl Vm {
         Ok(())
     }
 
+    /// Diagnostic copy of mapped RAM through this VM's own page table, whatever the mapping's
+    /// GPU permissions (firmware-private objects included). Pages outside System RAM fail with
+    /// EFAULT. Read-only: nothing is written to the pages or the tables.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn read_diagnostic(&self, va: u64, buf: &mut [u8]) -> Result {
+        let mut inner = lock_vm(&self.gpuvm, None, false)?;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let address = va.checked_add(done as u64).ok_or(EFAULT)?;
+            let page = address & !(UAT_PGMSK as u64);
+            let within = (address - page) as usize;
+            let count = (buf.len() - done).min(UAT_PGSZ - within);
+            if page < inner.va_range.start || page >= inner.va_range.end {
+                return Err(ERANGE);
+            }
+            let phys = inner.page_table.translate_iova(page).map_err(|_| ENOENT)?;
+            // SAFETY: `phys` is checked to be a RAM page; it stays mapped while the exec lock is
+            // held, and is only read here.
+            let ram = unsafe { kernel::page::Page::borrow_phys(&phys) }.ok_or(EFAULT)?;
+            let target = &mut buf[done..done + count];
+            ram.with_pointer_into_page(within, count, |p| {
+                // SAFETY: with_pointer_into_page() checked that `count` bytes at `p` are inside the
+                // page, and `target` holds exactly `count` bytes.
+                unsafe { core::ptr::copy_nonoverlapping(p, target.as_mut_ptr(), count) };
+                Ok(())
+            })?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    /// Diagnostic guarded store of one aligned u32 in mapped RAM: only while the u64 at
+    /// `epoch_va` equals `epoch` and the u32 at `va` equals `expected`. Both reads and the store go
+    /// through the linear map with clean+invalidate to the point of coherency around them.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn diagnostic_compare_store_u32(
+        &self,
+        va: u64,
+        expected: u32,
+        value: u32,
+        epoch_va: u64,
+        epoch: u64,
+    ) -> Result {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        if va & 3 != 0 || epoch_va & 7 != 0 {
+            return Err(EINVAL);
+        }
+        let mut inner = lock_vm(&self.gpuvm, None, false)?;
+        let page_of = |address: u64| address & !(UAT_PGMSK as u64);
+        for address in [va, epoch_va] {
+            if page_of(address) < inner.va_range.start || page_of(address) >= inner.va_range.end {
+                return Err(ERANGE);
+            }
+        }
+        let epoch_phys = inner.page_table.translate_iova(page_of(epoch_va)).map_err(|_| ENOENT)?;
+        let state_phys = inner.page_table.translate_iova(page_of(va)).map_err(|_| ENOENT)?;
+        // SAFETY: both are checked to be RAM pages; they stay mapped while the exec lock is held.
+        let epoch_page = unsafe { kernel::page::Page::borrow_phys(&epoch_phys) }.ok_or(EFAULT)?;
+        // SAFETY: as above.
+        let state_page = unsafe { kernel::page::Page::borrow_phys(&state_phys) }.ok_or(EFAULT)?;
+        let current = epoch_page.with_pointer_into_page((epoch_va - page_of(epoch_va)) as usize, 8, |p| {
+            pgtable::clean_invalidate_poc(p, 8);
+            pgtable::poc_barrier();
+            // SAFETY: `p` points at 8 aligned bytes inside the page.
+            Ok(unsafe { AtomicU64::from_ptr(p.cast()) }.load(Ordering::SeqCst))
+        })?;
+        if current != epoch {
+            return Err(EBUSY);
+        }
+        state_page.with_pointer_into_page((va - page_of(va)) as usize, 4, |p| {
+            pgtable::clean_invalidate_poc(p, 4);
+            pgtable::poc_barrier();
+            // SAFETY: `p` points at 4 aligned bytes inside the page.
+            let word = unsafe { AtomicU32::from_ptr(p.cast()) };
+            if word.load(Ordering::SeqCst) != expected {
+                return Err(EBUSY);
+            }
+            core::sync::atomic::fence(Ordering::SeqCst);
+            word.store(value, Ordering::SeqCst);
+            pgtable::clean_invalidate_poc(p, 4);
+            pgtable::poc_barrier();
+            Ok(())
+        })
+    }
+
     /// Status shared by every queue using this VM, if enabled by its GPU.
     pub(crate) fn status(&self) -> Option<&Arc<crate::g17::status::VmStatus>> {
         self.status.as_ref()
@@ -2328,7 +2432,9 @@ impl Vm {
             return Err(ret.err().unwrap_or(EIO));
         }
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        let mapping = KernelMapping(ManuallyDrop::new(node));
+        watch_lower(mapping.iova_range(), "map");
+        Ok(mapping)
     }
 
     /// Map a GEM object into this Vm at a specific address.
@@ -2407,7 +2513,9 @@ impl Vm {
             return Err(ret.err().unwrap_or(EIO));
         }
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        let mapping = KernelMapping(ManuallyDrop::new(node));
+        watch_lower(mapping.iova_range(), "map");
+        Ok(mapping)
     }
 
     /// Map a range of a GEM object into this Vm using GPUVM.
@@ -2578,7 +2686,9 @@ impl Vm {
             return Err(ret.err().unwrap_or(EIO));
         }
         ret?;
-        Ok(KernelMapping(ManuallyDrop::new(node)))
+        let mapping = KernelMapping(ManuallyDrop::new(node));
+        watch_lower(mapping.iova_range(), "map");
+        Ok(mapping)
     }
 
     /// Unmap everything in an address range.
@@ -2770,6 +2880,20 @@ impl Drop for VmInner {
 
 /// Physical regions of a UAT whose handoff the generation has already established itself
 /// ([`Uat::new_adopted`]). None of them needs to be in the kernel linear map.
+/// Reserved physical regions of a [`UatFirmware::PublishedRoots`] firmware whose page tables are
+/// not System RAM ([`Uat::new_published_foreign`]).
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+pub(crate) struct ForeignRegions {
+    /// The handoff region.
+    pub(crate) handoff: Range<PhysicalAddr>,
+    /// The TTBAT.
+    pub(crate) ttbs: Range<PhysicalAddr>,
+    /// Both firmware kernel roots (`pagetables`).
+    pub(crate) pagetables: Range<PhysicalAddr>,
+    /// The second-level table of the kernel window that both kernel roots name.
+    pub(crate) l2_pagetables: Range<PhysicalAddr>,
+}
+
 #[cfg(CONFIG_DRM_ASAHI_G16)]
 pub(crate) struct AdoptedRegions {
     /// The handoff region (PPL magic, lock and flush requests).
@@ -2923,6 +3047,220 @@ impl Uat {
                 static_lock_class!(),
             )?,
         })
+    }
+
+    /// Maps a reserved range of page-table pages write-combined for the rest of the boot and
+    /// registers it with the page-table code. The mapping is never removed: the firmware keeps
+    /// walking these tables until reboot.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    fn map_foreign_tables(range: &Range<PhysicalAddr>, min_size: usize) -> Result<*mut u8> {
+        let size: usize = (range.end.checked_sub(range.start).ok_or(EINVAL)?).try_into()?;
+        if size < min_size || (range.start as usize | size) & UAT_PGMSK != 0 {
+            return Err(EINVAL);
+        }
+        // SAFETY: memremap() of a reserved range outside System RAM only creates a mapping.
+        let map = unsafe {
+            kernel::bindings::memremap(range.start, size, kernel::bindings::MEMREMAP_WC as _)
+        };
+        if map.is_null() {
+            return Err(ENOMEM);
+        }
+        // SAFETY: The mapping covers the range and is intentionally never unmapped. The caller
+        // admitted the range as disjoint from System RAM.
+        unsafe { pgtable::register_foreign_tables(range.start, size, map.cast()) }?;
+        Ok(map.cast())
+    }
+
+    /// Creates the `Uat` of a G17 firmware whose kernel roots and kernel-window second-level table
+    /// are reserved outside System RAM ([`UatFirmware::PublishedRoots`] on T8142, M5).
+    ///
+    /// The same TTBAT layout as [`Uat::new`]: context 0 names the driver's lower root and the
+    /// firmware kernel root, context 1 aliases both with its own ASID. The driver walks the
+    /// reserved tables through write-combined mappings, and cleans every table it allocates to
+    /// the point of coherency, since the M5 UAT walker does not snoop the CPU caches. Nothing is
+    /// mapped and no coprocessor is running yet.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn new_published_foreign(
+        dev: &driver::AsahiDrmDevice,
+        geometry: UatGeometry,
+        regions: &ForeignRegions,
+        secondary_root_offset: u64,
+    ) -> Result<Self> {
+        let firmware = UatFirmware::PublishedRoots {
+            secondary_root_offset,
+        };
+        let pagetables_size = secondary_root_offset as usize + UAT_PGSZ;
+        let ttb1 = regions.pagetables.start;
+        let handoff_rgn = Self::map_physical(&regions.handoff, HANDOFF_SIZE)?;
+        let ttbs_rgn = Self::map_physical(&regions.ttbs, SLOTS_SIZE)?;
+        Self::map_foreign_tables(&regions.pagetables, pagetables_size)?;
+        Self::map_foreign_tables(&regions.l2_pagetables, UAT_PGSZ)?;
+
+        // SAFETY: The Handoff struct layout matches the firmware's view of memory at this
+        // address, and the region is at least large enough per the check above.
+        let handoff = unsafe { &(handoff_rgn.map.ptr() as *mut Handoff).as_ref().unwrap() };
+        // Evidence for any later use of the handoff lock: what the boot loader left there.
+        dev_info!(
+            dev.as_ref(),
+            "MMU: inherited handoff magic {:#x}/{:#x} locks {}/{} turn {} slot {:#x}\n",
+            handoff.magic_ap.load(Ordering::Relaxed),
+            handoff.magic_fw.load(Ordering::Relaxed),
+            handoff.lock_ap.load(Ordering::Relaxed),
+            handoff.lock_fw.load(Ordering::Relaxed),
+            handoff.turn.load(Ordering::Relaxed),
+            handoff.cur_slot.load(Ordering::Relaxed)
+        );
+
+        let inner = Arc::pin_init(
+            try_pin_init!(UatInner {
+                firmware,
+                m4_adopted: false,
+                failed: AtomicBool::new(false),
+                clean_poc: true,
+                handoff_flush <- pin_init::pin_init_array_from_fn(|i| {
+                    new_mutex!(HandoffFlush(&handoff.flush[i]), "handoff_flush")
+                }),
+                shared <- new_mutex!(
+                    UatShared {
+                        kernel_ttb1: ttb1,
+                        execution_contexts: !EXECUTION_CONTEXT_MASK,
+                        context_generations: [0; UAT_NUM_CTX],
+                        binding_generations: [0; UAT_NUM_CTX],
+                        binding_published: [false; UAT_NUM_CTX],
+                        owned_user_roots: [0; UAT_NUM_CTX],
+                        secondary_ttb1: Some(ttb1 + secondary_root_offset),
+                        map_kernel_to_user: true,
+                        handoff_rgn,
+                        ttbs_rgn,
+                    },
+                    "uat_shared"
+                ),
+            }),
+            GFP_KERNEL,
+        )?;
+
+        let kernel_lower_vm = Vm::new(
+            dev.into(),
+            inner.clone(),
+            geometry.user_range(),
+            geometry,
+            None,
+            1,
+        )?;
+        let kernel_vm = Vm::new(
+            dev.into(),
+            inner.clone(),
+            geometry.kernel_range(),
+            geometry,
+            Some(ttb1),
+            0,
+        )?;
+        let ttb0 = kernel_lower_vm.ttb();
+
+        let uat = Self {
+            dev: dev.into(),
+            geometry,
+            kernel_vm,
+            kernel_lower_vm,
+            inner,
+            slots: slotalloc::SlotAllocator::new(
+                UAT_USER_CTX as u32,
+                (),
+                |_inner, _slot| Some(SlotInner()),
+                c_str!("Uat::SlotAllocator"),
+                static_lock_class!(),
+                static_lock_class!(),
+            )?,
+        };
+
+        let inner = uat.inner.lock();
+        // The M5 firmware never takes part in the handoff protocol, and the initial contents of
+        // its lock words are unknown, so the handoff is neither locked nor otherwise initialized.
+        // Write exactly what the j704 runtime wrote in every qualified M5 boot: the AP magic and
+        // no current slot. Neither coprocessor runs yet.
+        inner.handoff().magic_ap.store(PPL_MAGIC, Ordering::Relaxed);
+        inner.handoff().cur_slot.store(u32::MAX, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let ttbs = inner.ttbs();
+        for ctx in &ttbs[1..] {
+            ctx.ttb0.store(0, Ordering::Relaxed);
+            ctx.ttb1.store(0, Ordering::Relaxed);
+        }
+        ttbs[0].ttb0.store(ttb0 | TTBR_VALID, Ordering::SeqCst);
+        ttbs[0].ttb1.store(ttb1 | TTBR_VALID, Ordering::SeqCst);
+        let alias = &ttbs[KERNEL_ALIAS_CTX];
+        alias
+            .ttb0
+            .store(tagged_root(ttb0, KERNEL_ALIAS_CTX), Ordering::SeqCst);
+        alias
+            .ttb1
+            .store(tagged_root(ttb1, KERNEL_ALIAS_CTX), Ordering::SeqCst);
+        core::mem::drop(inner);
+        mem::sync();
+
+        dev_info!(
+            dev.as_ref(),
+            "MMU: foreign kernel roots at {:#x}, kernel window table at {:#x}\n",
+            ttb1,
+            regions.l2_pagetables.start
+        );
+        Ok(uat)
+    }
+
+    /// Checks the kernel window entries both firmware instances published while they booted.
+    ///
+    /// Each kernel root must name the reserved second-level table, which must still be empty,
+    /// as on every qualified M5 boot. Nothing is cleared or copied: unlike [`Self::new`] roots,
+    /// the M5 entries above the kernel window have never been shown to be free.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) fn check_foreign_window(&self, l2: PhysicalAddr) -> Result<[u64; 3]> {
+        let index = IOVA_KERN_TOP_LEVEL_INDEX as usize;
+        let secondary = self.inner.lock().secondary_ttb1.ok_or(EINVAL)?;
+        let mut snapshot = [0u64; 3];
+        let mut upper = 0u32;
+        // SAFETY: Both roots are registered foreign table pages, retained until reboot.
+        unsafe {
+            pgtable::with_root_entries(self.kernel_vm.ttb(), UAT_PGSZ / size_of::<u64>(), |ptes| {
+                for (value, pte) in snapshot.iter_mut().zip(ptes) {
+                    *value = pte.load(Ordering::Relaxed);
+                }
+                upper = ptes[index + 1..]
+                    .iter()
+                    .filter(|pte| pte.load(Ordering::Relaxed) != 0)
+                    .count() as u32;
+            })
+        }?;
+        // SAFETY: As above.
+        let mirrored = unsafe {
+            pgtable::with_root_entries(secondary, index + 1, |ptes| {
+                ptes[index].load(Ordering::Relaxed)
+            })
+        }?;
+        // SAFETY: As above; the second-level table is a registered foreign table page.
+        let used = unsafe {
+            pgtable::with_root_entries(l2, UAT_PGSZ / size_of::<u64>(), |ptes| {
+                ptes.iter()
+                    .filter(|pte| pte.load(Ordering::Relaxed) != 0)
+                    .count()
+            })
+        }?;
+        dev_info!(
+            self.dev.as_ref(),
+            "MMU: firmware roots {:#x?}, secondary window {:#x}, window entries used {}, upper entries {}\n",
+            snapshot,
+            mirrored,
+            used,
+            upper
+        );
+        let table = snapshot[index] & ((1u64 << 42) - 1) & !(UAT_PGMSK as u64);
+        if table != l2
+            || snapshot[index] & 3 != 3
+            || mirrored != snapshot[index]
+            || used != 0
+        {
+            return Err(EIO);
+        }
+        Ok(snapshot)
     }
 
     #[cfg(CONFIG_DRM_ASAHI_G16)]

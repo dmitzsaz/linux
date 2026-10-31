@@ -486,6 +486,18 @@ impl QueueConfig {
             QueueConfigTarget::Fragment => (DataMaster::Fragment, 0, u64::MAX, u32::MAX, u32::MAX),
             QueueConfigTarget::Compute => (DataMaster::Compute, 0, u64::MAX, u32::MAX, u32::MAX),
         };
+        // Read-only evidence for the HAL300 release blocker: which queues this
+        // host configured, with what engine, and whether it asked for
+        // registration. See `g17::ksm`.
+        crate::g17::ksm::configured(
+            args.qid,
+            data_master as u16,
+            args.install,
+            args.policy.priority().into(),
+            args.context_id,
+            args.scheduler_va,
+            args.kick_ring_va,
+        );
         Ok(Self {
             tag: CommandTag::QueueConfig as u32,
             unk_04: 0,

@@ -74,6 +74,9 @@ pub(super) struct RenderState {
     grow: grow::Grow,
     retired: KVec<crate::g17::queue::render::RetiredBinding>,
     next_pm_generation: u64,
+    /// HAL300 pool reuse: pools of consumed closed contexts, and those no pair names any more.
+    closed_pools: KVec<Arc<crate::g17::freelist::RenderPool>>,
+    spare_pools: KVec<Arc<crate::g17::freelist::RenderPool>>,
 }
 
 impl RenderState {
@@ -95,6 +98,8 @@ impl RenderState {
             grow: grow::Grow::new()?,
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
             next_pm_generation: 1,
+            closed_pools: KVec::new(),
+            spare_pools: KVec::new(),
         })
     }
 
@@ -531,6 +536,16 @@ impl crate::g17::queue::render::Host for Host<'_> {
             self.firmware.acquire_registration_power()?;
             self.registration_powered = true;
         }
+        // G17G firmware owns KSM registration (HwData+2724 = 0, so P+108a5c = 0): the
+        // tag-15 install of each queue performs the native indexed transaction. This host
+        // route carries the G17P tag (0x40000021008 | qid << 43; native G17G uses
+        // 0x80000021008 | qid << 44), which the hardware decodes as QID qid >> 1: QID 21's
+        // TA ring landed in Hyprland's fragment QID 10, whose next kick completed as a
+        // zero-identity TA record and crashed the primary at P+0x48370 (Arch SD boot,
+        // 2026-10-30; gpu-bringup/sol-hal300-null-completion-study.md).
+        if crate::g17::fw::compute::g17g_selected() {
+            return Ok(());
+        }
         for _ in 0..3 {
             if self
                 .firmware
@@ -703,6 +718,14 @@ impl crate::g17::Firmware {
         self.queues.fail_render_vm(status, error, deferred)
     }
 
+    /// Wakes every in-flight render command of a retained (HAL300) session with `error`; the
+    /// pairs and their mappings stay owned by the leaked session.
+    pub(in crate::g17) fn fail_render_owned(&self, error: Error) {
+        for pair in self.queues.render.entries.iter().flatten().filter_map(|e| e.pair.as_ref()) {
+            pair.fail_owned(error);
+        }
+    }
+
     pub(in crate::g17) fn stop_render(&mut self) {
         for entry in self.queues.render.entries.iter_mut().flatten() {
             if let Some(pair) = entry.pair.as_mut() {
@@ -730,6 +753,28 @@ impl Registry {
             .filter_map(|entry| entry.pair.as_ref())
             .find(|pair| pair.qids().contains(&qid))
             .and_then(|pair| pair.oldest_spared())
+    }
+    /// Clears the tail-pointer cache of every render pair whose TA (first QID) is in `qids`;
+    /// returns how many pairs were scrubbed.
+    pub(in crate::g17) fn scrub_render_tpc(&mut self, qids: u128) -> usize {
+        let mut scrubbed = 0;
+        for pair in self.render.entries.iter_mut().flatten().filter_map(|entry| entry.pair.as_mut()) {
+            if qids & (1u128 << (pair.qids()[0] & 0x7f)) != 0 {
+                pair.scrub_tpc();
+                scrubbed += 1;
+            }
+        }
+        scrubbed
+    }
+    /// QIDs of every retained render pair, both halves.
+    pub(in crate::g17) fn render_qids_mask(&self) -> u128 {
+        let mut qids = 0u128;
+        for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            for qid in pair.qids() {
+                qids |= 1u128 << (qid & 0x7f);
+            }
+        }
+        qids
     }
     pub(in crate::g17) fn visit_render_owners(
         &self,
@@ -797,7 +842,7 @@ impl Registry {
             let Some(pair) = entry.pair.as_mut() else {
                 continue;
             };
-            if !pair.manager().grown() {
+            if !pair.manager().grown() || !crate::g17::fw::buffer::host_shrink_qualified() {
                 continue;
             }
             let busy = borrowed || !pair.idle_for_context(pair.context()).unwrap_or(false);
@@ -874,11 +919,78 @@ impl Registry {
             if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
                 continue;
             }
+            // HAL300 keeps render pool backing until reboot (see Context::render_pool).
+            if crate::g17::fw::compute::g17g_selected() { continue; }
             if let Some(backing) = pool.vacate() {
                 deferred.defer_render_backing(backing);
             }
         }
         Ok(())
+    }
+    /// HAL300 cross-owner render serialization. A logical owner may publish a render pass only
+    /// while no other owner has render work in flight: with Hyprland, XWayland and a starting
+    /// GL client interleaving TA work, a TA completed with KSM status 0x41 and afterwards no
+    /// queue's stamps were written (asahi-render40/45-boot); without it client transitions
+    /// failed again even after the pool-row codec fix (asahi-render56-boot). An owner that
+    /// passes this check holds the turn until its publication (render_turn_release) or
+    /// RENDER_HOLD_STALE_NS, so nobody slips in between its preparation and its publication;
+    /// without that hold a loading Minecraft lost every race to Hyprland until its 2 s wait
+    /// ended in ETIMEDOUT (asahi-render55-boot). An owner that keeps waiting longer than
+    /// RENDER_TURN_NS gets the next turn: the others stop publishing until it has.
+    pub(in crate::g17) fn render_turn_blocked(&self, owner: u64, now: u64) -> bool {
+        use core::sync::atomic::Ordering::Relaxed;
+        if !RENDER_SERIALIZE.load(Relaxed) {
+            return false;
+        }
+        let token = owner.wrapping_add(1);
+        let holder = RENDER_TURN.load(Relaxed);
+        let held = holder != 0
+            && now.saturating_sub(RENDER_TURN_SINCE.load(Relaxed)) < RENDER_HOLD_STALE_NS;
+        if held && holder == token {
+            return false;
+        }
+        let waiter = RENDER_WAITER.load(Relaxed);
+        let since = RENDER_WAIT_SINCE.load(Relaxed);
+        let stale = waiter != 0 && now.saturating_sub(since) >= RENDER_WAIT_STALE_NS;
+        let other = held
+            || self.render.entries.iter().flatten().any(|entry| {
+                entry.reservation.owner != owner
+                    && entry.pair.as_ref().is_some_and(|pair| pair.published_in_flight())
+            });
+        if other {
+            if waiter == 0 || stale {
+                RENDER_WAITER.store(token, Relaxed);
+                RENDER_WAIT_SINCE.store(now, Relaxed);
+            } else if waiter == token && now.saturating_sub(since) >= 500_000_000
+                && now.saturating_sub(RENDER_TURN_LOGGED.load(Relaxed)) >= 500_000_000
+            {
+                RENDER_TURN_LOGGED.store(now, Relaxed);
+                pr_warn!("asahi: render turn: owner {} waited {} ms, holder {} held {}\n",
+                         owner, now.saturating_sub(since) / 1_000_000, holder.wrapping_sub(1), held);
+                for entry in self.render.entries.iter().flatten() {
+                    pr_warn!("asahi: render turn:   entry owner {} pair {} in_flight {}\n",
+                             entry.reservation.owner, entry.pair.is_some(),
+                             entry.pair.as_ref().is_some_and(|pair| pair.published_in_flight()));
+                }
+            }
+            return true;
+        }
+        if waiter != 0 && waiter != token && !stale && now.saturating_sub(since) >= RENDER_TURN_NS {
+            return true;
+        }
+        if waiter == token {
+            RENDER_WAITER.store(0, Relaxed);
+        }
+        RENDER_TURN.store(token, Relaxed);
+        RENDER_TURN_SINCE.store(now, Relaxed);
+        false
+    }
+    /// Ends `owner`'s render turn after its publication attempt.
+    pub(in crate::g17) fn render_turn_release(&self, owner: u64) {
+        use core::sync::atomic::Ordering::Relaxed;
+        if RENDER_TURN.load(Relaxed) == owner.wrapping_add(1) {
+            RENDER_TURN.store(0, Relaxed);
+        }
     }
     pub(in crate::g17) fn render_in_flight(&self) -> bool {
         self.render.entries.iter().flatten().any(|entry| {
@@ -956,6 +1068,26 @@ impl Registry {
 }
 
 impl RenderState {
+    /// What a published render pair left in host state: every live slot with its pass
+    /// identities. Read-only; it never touches firmware memory.
+    pub(super) fn write_observation(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        writeln!(f, "render_entries live={}", self.entries.iter().flatten().count())?;
+        for (slot, entry) in self.entries.iter().enumerate() {
+            let Some(entry) = entry.as_ref() else { continue };
+            writeln!(
+                f,
+                "render_entry slot={} growing={} preparing={} has_context={}",
+                slot,
+                u8::from(entry.growing),
+                u8::from(entry.preparing.is_some()),
+                u8::from(entry.context.is_some())
+            )?;
+        }
+        let (queued, active) = self.grow.observation();
+        writeln!(f, "render_grow queued={} active={}", queued, u8::from(active))?;
+        Ok(())
+    }
+
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
         writeln!(f, "retired_render_bindings used={} total={}", self.retired.len(), self.retired.capacity())?;
         self.pools.write_capacity(f)?;
@@ -1001,9 +1133,45 @@ impl Registry {
                 }
             }
             if idle {
+                // HAL300 keeps render pool backing until reboot (see Context::render_pool).
+                if crate::g17::fw::compute::g17g_selected() { continue; }
                 if let Some(backing) = pool.vacate() { deferred.defer_render_backing(backing); }
             }
         }
         Ok(())
     }
 }
+
+/// Owner (plus one) waiting longest for its HAL300 render turn, and since when.
+static RENDER_WAITER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RENDER_WAIT_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Owner (plus one) holding the HAL300 render turn between its check and publication.
+static RENDER_TURN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RENDER_TURN_SINCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static RENDER_TURN_LOGGED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// A held turn whose owner never published (failed preparation) lapses after this long.
+const RENDER_HOLD_STALE_NS: u64 = 50_000_000;
+/// Cross-owner render serialization switch (see Registry::render_turn_blocked). It serializes
+/// every process's render passes against each other, which costs multi-pass clients (browsers,
+/// toolkits) most of their frame rate. It was added before the misencoded host KSM registration
+/// (phase2n73) was found. Off by default since phase2n75 (scrolling went from ~20 to ~55 fps on
+/// the panel with no faults); `echo "serialize 1" > .../asahi-g17/power` turns it back on.
+static RENDER_SERIALIZE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Turns cross-owner render serialization on or off; turning it off drops any held turn.
+pub(in crate::g17) fn set_render_serialize(on: bool) {
+    use core::sync::atomic::Ordering::Relaxed;
+    RENDER_SERIALIZE.store(on, Relaxed);
+    if !on {
+        RENDER_TURN.store(0, Relaxed);
+        RENDER_WAITER.store(0, Relaxed);
+    }
+}
+
+pub(in crate::g17) fn render_serialize() -> bool {
+    RENDER_SERIALIZE.load(core::sync::atomic::Ordering::Relaxed)
+}
+/// After this long, a waiting owner's turn comes before further work of the others.
+const RENDER_TURN_NS: u64 = 4_000_000;
+/// A waiter that stopped polling (closed, failed) is forgotten after this long.
+const RENDER_WAIT_STALE_NS: u64 = 200_000_000;

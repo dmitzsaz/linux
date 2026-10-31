@@ -115,7 +115,7 @@ pub(crate) struct Snapshot {
     pub(crate) cursors: [Cursors; 2],
     pub(crate) job_list_empty: bool,
     /// The tiler writes the start and fragment processing writes the end.
-    pub(crate) pass: [u64; 2],
+    pub(crate) pass: [u64; 4],
 }
 
 impl Snapshot {
@@ -144,6 +144,13 @@ pub(crate) fn observe(ticket: &Ticket, snapshot: Snapshot) -> Result<Observation
     })
 }
 
+/// Set when a completed pass was found before its post-maintenance stamps: the firmware sends
+/// no event for the stamps, so the event worker must poll (runtime events POLL_WANTED) instead
+/// of leaving the pass to the next unrelated event (Arch desktop 2026-10-30: a GL frame's render
+/// retired ~0.6 ms after its compute part, which alone was being polled).
+pub(crate) static STAMP_WAIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 /// Outstanding publications span less than half the 24-bit stamp sequence.
 /// A zero stamp is valid when that sequence wraps.
 pub(crate) const fn stamp_covers(stamp: u32, published: u64) -> bool {
@@ -164,7 +171,7 @@ fn visible(ticket: &Ticket, stamps: [u32; 2]) -> Result<bool> {
 pub(crate) trait Memory {
     fn snapshot(&mut self, ordinal: u64) -> Result<Snapshot>;
     fn stamps(&mut self) -> Result<[u32; 2]>;
-    fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]>;
+    fn pass(&mut self, ordinal: u64) -> Result<[u64; 4]>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,13 +226,21 @@ fn complete_poll(
 ) -> Result<Poll> {
     if observation.complete {
         if !visible(ticket, memory.stamps()?)? {
+            STAMP_WAIT.store(true, Ordering::Release);
             return Ok(Poll::Pending);
         }
         // Refresh this generation's pass after observing the post-maintenance
         // stamps. The pre-stamp snapshot alone cannot authorize export.
         fence(Ordering::Acquire);
-        let [start, end] = memory.pass(ticket.ordinal)?;
-        return Ok(Poll::Complete([start, start, start, end]));
+        // G17G measures all four stages separately; G17P leaves the TA end and fragment
+        // start words zero, which keeps the old pass envelope.
+        let stages = memory.pass(ticket.ordinal)?;
+        let [ta_start, ta_end, fragment_start, fragment_end] = stages;
+        return Ok(Poll::Complete(if ta_end != 0 && fragment_start != 0 {
+            stages
+        } else {
+            [ta_start, ta_start, ta_start, fragment_end]
+        }));
     }
     ticket.previous = snapshot.cursors;
     Ok(Poll::Pending)

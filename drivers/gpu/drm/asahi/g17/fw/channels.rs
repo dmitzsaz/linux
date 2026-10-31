@@ -238,6 +238,7 @@ pub(crate) enum ControlRecord {
     SchedulerStateRelease(SchedulerStateRelease),
     FreeListRelease(FreeListRelease),
     ContextKill(ContextKill),
+    UscCacheInvalidate(UscCacheInvalidate),
 }
 
 impl ControlRecord {
@@ -248,6 +249,7 @@ impl ControlRecord {
             Self::SchedulerStateRelease(_) => DeviceControlOp::SchedulerStateRelease,
             Self::FreeListRelease(_) => DeviceControlOp::FreeListRelease,
             Self::ContextKill(_) => DeviceControlOp::ContextKill,
+            Self::UscCacheInvalidate(_) => DeviceControlOp::UscCacheInvalidate,
         }
     }
 
@@ -259,6 +261,7 @@ impl ControlRecord {
             Self::SchedulerStateRelease(record) => core::ptr::from_ref(record).cast(),
             Self::FreeListRelease(record) => core::ptr::from_ref(record).cast(),
             Self::ContextKill(record) => core::ptr::from_ref(record).cast(),
+            Self::UscCacheInvalidate(record) => core::ptr::from_ref(record).cast(),
         };
         // SAFETY: Each variant has a statically checked size of 0x40 bytes,
         // contains only initialized integer fields with no implicit padding,
@@ -281,15 +284,28 @@ pub(crate) enum DeviceControlOp {
     FreeListRelease = 0x2e,
     /// Stop the queues named by a closed logical scheduler.
     ContextKill = 0x29,
+    /// HAL300: invalidate one USC cache domain of a UAT context ([`UscCacheInvalidate`]).
+    UscCacheInvalidate = 0x33,
 }
+
+/// HAL300 wire value of the scheduler-state release: native M5
+/// `AGXArmFirmware::submitReleaseResource` publishes kind 0x13 with the HAL200 record layout
+/// (page bytes 0x26/0/1/4 at +8, page VA at +0xc). HAL300 kind 0x14 is the unrelated
+/// `AGXHWDSIDManager::deprioritizeHWDSID` request; publishing 0x14 crashed the M5 firmware.
+const HAL300_SCHEDULER_STATE_RELEASE: u32 = 0x13;
 
 impl DeviceControlOp {
     /// Tells whether records with this opcode count towards the host
     /// power-assert tally. The firmware compares the tally with the counted
     /// records it has drained and keeps the GPU cores powered while they
-    /// differ.
-    pub(crate) const fn asserts_gpu_power(self) -> bool {
-        !matches!(self, Self::FreeListRelease)
+    /// differ. On HAL300 the native submitDeviceControl counts kinds 0x0a, 0x29 and 0x33 of
+    /// these but neither release (0x13, 0x2e).
+    pub(crate) fn asserts_gpu_power(self) -> bool {
+        match self {
+            Self::FreeListRelease => false,
+            Self::SchedulerStateRelease => !super::compute::g17g_selected(),
+            _ => true,
+        }
     }
 }
 
@@ -404,9 +420,13 @@ static_assert!(core::mem::offset_of!(SchedulerStateRelease, page_va) == 0x0c);
 
 impl SchedulerStateRelease {
     /// Releases the scheduler page with its identity bytes in record order.
-    pub(crate) const fn new(page_va: u64, id: [u8; 4]) -> Self {
+    pub(crate) fn new(page_va: u64, id: [u8; 4]) -> Self {
         Self {
-            opcode: DeviceControlOp::SchedulerStateRelease as u32,
+            opcode: if super::compute::g17g_selected() {
+                HAL300_SCHEDULER_STATE_RELEASE
+            } else {
+                DeviceControlOp::SchedulerStateRelease as u32
+            },
             unk_04: 0,
             id,
             page_va,
@@ -522,6 +542,33 @@ impl ContextKill {
             page_va,
             cookie,
             reserved: [0; 0x2c],
+        }
+    }
+}
+
+/// HAL300 device control that invalidates one USC cache domain of a UAT context: the native
+/// `AGXDeviceUserClient::invalidateICache` record (selectors 0..2 name domains 2, 0 and 1).
+/// Every qualified M5 dispatch ran after all three were retired for its context.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct UscCacheInvalidate {
+    opcode: u32,
+    domain: u32,
+    context: u32,
+    reserved: [u8; 0x34],
+}
+static_assert!(size_of::<UscCacheInvalidate>() == DEVICE_CONTROL_RECORD_SIZE);
+
+impl UscCacheInvalidate {
+    /// Domains in the order of the native selectors.
+    pub(crate) const DOMAINS: [u32; 3] = [2, 0, 1];
+
+    pub(crate) const fn new(domain: u32, context: u32) -> Self {
+        Self {
+            opcode: DeviceControlOp::UscCacheInvalidate as u32,
+            domain,
+            context,
+            reserved: [0; 0x34],
         }
     }
 }

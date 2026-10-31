@@ -29,12 +29,20 @@ mod feed;
 mod fence;
 mod freelist;
 pub(crate) mod fw;
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+pub(crate) mod hal300;
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+mod hal300_build;
+#[cfg(CONFIG_DRM_ASAHI_G16)]
+mod hal300_graph;
 mod ids;
 pub(crate) mod hazard;
 mod initdata;
 mod job;
 mod capacity;
 mod kick;
+pub(crate) mod ksm;
+pub(crate) mod pubring;
 mod object;
 mod power;
 mod preparation;
@@ -45,12 +53,33 @@ mod runtime;
 pub(crate) mod status;
 mod teardown;
 mod timeout;
+
+/// HAL300 GPU idle descent and wake (device control 0x0a): the GPU powers down when idle and
+/// render-pair registration wakes and holds it (`power::acquire`/`release`). Default since
+/// phase2n63, after asahi-pw50-boot (8/8 transitions rounds and the mixed desktop soak with the
+/// GPU descending between them); debug_flags bit 47 keeps the GPU powered (the former opt-in
+/// bit 56 is accepted and ignored).
+pub(crate) fn idle_policy_enabled() -> bool {
+    crate::module_parameters::debug_flags.value() & (1 << 47) == 0
+}
+
+/// HAL300 default since phase2n55 (debug_flags bit 50 restores the unseeded start; bit 55, the
+/// former opt-in, is accepted and ignored): start with the native startup idle permission
+/// (region C +0x30 = 1) and wake the firmware once (hal300::start_idle_permitted). With the idle
+/// policy disabled (debug_flags bit 47) that single descent and wake is all: the permission is withdrawn afterwards and the GPU stays
+/// awake, keeping the reason-4 DVFS seed the wake catch-up produced (asahi-pw18-boot). Without it
+/// the firmware's controller caps the GPU at performance state 1 (338 MHz) for the whole boot.
+/// Qualified after the operand-size and per-kick usage-record fixes (asahi-pw37-boot).
+pub(crate) fn startup_seed_enabled() -> bool {
+    crate::module_parameters::debug_flags.value() & (1 << 50) == 0
+}
 mod validation;
 
 use core::any::Any;
 use core::ops::Range;
 use core::sync::atomic::{
     AtomicBool,
+    AtomicU64,
     Ordering, //
 };
 
@@ -154,6 +183,9 @@ pub(crate) struct Config {
     pub(crate) crash_buffers: [FixedBuffer; 2],
     /// Parameter buffer page metrics shared with the firmware.
     pub(crate) pm_metrics: FixedBuffer,
+    /// HAL300 firmware identity and startup graph (T8142), instead of the HAL200 initdata.
+    #[cfg(CONFIG_DRM_ASAHI_G16)]
+    pub(crate) hal300: Option<&'static hal300::Hal300Config>,
 }
 
 /// A firmware coprocessor instance.
@@ -204,19 +236,60 @@ const RTKIT_BUFFER_ADDR_MASK: u64 = (1 << 40) - 1;
 const CRASH_BUFFER_FILL: [u8; 2] = [0xa5, 0x5a];
 
 /// A crash log buffer handed to RTKit.
-pub(crate) struct CrashLog {
-    iova: usize,
-    map: shmem::VMapOwned<AsahiObject>,
+pub(crate) enum CrashLog {
+    /// A kernel object at the address the firmware fixes (HAL200).
+    Object {
+        iova: usize,
+        map: shmem::VMapOwned<AsahiObject>,
+    },
+    /// A buffer the firmware placed in its own reserved data segment (HAL300).
+    Physical {
+        iova: usize,
+        map: *mut u8,
+        size: usize,
+    },
 }
+
+// SAFETY: A physical crash log mapping is plain memory owned by this buffer.
+unsafe impl Send for CrashLog {}
 
 impl rtkit::Buffer for CrashLog {
     fn iova(&self) -> Result<usize> {
-        Ok(self.iova)
+        match self {
+            Self::Object { iova, .. } | Self::Physical { iova, .. } => Ok(*iova),
+        }
     }
 
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        Ok(IoSysMap::from((&self.map).as_view()))
+        match self {
+            Self::Object { map, .. } => Ok(IoSysMap::from((&*map).as_view())),
+            Self::Physical { map, size, .. } => {
+                let region = Region::<0>::ptr_try_from_raw_parts_mut(*map, *size)?;
+                // SAFETY: `map` maps `size` bytes for as long as this buffer exists.
+                Ok(IoSysMap::from(unsafe { kernel::io::SysMem::new(region) }))
+            }
+        }
     }
+}
+
+impl Drop for CrashLog {
+    fn drop(&mut self) {
+        if let Self::Physical { map, .. } = self {
+            // SAFETY: `map` came from memremap() and is not used afterwards.
+            unsafe { kernel::bindings::memunmap((*map).cast()) };
+        }
+    }
+}
+
+/// Where a coprocessor's crash log lives.
+enum CrashBuffer {
+    /// A kernel object at a fixed address of the kernel lower root (HAL200).
+    Object {
+        log: FixedBuffer,
+        map: shmem::VMapOwned<AsahiObject>,
+    },
+    /// The firmware's own reserved data segment, which it names by physical address (HAL300).
+    Physical(core::ops::Range<u64>),
 }
 
 /// Callback state; initialization ACKs can arrive in hard interrupt context.
@@ -224,8 +297,7 @@ impl rtkit::Buffer for CrashLog {
 struct RoleState {
     role: Role,
     shared: Arc<Shared>,
-    crash_log: FixedBuffer,
-    crash_map: shmem::VMapOwned<AsahiObject>,
+    crash: CrashBuffer,
     crashed: AtomicBool,
     #[pin]
     ack: Opaque<kernel::bindings::completion>,
@@ -290,7 +362,7 @@ impl rtkit::Operations for RoleOps {
         if !is_events_message(ep, msg) {
             return false;
         }
-        data.shared.queue_events();
+        data.shared.queue_event_records();
         true
     }
 
@@ -304,14 +376,36 @@ impl rtkit::Operations for RoleOps {
         iova: usize,
         size: usize,
     ) -> Result<CrashLog> {
-        if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != data.crash_log.va || size > data.crash_log.size
-        {
-            return Err(EINVAL);
+        match &data.crash {
+            CrashBuffer::Object { log, map } => {
+                if (iova as u64) & RTKIT_BUFFER_ADDR_MASK != log.va || size > log.size {
+                    return Err(EINVAL);
+                }
+                Ok(CrashLog::Object {
+                    iova,
+                    map: map.owner().owned_vmap()?,
+                })
+            }
+            CrashBuffer::Physical(range) => {
+                let start = iova as u64;
+                if start != range.start || size as u64 > range.end - start {
+                    return Err(EINVAL);
+                }
+                // SAFETY: The range is the firmware's own reserved data segment, outside
+                // System RAM; memremap() only creates a mapping.
+                let map = unsafe {
+                    kernel::bindings::memremap(start, size, kernel::bindings::MEMREMAP_WC as _)
+                };
+                if map.is_null() {
+                    return Err(ENOMEM);
+                }
+                Ok(CrashLog::Physical {
+                    iova,
+                    map: map.cast(),
+                    size,
+                })
+            }
         }
-        Ok(CrashLog {
-            iova,
-            map: data.crash_map.owner().owned_vmap()?,
-        })
     }
 }
 
@@ -321,9 +415,11 @@ impl rtkit::Operations for RoleOps {
 struct Coprocessor {
     cpu: regs::CpuControl,
     running: bool,
+    /// HAL300: once started, the CPU is never stopped (it cannot be restarted safely).
+    retained: bool,
     rtkit: rtkit::RtKit<RoleOps>,
     state: Arc<RoleState>,
-    _crash_buffer: KernelObject,
+    _crash_buffer: Option<KernelObject>,
 }
 
 impl Coprocessor {
@@ -349,15 +445,44 @@ impl Coprocessor {
         crash_buffer.bytes_mut().fill(CRASH_BUFFER_FILL[index]);
 
         let crash_map = crash_buffer.kernel_map()?;
+        let crash = CrashBuffer::Object {
+            log: FixedBuffer {
+                va: buffer.va,
+                size: buffer.size,
+            },
+            map: crash_map,
+        };
+        Self::with_crash_buffer(pdev, dev, shared, role, crash, Some(crash_buffer), false)
+    }
+
+    /// Sets up a HAL300 coprocessor, whose crash log is in its own data segment. Once booted,
+    /// it is retained: neither stopped nor released.
+    fn new_retained(
+        pdev: &platform::Device<Core<'_>>,
+        dev: &AsahiDrmDevice,
+        shared: &Arc<Shared>,
+        role: Role,
+        crash_log: core::ops::Range<u64>,
+    ) -> Result<Coprocessor> {
+        let crash = CrashBuffer::Physical(crash_log);
+        Self::with_crash_buffer(pdev, dev, shared, role, crash, None, true)
+    }
+
+    fn with_crash_buffer(
+        pdev: &platform::Device<Core<'_>>,
+        dev: &AsahiDrmDevice,
+        shared: &Arc<Shared>,
+        role: Role,
+        crash: CrashBuffer,
+        crash_buffer: Option<KernelObject>,
+        retained: bool,
+    ) -> Result<Coprocessor> {
+        let index = role as usize;
         let state = Arc::pin_init(
             pin_init!(RoleState {
                 role,
                 shared: shared.clone(),
-                crash_log: FixedBuffer {
-                    va: buffer.va,
-                    size: buffer.size,
-                },
-                crash_map,
+                crash,
                 crashed: AtomicBool::new(false),
                 ack <- Opaque::ffi_init(|ptr| {
                     // SAFETY: ptr is valid uninitialized completion storage that is pinned
@@ -371,6 +496,7 @@ impl Coprocessor {
         Ok(Coprocessor {
             cpu: regs::CpuControl::new(pdev, index)?,
             running: false,
+            retained,
             rtkit: Self::receiver(dev, index, &state)?,
             state,
             _crash_buffer: crash_buffer,
@@ -420,9 +546,10 @@ impl Coprocessor {
         Pin::new(&mut self.rtkit).send_message(EP_DOORBELL, msg)
     }
 
-    /// Stops the CPU. The firmware keeps its state, but no longer runs.
+    /// Stops the CPU. The firmware keeps its state, but no longer runs. A retained (HAL300)
+    /// coprocessor keeps running until reboot.
     fn stop(&mut self) {
-        if self.running {
+        if self.running && !self.retained {
             self.cpu.stop();
             self.running = false;
         }
@@ -487,10 +614,19 @@ struct Firmware {
     _render_global: mmu::Vm,
     _pm_metrics: Arc<KernelObject>,
     uat: Arc<mmu::Uat>,
+    /// HAL300: the started firmware and everything it can reach stay until reboot; teardown
+    /// leaks this session instead of dropping it.
+    retained: bool,
 }
 
 impl Drop for Firmware {
     fn drop(&mut self) {
+        if self.retained {
+            // Teardown leaks retained sessions; getting here is a driver bug. Never stop the
+            // coprocessors or clear the bridge of a firmware that cannot be restarted.
+            pr_err!("asahi: retained GPU firmware session dropped\n");
+            return;
+        }
         self.secondary.stop();
         self.primary.stop();
         self.pool.stop_after_firmware();
@@ -570,8 +706,24 @@ impl power::Control for Firmware {
     fn counters(&self) -> Result<[u32; 3]> {
         self.init.control_counters()
     }
+    fn idle_policy_qualified(&self) -> bool {
+        // A retained session is the HAL300 one; its idle power-off record is opt-in. The
+        // seed-only start (bit 55) needed the keep/wake half while its permission stayed cached
+        // (asahi-pw23-boot: EAGAIN); since the start withdraws it and publishes the
+        // configuration snapshot (phase2n49) the GPU stays powered, and the only seed-only
+        // compute watchdog expiry (asahi-pw34-boot) followed exactly these allow=0 records.
+        !self.retained || idle_policy_enabled()
+    }
+    fn release_permitted(&self) -> bool {
+        !self.retained || idle_policy_enabled()
+    }
     fn set_idle(&mut self, enabled: bool) -> Result<u32> {
         use fw::channels::{ControlRecord, IdlePolicy, IdlePowerOff};
+        if self.retained && !idle_policy_enabled() && (enabled || !startup_seed_enabled()) {
+            // With the HAL300 idle policy disabled (debug_flags bit 47) the seed-only start may
+            // only keep/wake (allow = 0).
+            return Err(ENODEV);
+        }
         self.publish_control(&ControlRecord::IdlePowerOff(IdlePowerOff::new(
             if enabled {
                 IdlePolicy::AllowPowerOff
@@ -619,6 +771,11 @@ struct Shared {
     preparations: Arc<preparation::Gate>,
     #[pin]
     work: Work<Shared, EVENT_WORK>,
+    /// The next event pass runs every housekeeping step: set by every [`Self::queue_events`]
+    /// request, not by the firmware's event notification ([`Self::queue_event_records`]).
+    housekeeping: AtomicBool,
+    /// When an event pass last ran every housekeeping step, in ns.
+    housekeeping_ns: AtomicU64,
     #[pin]
     poll: DelayedWork<Shared, POLL_WORK>,
     #[pin]
@@ -728,8 +885,17 @@ impl Shared {
         drop(retired);
     }
 
-    /// Queues the event worker. Callable from any context.
+    /// Queues the event worker for a pass that runs every housekeeping step. Callable from any
+    /// context.
     fn queue_events(self: &Arc<Self>) {
+        self.housekeeping.store(true, Ordering::Release);
+        self.queue_event_records();
+    }
+
+    /// Queues the event worker for firmware records alone: completions, records that arrived
+    /// during a pass, or the fast re-check of a stamp. The pass skips the housekeeping nothing
+    /// needs (see `runtime_event_turn`). Callable from any context.
+    fn queue_event_records(self: &Arc<Self>) {
         // Already queued if this fails, which is just as good.
         let _ = workqueue::system_highpri().enqueue::<Arc<Shared>, EVENT_WORK>(self.clone());
     }
@@ -772,6 +938,7 @@ impl Shared {
     }
 
     fn queue_poll(self: &Arc<Self>) {
+        runtime::POLL_WANTED.store(true, core::sync::atomic::Ordering::Release);
         let _ = workqueue::system_highpri()
             .enqueue_delayed::<Arc<Self>, POLL_WORK>(self.clone(), msecs_to_jiffies(1));
     }
@@ -836,6 +1003,13 @@ pub(crate) struct Gpu {
     ids: gpu::SequenceIDs,
     shared: Arc<Shared>,
     _capacity: Pin<KBox<kernel::debugfs::File<capacity::View>>>,
+    _render_observation: Pin<KBox<kernel::debugfs::File<capacity::RenderView>>>,
+    _power_observation: Pin<KBox<kernel::debugfs::File<capacity::PowerView>>>,
+    _firmware_data: [Pin<KBox<kernel::debugfs::File<capacity::FirmwareData>>>; 2],
+    _peek: Pin<KBox<kernel::debugfs::File<capacity::Peek>>>,
+    _recovery: Pin<KBox<kernel::debugfs::File<capacity::Recovery>>>,
+    _ksm: Pin<KBox<kernel::debugfs::File<ksm::View>>>,
+    _pubs: Pin<KBox<kernel::debugfs::File<pubring::View>>>,
 }
 
 impl Gpu {
@@ -866,6 +1040,20 @@ impl Gpu {
             oas: cfg.uat_oas,
         };
         let max_frequency_khz = Self::max_frequency_khz(dev)?;
+        // T8142 (M5) runs the HAL300 firmware interface, started from its adopted graph.
+        if cfg.identity.hal_generation == 300 {
+            dev_info!(
+                dev.as_ref(),
+                "T8142 identified: {} cluster(s), {} core(s), masks {:#x?}, rev {:?}, max {} kHz\n",
+                id.num_clusters,
+                id.num_cores,
+                id.core_masks,
+                id.gpu_rev,
+                max_frequency_khz
+            );
+            #[cfg(not(CONFIG_DRM_ASAHI_G16))]
+            return Err(ENODEV);
+        }
         let preparations = preparation::Gate::new()?;
         let reclaim = runtime::teardown::ReclaimBatch::new()?;
         let feed = feed::Feed::new()?;
@@ -882,6 +1070,8 @@ impl Gpu {
                 feed_work <- new_work!("g17::Shared::feed_work"),
                 preparations,
                 work <- new_work!("g17::Shared::work"),
+                housekeeping: AtomicBool::new(true),
+                housekeeping_ns: AtomicU64::new(0),
                 poll <- new_delayed_work!("g17::Shared::poll"),
                 idle <- new_delayed_work!("g17::Shared::idle"),
                 grow <- new_work!("g17::Shared::grow"),
@@ -899,6 +1089,44 @@ impl Gpu {
             directory.read_only_file(c"capacity", capacity::View(shared.clone())),
             GFP_KERNEL,
         )?;
+        let render_observation = KBox::pin_init(
+            directory.read_only_file(c"render", capacity::RenderView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let power_observation = KBox::pin_init(
+            directory.read_write_file(c"power", capacity::PowerView(shared.clone())),
+            GFP_KERNEL,
+        )?;
+        let firmware_data = [
+            KBox::pin_init(
+                directory.read_only_file(c"fwdata0", capacity::FirmwareData(0)),
+                GFP_KERNEL,
+            )?,
+            KBox::pin_init(
+                directory.read_only_file(c"fwdata1", capacity::FirmwareData(1)),
+                GFP_KERNEL,
+            )?,
+        ];
+        let peek = KBox::pin_init(
+            directory.read_write_file(
+                c"peek",
+                capacity::Peek {
+                    shared: shared.clone(),
+                    va: core::sync::atomic::AtomicU64::new(0),
+                    length: core::sync::atomic::AtomicU64::new(0),
+                },
+            ),
+            GFP_KERNEL,
+        )?;
+        let recovery = KBox::pin_init(
+            directory.read_write_file(c"recovery", capacity::Recovery),
+            GFP_KERNEL,
+        )?;
+        let ksm = KBox::pin_init(
+            directory.read_only_file(c"ksm", ksm::View(regs.clone())),
+            GFP_KERNEL,
+        )?;
+        let pubs = KBox::pin_init(directory.read_only_file(c"pubs", pubring::View), GFP_KERNEL)?;
         let gpu = Arc::new(
             Gpu {
                 cfg,
@@ -908,9 +1136,22 @@ impl Gpu {
                 ids: Default::default(),
                 shared,
                 _capacity: capacity,
+                _render_observation: render_observation,
+                _power_observation: power_observation,
+                _firmware_data: firmware_data,
+                _peek: peek,
+                _recovery: recovery,
+                _ksm: ksm,
+                _pubs: pubs,
             },
             GFP_KERNEL,
         )?;
+        #[cfg(CONFIG_DRM_ASAHI_G16)]
+        let firmware = match cfg.hal300 {
+            Some(hal) => hal300::boot(pdev, dev, cfg, hal, regs, &gpu.shared)?,
+            None => Self::boot(pdev, dev, cfg, regs, geometry, &gpu.shared)?,
+        };
+        #[cfg(not(CONFIG_DRM_ASAHI_G16))]
         let firmware = Self::boot(pdev, dev, cfg, regs, geometry, &gpu.shared)?;
         *gpu.shared.state.lock() = Some(firmware);
         gpu.shared.queue_events();
@@ -989,6 +1230,7 @@ impl Gpu {
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
                 uat,
+                retained: false,
             }),
             GFP_KERNEL,
         )?;
@@ -1097,13 +1339,23 @@ impl gpu::Gpu for Gpu {
     }
 
     fn get_params(&self, params: &mut uapi::drm_asahi_params_global) -> Result {
-        params.features |=
-            u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
-                | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+        if self.cfg.identity.hal_generation == 300 {
+            // Only the compute path is qualified on HAL300. Input-sync and prior ordering are
+            // scheduler properties; the render, ray-query and AS-build bits describe G17P
+            // firmware behaviour this runtime does not have.
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+                    | FEATURE_COMPUTE_RESOURCES;
+        } else {
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_PER_COMMAND_INPUT_SYNCS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_EXACT_PRIOR_BARRIERS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FRAGMENT_BARRIERS)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_RENDER_RAY_QUERY)
+                    | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD);
+        }
         params.gpu_generation = hw::GpuGen::G17 as u32;
         params.gpu_variant = self.cfg.identity.gpu_variant as u32;
         params.gpu_revision = self.id.gpu_rev as u32;
@@ -1163,11 +1415,24 @@ impl gpu::Gpu for Gpu {
             .new_vm(self.ids.vm.next(), kernel_range)?
             .with_status()?;
         let mappings = firmware.init.user_aliases(&vm, &firmware._pm_metrics)?;
-        let ranges =
-            hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va).ok_or(EINVAL)?;
-        let mut reserved = KVec::with_capacity(ranges.len(), GFP_KERNEL)?;
-        for range in ranges {
-            reserved.push(range, GFP_KERNEL)?;
+        let mut reserved = KVec::new();
+        if self.cfg.identity.hal_generation == 300 {
+            // The adopted HAL300 graph has none of the T8140 render windows. Its completion
+            // rings and work objects stay inside the low runtime-graph window, so that window,
+            // the null page and the PM metrics alias are withheld from userspace. Mesa's M5
+            // contract puts the driver range at 0x1000000000 and data at 0x4000000000..0x8000000000.
+            let metrics = self.cfg.pm_metrics.va
+                ..self.cfg.pm_metrics.va.checked_add(self.cfg.pm_metrics.size as u64).ok_or(EINVAL)?;
+            for range in [0..0x1_0000, 0x70_0000_0000..0x71_0000_0000, metrics] {
+                reserved.push(range, GFP_KERNEL)?;
+            }
+        } else {
+            let ranges = hw::t8140::resources::client_reserved_ranges(self.cfg.pm_metrics.va)
+                .ok_or(EINVAL)?;
+            reserved.reserve(ranges.len(), GFP_KERNEL)?;
+            for range in ranges {
+                reserved.push(range, GFP_KERNEL)?;
+            }
         }
         vm.install_driver_mappings(mappings, reserved)?;
         Ok(vm)
@@ -1185,7 +1450,7 @@ impl gpu::Gpu for Gpu {
         let owner = self.ids.queue.next();
         let frontend =
             queue::Frontend::new(priority, usc_exec_base, self.geometry.user_usable_range())?;
-        let policy = scheduling_policy(priority)?;
+        let policy = scheduling_policy(priority, self.cfg.identity.hal_generation)?;
         let admission_started = now_ns();
         let (backend, slot) = loop {
             match runtime::Backend::new(&self.shared, &vm, owner, policy) {
@@ -1241,13 +1506,56 @@ impl gpu::Gpu for Gpu {
 /// Scheduling profile of a new logical queue. `file.rs` passes
 /// `DRM_ASAHI_PRIORITY_REALTIME - priority` and refuses REALTIME, so HIGH
 /// arrives as 1, MEDIUM as 2 and LOW as 3.
-fn scheduling_policy(priority: u32) -> Result<fw::queue::Policy> {
-    match priority {
-        1 => Ok(hw::t8140::scheduling::HIGH),
-        2 => Ok(hw::t8140::scheduling::MEDIUM),
-        3 => Ok(hw::t8140::scheduling::LOW),
-        _ => Err(EINVAL),
+/// `DRM_ASAHI_FEATURE_COMPUTE_RESOURCES`: compute commands may be preceded by the M5
+/// per-dispatch storage declarations (`DRM_ASAHI_SET_COMPUTE_RESOURCES`), which this runtime
+/// turns into private-memory pool pages. The pinned uAPI header of this tree does not name the
+/// bit yet.
+const FEATURE_COMPUTE_RESOURCES: u64 = 1 << 28;
+
+/// HAL300: whether queues created from now on keep their requested ring priority (debugfs
+/// `power`: "prio 1"). Off by default, see `scheduling_policy`.
+static QUEUE_PRIORITIES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub(in crate::g17) fn set_queue_priorities(on: bool) {
+    QUEUE_PRIORITIES.store(on, Ordering::Relaxed);
+}
+
+pub(in crate::g17) fn queue_priorities() -> bool {
+    QUEUE_PRIORITIES.load(Ordering::Relaxed)
+}
+
+fn scheduling_policy(priority: u32, hal_generation: u32) -> Result<fw::queue::Policy> {
+    let policy = match priority {
+        1 => hw::t8140::scheduling::HIGH,
+        2 => hw::t8140::scheduling::MEDIUM,
+        3 => hw::t8140::scheduling::LOW,
+        _ => return Err(EINVAL),
+    };
+    if hal_generation == 300 {
+        // Every qualified M5 dispatch published QoS class 8 (the compute kick class) in its QoS
+        // row; the share is the same. By default all queues share the MEDIUM ring priority
+        // (native user queues use class 2): with Hyprland's LOW queues beside MEDIUM clients a
+        // client's first render pass sometimes never retired, without fault or recovery, and
+        // every later TA of all clients stayed behind it (asahi-render40-boot, before the
+        // page-pool codec, operand-size and UMA-record fixes). Cross-priority render preemption
+        // is not qualified on HAL300; "prio 1" keeps the requested ring for new queues, so a
+        // compositor with HIGH (CAP_SYS_NICE) can be tested against MEDIUM clients.
+        if priority != 2 {
+            pr_info!(
+                "asahi: HAL300 queue requested priority {} ({})\n",
+                priority,
+                if queue_priorities() { "kept" } else { "using MEDIUM" }
+            );
+        }
+        let policy = if queue_priorities() { policy } else { hw::t8140::scheduling::MEDIUM };
+        return Ok(fw::queue::Policy::new(
+            policy.priority(),
+            policy.policy(),
+            fw::compute::COMPUTE_QOS_CLASS,
+            policy.qos_share(),
+        ));
     }
+    Ok(policy)
 }
 
 impl Drop for Gpu {

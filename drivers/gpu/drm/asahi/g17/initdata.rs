@@ -18,6 +18,10 @@ use t8140::{kernel_window as high, low};
 
 const EVENT_RING_RECHECK: u32 = 256;
 
+/// Bundle offset of the HAL300 hardware data's completion-ring table: four (low, high) pairs
+/// 0x20 bytes apart.
+const HAL300_COMPLETION_TABLE: usize = 0x2734;
+
 const INDEX_SIZE: usize = 0x10000;
 const CONTEXT_SIZE: usize = 0x20000;
 const REGION_A_SIZE: usize = core::mem::size_of::<abi::RegionA>();
@@ -28,6 +32,32 @@ const COMPUTE_BLOCKS_POPULATED: usize = 21;
 const COMPUTE_CONTROL_BLOCKS: u32 = 25;
 const COMPUTE_CONTROL_CURSOR: u32 = 0x18;
 const COMPUTE_RUN_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
+
+/// Timestamp bits of a completion record word (as the queue's observation fold masks them).
+const COMPLETION_TIME_MASK: u64 = 0x003f_ffff_ffff_ffff;
+
+/// Compute completion scan state: the slot after the newest record seen, that record's end time
+/// (0 before the first full scan) and when a new record was last found.
+#[derive(Clone, Copy)]
+struct CompletionScan {
+    head: usize,
+    newest: u64,
+    progress_ns: u64,
+}
+
+/// A scan that finds no new record for this long while work waits for one rereads the whole ring.
+const COMPLETION_STALL_NS: u64 = 100_000_000;
+
+/// Compute completion scan statistics, shown by debugfs `capacity`: scans, full scans, slots
+/// read, and exact records latched by a queue.
+pub(crate) static COMPLETION_SCANS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMPLETION_FULL_SCANS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMPLETION_SLOTS: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
+pub(crate) static COMPLETION_LATCHED: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(0);
 
 /// A borrowed completion slot. Read the identity before requesting its timestamps;
 /// unrelated QIDs need only the control word. Each access is an aligned live load.
@@ -137,6 +167,32 @@ impl WorkPublication<'_> {
     }
 }
 
+/// An object of the adopted HAL300 graph, with its fixed address, its context-0 aliases and
+/// its name in the graph.
+pub(super) struct Hal300Object {
+    pub(super) name: KVec<u8>,
+    pub(super) object: KernelObject,
+    pub(super) aliases: KVec<mmu::KernelMapping>,
+    pub(super) low: [u64; 2],
+    /// Firmware address this object is mapped at, from the graph or chosen by the driver for
+    /// an object the adopted graph does not contain.
+    pub(super) high: u64,
+    /// Protection of that firmware mapping.
+    pub(super) prot: mmu::Prot,
+}
+
+/// What the runtime needs from an adopted HAL300 graph beyond the shared object indices.
+struct Hal300Graph {
+    /// Object indices and context-0 addresses of the four completion rings.
+    completions: [(usize, u64); 4],
+    /// Initialization root of each instance.
+    roots: [u64; 2],
+    /// Identity of the completion aliases installed in client VMs.
+    client_id: u64,
+    /// Effort input of the last publication, for the read-only power observation.
+    effort: core::cell::Cell<u32>,
+}
+
 /// Session-long storage and mappings. Aliases are released before their backing objects.
 pub(super) struct InitData {
     // Live publication uses interior writes under the device mutex. This owner is Send but not
@@ -159,8 +215,15 @@ pub(super) struct InitData {
     compute_scheduler: Option<ComputeScheduler>,
     compute_active: core::cell::Cell<bool>,
     event_ring_checked: [core::cell::Cell<(u64, u64, u32)>; 2],
+    /// Where the next compute completion scan starts (see `scan_compute_completions`).
+    completion_scan: core::cell::Cell<CompletionScan>,
     completion_rings: [usize; 2],
     stamps: [usize; 2],
+    /// Offsets of the shared rings and state in this graph.
+    layout: &'static abi::Layout,
+    /// HAL300: the adopted graph, its completion rings and their client aliases, the root
+    /// addresses, the identity of its client mappings and the effort input the host last set.
+    hal300: Option<Hal300Graph>,
     render_pages: usize,
     render_runs: usize,
     render_blocks: core::ops::Range<usize>,
@@ -239,8 +302,15 @@ impl InitData {
             compute_scheduler: None,
             compute_active: core::cell::Cell::new(false),
             event_ring_checked: [const { core::cell::Cell::new((0, 0, 0)) }; 2],
+            completion_scan: core::cell::Cell::new(CompletionScan {
+                head: 0,
+                newest: 0,
+                progress_ns: 0,
+            }),
             completion_rings: [0; 2],
             stamps: [0; 2],
+            layout: &abi::HAL200,
+            hal300: None,
             render_pages: 0,
             render_runs: 0,
             render_blocks: 0..0,
@@ -256,6 +326,41 @@ impl InitData {
 
     pub(super) fn pb_descriptor_table(&self) -> Result<&KernelObject> {
         self.object(self.pb)
+    }
+
+    /// The adopted graph's pool rows use the G17P packing (unit 0x40000 at D0 bit 41, lanes
+    /// shifted by 5/33). Rewrite them, before the firmware starts, in the native G17G packing
+    /// that every row the driver writes now uses (PagePoolDescriptor::g17g).
+    fn convert_g17g_pool_rows(&self) -> Result {
+        let object = self.object(self.page_pool)?;
+        let size = core::mem::size_of::<abi::PagePoolDescriptor>();
+        for row in 0..mmu::UAT_PGSZ / size {
+            let word = |index: usize| object.dword(row * size + index * 8);
+            let d0 = word(0)?.load(Ordering::Relaxed);
+            // Only G17P-packed rows (unit 0x40000 above the page-list address).
+            if d0 >> 41 != 0x4_0000 {
+                continue;
+            }
+            let d1 = word(1)?.load(Ordering::Relaxed);
+            let d2 = word(2)?.load(Ordering::Relaxed);
+            let va = (d0 & ((1u64 << 41) - 1)) << 7;
+            let row_g17g = abi::PagePoolDescriptor::g17g(
+                va,
+                ((d1 >> 5) & 0x0fff_ffff) as u32,
+                ((d1 >> 33) & 0x0fff_ffff) as u32,
+                (d1 >> 61) as u32,
+                (d2 & 0x0fff_ffff) as u32,
+                0x4_0000,
+            );
+            pr_info!("asahi: HAL300 pool row {} {:#x} {:#x} {:#x} -> {:#x} {:#x} {:#x}\n",
+                     row, d0, d1, d2, row_g17g.page_list, row_g17g.counters, row_g17g.page_count);
+            word(0)?.store(row_g17g.page_list, Ordering::Relaxed);
+            word(1)?.store(row_g17g.counters, Ordering::Relaxed);
+            word(2)?.store(row_g17g.page_count, Ordering::Relaxed);
+            word(3)?.store(0, Ordering::Relaxed);
+        }
+        core::sync::atomic::fence(Ordering::SeqCst);
+        Ok(())
     }
 
     pub(super) fn page_pool_descriptor_table(&self) -> Result<&KernelObject> {
@@ -331,7 +436,9 @@ impl InitData {
     }
 
     pub(super) fn has_compute_shared(&self) -> bool {
-        self.compute_shared.is_some()
+        // The HAL300 graph has no shared compute aperture; clients only need its completion
+        // rings, which cache_compute_vm() maps.
+        self.hal300.is_some() || self.compute_shared.is_some()
     }
 
     /// Install a prepared aperture once while holding the device mutex. A competing preparer
@@ -373,6 +480,20 @@ impl InitData {
     }
 
     pub(super) fn cache_compute_vm(&self, vm: &mmu::Vm) -> Result {
+        if let Some(graph) = self.hal300.as_ref() {
+            if vm.compute_pool_mappings_match(graph.client_id) {
+                return Ok(());
+            }
+            vm.clear_compute_pool_mappings();
+            let mut mappings = KVec::with_capacity(graph.completions.len(), GFP_KERNEL)?;
+            for (index, low) in graph.completions {
+                mappings.push(
+                    self.object(index)?.map_alias(vm, low, mmu::PROT_GPU_SHARED_RW)?,
+                    GFP_KERNEL,
+                )?;
+            }
+            return vm.install_compute_pool_mappings(graph.client_id, mappings);
+        }
         let shared = self.compute_shared.as_ref().ok_or(EIO)?;
         if vm.compute_pool_mappings_match(shared.id) {
             return Ok(());
@@ -412,6 +533,17 @@ impl InitData {
 
     /// The descriptor-table views remain immutable for the firmware session.
     pub(super) fn validate_descriptor_views(&self) -> Result {
+        if self.hal300.is_some() {
+            // The adopted graph names only the page-pool descriptor table.
+            let base = self.layout.main_config[Role::Primary as usize]
+                + core::mem::offset_of!(abi::MainConfig, page_pool_descriptors_low_va);
+            let bundle = self.object(self.bundle)?;
+            let table = self.object(self.page_pool)?.gpu_va();
+            let low = bundle.dword(base)?.load(Ordering::Relaxed);
+            let high = bundle.dword(base + 8)?.load(Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+            return if low == 0 || high != table { Err(EIO) } else { Ok(()) };
+        }
         let values = [
             low::PB_DESCRIPTORS,
             self.object(self.pb)?.gpu_va(),
@@ -436,6 +568,12 @@ impl InitData {
     pub(super) fn activate_compute(&self) -> Result {
         self.validate_descriptor_views()?;
         if self.compute_active.get() {
+            return Ok(());
+        }
+        if self.hal300.is_some() {
+            // The qualified HAL300 dispatches never wrote a compute global state; the queue
+            // configuration and the QoS publication name the scheduler instead.
+            self.compute_active.set(true);
             return Ok(());
         }
         let scheduler = self.compute_scheduler.as_ref().ok_or(EIO)?.object.gpu_va();
@@ -498,11 +636,11 @@ impl InitData {
             return Err(EINVAL);
         }
         let destination = self.object(self.bundle)?.pointer(
-            abi::work_ring_offset(channel) + producer as usize * core::mem::size_of_val(record),
+            self.layout.work_ring_offset(channel) + producer as usize * core::mem::size_of_val(record),
             core::mem::size_of_val(record),
         )?;
         let producer = self.object(self.cluster)?.word(
-            Self::state_offset(Role::Primary)
+            self.state_offset(Role::Primary)
                 + abi::work_state_offset(channel)
                 + abi::ChannelState::PRODUCER,
         )?;
@@ -522,7 +660,7 @@ impl InitData {
     ) -> Result<[u32; 3]> {
         use super::fw::channels;
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
-        let base = Self::state_offset(Role::Primary) + abi::work_state_offset(channel);
+        let base = self.state_offset(Role::Primary) + abi::work_state_offset(channel);
         let state = self.object(self.cluster)?;
         let mut values = [0; 3];
         for (value, offset) in values.iter_mut().zip([
@@ -539,6 +677,28 @@ impl InitData {
             return Err(EINVAL);
         }
         Ok(values)
+    }
+
+    /// Copy of the outer work-ring record at `index` of the channel (read-only diagnostics).
+    pub(super) fn work_record(
+        &self,
+        priority: u8,
+        engine: super::fw::queue::DataMaster,
+        index: u32,
+    ) -> Result<[u8; core::mem::size_of::<super::fw::channels::WorkSlot>()]> {
+        use super::fw::channels;
+        let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
+        if index >= channels::WORK_RING_SLOTS {
+            return Err(EINVAL);
+        }
+        let mut record = [0u8; core::mem::size_of::<super::fw::channels::WorkSlot>()];
+        let source = self.object(self.bundle)?.pointer(
+            self.layout.work_ring_offset(channel) + index as usize * record.len(),
+            record.len(),
+        )?;
+        // SAFETY: `pointer()` checked the range against the live mapping; this is a plain copy.
+        unsafe { core::ptr::copy_nonoverlapping(source, record.as_mut_ptr(), record.len()) };
+        Ok(record)
     }
 
     /// Inner queue records must be visible before this outer publication. The returned
@@ -601,7 +761,7 @@ impl InitData {
         };
         let channel = channels::work_ring_index(priority, engine).ok_or(EINVAL)?;
         let producer = self.object(self.cluster)?.word(
-            Self::state_offset(Role::Primary)
+            self.state_offset(Role::Primary)
                 + abi::work_state_offset(channel)
                 + abi::ChannelState::PRODUCER,
         )?;
@@ -611,7 +771,7 @@ impl InitData {
             return Err(EBUSY);
         }
         let destination = self.object(self.bundle)?.pointer(
-            abi::work_ring_offset(channel) + current as usize * core::mem::size_of_val(record),
+            self.layout.work_ring_offset(channel) + current as usize * core::mem::size_of_val(record),
             core::mem::size_of_val(record),
         )?;
         Ok(WorkPublication {
@@ -651,18 +811,350 @@ impl InitData {
 
     /// Snapshot the shared compute completion ring once per service transaction. The queue
     /// scanner latches exact identities; firmware retains sole ownership of these slots.
+    ///
+    /// HAL300 scans incrementally: the firmware fills slots in order, so only slots past the
+    /// newest record seen last time, or from slot 0 after a restart, can hold new ones. Reading
+    /// all 2048 write-combined slots took 0.2-0.7 ms per event turn with the device mutex held,
+    /// which every submission waited for (Arch desktop 2026-10-31: run_job to doorbell up to
+    /// 1.5 ms). A record missed here only costs the recordless one-pass grace; `full`, the first
+    /// scan and a scan without a new record for `COMPLETION_STALL_NS` read the whole ring.
     pub(super) fn scan_compute_completions(
         &self,
+        full: bool,
         mut record: impl FnMut(ComputeCompletion<'_>) -> Result,
     ) -> Result {
-        let object = self.object(self.completion_rings[0])?;
+        let ring = match self.hal300.as_ref() {
+            Some(graph) => graph.completions[self.layout.compute_completions].0,
+            None => self.completion_rings[self.layout.compute_completions],
+        };
+        let object = self.object(ring)?;
         fence(Ordering::Acquire);
-        for slot in 0..(abi::COMPLETION_RING_SIZE / 0x40).min(0x800) {
+        let slots = (abi::COMPLETION_RING_SIZE / 0x40).min(0x800);
+        if self.hal300.is_none() {
+            for slot in 0..slots {
+                record(ComputeCompletion {
+                    object,
+                    offset: slot * 0x40,
+                })?;
+            }
+            return Ok(());
+        }
+        // A record's start (word 2) and end (word 5) in 24 MHz ticks.
+        let times = |slot: usize| -> Result<(u64, u64)> {
+            let word = |index: usize| -> Result<u64> {
+                Ok(object.dword(slot * 0x40 + index * 8)?.load(Ordering::Relaxed)
+                    & COMPLETION_TIME_MASK)
+            };
+            Ok((word(2)?, word(5)?))
+        };
+        // G17G never measures a timestamp-only command; a zero interval there is not the G17P
+        // proof that the command did not execute, so such a record stays unlatched and the
+        // command keeps the recordless path it always had.
+        let mut visit = |slot: usize, (start, end): (u64, u64)| -> Result {
+            if start != 0 && start == end {
+                return Ok(());
+            }
             record(ComputeCompletion {
                 object,
                 offset: slot * 0x40,
-            })?;
+            })
+        };
+        let scan = self.completion_scan.get();
+        let now = super::now_ns();
+        COMPLETION_SCANS.fetch_add(1, Ordering::Relaxed);
+        if full
+            || scan.newest == 0
+            || scan.head >= slots
+            || now.saturating_sub(scan.progress_ns) > COMPLETION_STALL_NS
+        {
+            COMPLETION_FULL_SCANS.fetch_add(1, Ordering::Relaxed);
+            let mut best = (0, 0);
+            for slot in 0..slots {
+                let times = times(slot)?;
+                if times.1 > best.1 {
+                    best = (slot, times.1);
+                }
+                visit(slot, times)?;
+            }
+            COMPLETION_SLOTS.fetch_add(slots as u64, Ordering::Relaxed);
+            self.completion_scan.set(CompletionScan {
+                head: (best.0 + 1) % slots,
+                newest: best.1,
+                progress_ns: now,
+            });
+            return Ok(());
         }
+        // The firmware restarts at slot 0 whenever the GPU powers up again (idle power-off
+        // descends many times a second on an idle desktop) and otherwise continues after the
+        // last record. So walk from the head and, if slot 0 holds a record newer than the newest
+        // seen, from slot 0 as well; each walk ends at a run of records no newer than that, which
+        // is older data. A few slots before the head are revisited for records that were still
+        // being written. Visiting a slot twice is harmless: latching keeps the newest identity.
+        const LOOKBACK: usize = 16;
+        const OLD_RUN: usize = 8;
+        let mut visited = 0u64;
+        for back in (1..=LOOKBACK).rev() {
+            let slot = (scan.head + slots - back) % slots;
+            visit(slot, times(slot)?)?;
+            visited += 1;
+        }
+        let mut best = (scan.head, scan.newest);
+        let mut walk = |start: usize, best: &mut (usize, u64), visited: &mut u64| -> Result {
+            let mut old = 0;
+            for step in 0..slots {
+                let slot = (start + step) % slots;
+                let times = times(slot)?;
+                visit(slot, times)?;
+                *visited += 1;
+                if times.1 > scan.newest {
+                    old = 0;
+                    if times.1 > best.1 {
+                        *best = ((slot + 1) % slots, times.1);
+                    }
+                } else {
+                    old += 1;
+                    if old >= OLD_RUN {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        };
+        walk(scan.head, &mut best, &mut visited)?;
+        if scan.head != 0 && times(0)?.1 > scan.newest {
+            walk(0, &mut best, &mut visited)?;
+        }
+        COMPLETION_SLOTS.fetch_add(visited, Ordering::Relaxed);
+        self.completion_scan.set(CompletionScan {
+            head: best.0,
+            newest: best.1,
+            progress_ns: if best.1 > scan.newest { now } else { scan.progress_ns },
+        });
+        Ok(())
+    }
+
+    /// Adopts the HAL300 graph the firmware was started with, instead of building the HAL200
+    /// graph. Every address the runtime derives from [`abi::HAL300`] is first checked against
+    /// what the graph itself names, so a layout mistake fails here, before any publication.
+    pub(super) fn adopt_hal300(
+        &mut self,
+        objects: KVec<Hal300Object>,
+        roots: [u64; 2],
+        metrics_fw_va: u64,
+    ) -> Result {
+        if !self.objects.is_empty() || self.hal300.is_some() {
+            return Err(EBUSY);
+        }
+        let layout = &abi::HAL300;
+        let mut completions = [(usize::MAX, 0u64); 4];
+        let (mut bundle, mut cluster, mut region_c, mut qos, mut page_pool) =
+            (None, None, None, None, None);
+        let (mut pb, mut stamps) = (None, [None, None]);
+        for item in objects {
+            let index = self.objects.len();
+            let name = item.name.as_slice();
+            let size = item.object.size();
+            match name {
+                b"allocation0" if size == abi::bundle::SIZE => bundle = Some(index),
+                b"allocation1" if size == abi::private::SIZE => cluster = Some(index),
+                b"allocation2" if size >= layout.power_assert_tally + 4 => region_c = Some(index),
+                b"compute-global" if size >= abi::QOS_SIZE => qos = Some(index),
+                b"compute-pool-descriptors" if size == mmu::UAT_PGSZ => page_pool = Some(index),
+                // Driver-created render tables: the adopted compute graph has neither the
+                // parameter-buffer descriptor table nor the two stamp pages.
+                b"pb-descriptors" if size == mmu::UAT_PGSZ => pb = Some(index),
+                b"render-stamp-a" if size == mmu::UAT_PGSZ => stamps[0] = Some(index),
+                b"render-stamp-b" if size == mmu::UAT_PGSZ => stamps[1] = Some(index),
+                [b'c', b'o', b'm', b'p', b'l', b'e', b't', b'i', b'o', b'n', ring]
+                    if (b'0'..=b'3').contains(ring) && size == abi::COMPLETION_RING_SIZE =>
+                {
+                    let slot = usize::from(ring - b'0');
+                    if completions[slot].0 != usize::MAX || item.low[0] == 0 || item.low[1] != 0 {
+                        return Err(EINVAL);
+                    }
+                    completions[slot] = (index, item.low[0]);
+                }
+                _ => {}
+            }
+            self.objects.push(item.object, GFP_KERNEL)?;
+            for alias in item.aliases {
+                self.aliases.push(alias, GFP_KERNEL)?;
+            }
+        }
+        let (Some(bundle), Some(cluster), Some(region_c), Some(qos), Some(page_pool)) =
+            (bundle, cluster, region_c, qos, page_pool)
+        else {
+            pr_err!("asahi: HAL300 graph lacks a shared object\n");
+            return Err(EINVAL);
+        };
+        if completions.iter().any(|(index, _)| *index == usize::MAX) {
+            pr_err!("asahi: HAL300 graph lacks a completion ring\n");
+            return Err(EINVAL);
+        }
+        self.bundle = bundle;
+        self.cluster = cluster;
+        self.region_c = region_c;
+        self.qos = qos;
+        self.page_pool = page_pool;
+        self.convert_g17g_pool_rows()?;
+        if crate::g17::startup_seed_enabled() {
+            // Startup idle permission. Native initFirmwareData copies the accelerator's flag
+            // bit here (H+0x8b99454); the captured graph has 0, so the firmware never descends
+            // and its performance controller never takes the wake catch-up path that seeds the
+            // reason-4 entries (sol-hal300-seed-study.md).
+            // HARDWARE RESULT (asahi-pw3/pw4-boot): with this set the power-on transition ends
+            // in the DESCENDED status A ([0,1,0,0,0,1,0,0] for both) instead of the settled
+            // one, and firmware start times out - even when one IdlePowerOff{allow=0} is
+            // published immediately after POWER_ON_DONE. So it needs a start sequence that
+            // can wake a descended firmware, not just this word; kept on its own flag (bit 55)
+            // so the finding is reproducible without affecting the idle policy (bit 56).
+            self.object(self.region_c)?
+                .word(0x30)?
+                .store(1, Ordering::Relaxed);
+            fence(Ordering::SeqCst);
+        }
+        // Render needs all three; compute does not touch them, so a graph without them still
+        // starts and only a render command fails its own validation.
+        if let (Some(pb), [Some(a), Some(b)]) = (pb, stamps) {
+            self.pb = pb;
+            self.stamps = [a, b];
+        }
+        self.metrics_fw_va = metrics_fw_va;
+        self.layout = layout;
+        let bundle_va = self.object(self.bundle)?.gpu_va();
+        let cluster_va = self.object(self.cluster)?.gpu_va();
+        if bundle_va == 0 || cluster_va == 0 {
+            pr_err!("asahi: HAL300 graph objects are not mapped\n");
+            return Err(EINVAL);
+        }
+        let bundle = self.object(self.bundle)?;
+        // Some graph words are only 4-byte aligned (the completion table at 0x2734).
+        let read = |offset: usize| -> Result<u64> {
+            let [low, high] = bundle.read_words::<2>(offset)?;
+            Ok(u64::from(low) | u64::from(high) << 32)
+        };
+        let mismatch = |what: &str, offset: usize, found: u64, expected: u64| {
+            pr_err!(
+                "asahi: HAL300 graph layout mismatch: {} at {:#x}: {:#x}, expected {:#x}\n",
+                what,
+                offset,
+                found,
+                expected
+            );
+            EINVAL
+        };
+        // Each root names this layout's main configuration and status A block.
+        for (role, root) in roots.iter().enumerate() {
+            let object = self
+                .objects
+                .iter()
+                .find(|object| {
+                    let va = object.gpu_va();
+                    va != 0 && *root >= va && *root + 0xc8 <= va + object.size() as u64
+                })
+                .ok_or_else(|| {
+                    pr_err!("asahi: HAL300 root {:#x} is not in a graph object\n", root);
+                    EINVAL
+                })?;
+            let at = (*root - object.gpu_va()) as usize;
+            let word = |offset: usize| -> Result<u64> {
+                let [low, high] = object.read_words::<2>(at + offset)?;
+                Ok(u64::from(low) | u64::from(high) << 32)
+            };
+            for (offset, expected) in [
+                (0x18, bundle_va + layout.main_config[role] as u64),
+                (0xa8, cluster_va + layout.status_a[role] as u64),
+            ] {
+                let found = word(offset)?;
+                if found != expected {
+                    return Err(mismatch("root", offset, found, expected));
+                }
+            }
+        }
+        // The channel tables name the work rings, the control rings and the event rings exactly
+        // where the runtime will publish and consume them.
+        let channels = core::mem::offset_of!(abi::MainConfig, channels);
+        let entry = |role: usize, channel: usize, word: usize| {
+            read(layout.main_config[role] + channels + channel * 0x20 + word * 8)
+        };
+        let check = |role: usize, channel: usize, word: usize, expected: u64| -> Result {
+            let found = entry(role, channel, word)?;
+            if found != expected {
+                let offset = layout.main_config[role] + channels + channel * 0x20 + word * 8;
+                return Err(mismatch("channel", offset, found, expected));
+            }
+            Ok(())
+        };
+        for channel in 0..abi::WORK_CHANNELS {
+            let state = cluster_va + (layout.state[0] + abi::work_state_offset(channel)) as u64;
+            check(0, channel, 0, state + abi::ChannelState::CONSUMER as u64)?;
+            check(0, channel, 2, state + abi::ChannelState::PRODUCER as u64)?;
+            check(0, channel, 3, bundle_va + layout.work_ring_offset(channel) as u64)?;
+        }
+        for role in 0..2 {
+            let state = cluster_va + (layout.state[role] + abi::CONTROL_STATE_OFFSET) as u64;
+            let status = cluster_va + layout.status_a[role] as u64;
+            let ring = bundle_va + (layout.main_config[role] + abi::MainConfig::CONTROL_RING) as u64;
+            check(role, abi::CONTROL_CHANNEL, 2, state + abi::ChannelState::PRODUCER as u64)?;
+            check(role, abi::CONTROL_CHANNEL, 3, ring)?;
+            check(role, abi::EVENT_CHANNEL, 0, status + abi::status::EVENT_STATE)?;
+            check(role, abi::EVENT_CHANNEL, 1, status + abi::status::EVENT_RING)?;
+        }
+        // The hardware data's completion table names the four rings and their context-0 aliases.
+        for (ring, (index, low)) in completions.iter().enumerate() {
+            let high = self.object(*index)?.gpu_va();
+            let offset = HAL300_COMPLETION_TABLE + ring * 0x20;
+            for (at, expected) in [(offset, *low), (offset + 8, high)] {
+                let found = read(at)?;
+                if found != expected {
+                    return Err(mismatch("completion table", at, found, expected));
+                }
+            }
+        }
+        self.hal300 = Some(Hal300Graph {
+            completions,
+            roots,
+            client_id: u64::from(super::ids::OBJECTS.object()?),
+            effort: core::cell::Cell::new(0),
+        });
+        Ok(())
+    }
+
+    /// Whether device-control records with `opcode` are qualified for this firmware. On HAL300
+    /// the USC cache control and the three compute teardown records are: their kinds and
+    /// layouts match the native M5 publishers (submitReleaseResource 0x13, the free-list
+    /// releases 0x2e, processExitTimeoutHandler 0x29). Idle power and parameter-buffer replies
+    /// are not used on HAL300.
+    pub(super) fn control_qualified(&self, opcode: super::fw::channels::DeviceControlOp) -> bool {
+        use super::fw::channels::DeviceControlOp as Op;
+        // SchedulerStateRelease (0x13) crashed the firmware in asahi-render62/63/64 (slot
+        // bookkeeping at P+0x120e0: a descriptor word whose bits 60:61 were zero indexes its
+        // 16-byte table at -1). Those boots published it for contexts whose render pool had
+        // never been released, because HAL300 suppressed every free-list release. The order is
+        // native again (the pool releases on its final reference, then the scheduler), so the
+        // record is admitted behind debug_flags bit 60 until a boot proves that order.
+        self.hal300.is_none()
+            || matches!(
+                opcode,
+                Op::UscCacheInvalidate
+                    | Op::FreeListRelease
+                    | Op::ContextKill
+                    | Op::TvbGrowReply
+            )
+            // IdlePowerOff (0x0a) is the native permission/wake control; its 64 bytes
+            // ({kind, allow, zero[56]}) and power-counted policy already match the native
+            // publisher. HAL300 keeps it opt-in (debug_flags bit 56) until a boot proves one
+            // complete descent and wake: sol-hal300-seed-study.md shows that wake catch-up is
+            // the legitimate route to the reason-4 seed that today leaves this M5 at pstate 1.
+            || (matches!(opcode, Op::IdlePowerOff)
+                && (super::idle_policy_enabled() || super::startup_seed_enabled()))
+            || (matches!(opcode, Op::SchedulerStateRelease)
+                && crate::module_parameters::debug_flags.value() & (1 << 60) != 0)
+    }
+
+    /// Retains a mapping the firmware uses for the whole session, such as a register window.
+    pub(super) fn retain_mapping(&mut self, mapping: mmu::KernelMapping) -> Result {
+        self.aliases.push(mapping, GFP_KERNEL)?;
         Ok(())
     }
 
@@ -1050,8 +1542,8 @@ impl InitData {
             let slot = role as usize;
             let main_offset = abi::bundle::MAIN_CONFIG[slot];
             let main_va = base + high::BUNDLE + main_offset as u64;
-            let state_va = base + high::PRIVATE_CLUSTER + Self::state_offset(role) as u64;
-            let status_va = base + high::PRIVATE_CLUSTER + Self::status_offset(role) as u64;
+            let state_va = base + high::PRIVATE_CLUSTER + self.state_offset(role) as u64;
+            let status_va = base + high::PRIVATE_CLUSTER + self.status_offset(role) as u64;
             let args = abi::MainConfigArgs {
                 bundle_va: base + high::BUNDLE,
                 main_config_va: main_va,
@@ -1107,7 +1599,7 @@ impl InitData {
                 (abi::ChannelState::PRODUCER, abi::OPENING_PRODUCER),
             ] {
                 self.object(self.cluster)?
-                    .word(Self::state_offset(role) + abi::CONTROL_STATE_OFFSET + offset)?
+                    .word(self.state_offset(role) + abi::CONTROL_STATE_OFFSET + offset)?
                     .store(value, Ordering::Relaxed);
             }
         }
@@ -1123,6 +1615,20 @@ impl InitData {
         metrics: &KernelObject,
     ) -> Result<KVec<mmu::KernelMapping>> {
         let mut mappings = KVec::with_capacity(24, GFP_KERNEL)?;
+        if self.hal300.is_some() {
+            // The adopted graph has no render pool, so only the PM metrics page is aliased. TA
+            // writes scene metrics through a compact pointer relative to the architectural base
+            // 0x1000000000 (register 0x1c910, scene metric alias 0x1000080004 + 4 * slot): in
+            // render13 the TA faulted writing context 5 VA 0x1000080000 (fault info
+            // 0x81400bc091) because this alias was missing. Mesa's M5 driver range is the
+            // client VM's kernel range ([0x1000000000, 0x1800000000)), so the alias belongs
+            // there; compute never touches it.
+            mappings.push(
+                metrics.map_alias(vm, t8140::CONFIG.pm_metrics.va, mmu::PROT_GPU_FW_SHARED_RW)?,
+                GFP_KERNEL,
+            )?;
+            return Ok(mappings);
+        }
         mappings.push(
             self.object_mut(self.render_pages)?.map_alias(
                 vm,
@@ -1158,10 +1664,14 @@ impl InitData {
 
     /// Writes the effort input in firmware order, then cleans its cache line to coherency.
     pub(super) fn publish_effort(&self, effort: u32) -> Result {
+        if let Some(graph) = self.hal300.as_ref() {
+            graph.effort.set(effort);
+        }
         let region = self.object(self.region_c)?;
-        let override_word = region.word(abi::RegionC::UNK_E8)?;
-        let effort_word = region.word(abi::RegionC::EFFORT)?;
-        let line = region.pointer(abi::RegionC::EFFORT, 4)?;
+        let effort_offset = self.layout.effort.ok_or(EIO)?;
+        let override_word = region.word(effort_offset + 4)?;
+        let effort_word = region.word(effort_offset)?;
+        let line = region.pointer(effort_offset, 4)?;
         override_word.store(0, Ordering::Relaxed);
         effort_word.store(effort, Ordering::Relaxed);
         // SAFETY: line points into the retained kernel mapping; cleaning this host-owned cache
@@ -1173,10 +1683,92 @@ impl InitData {
         Ok(())
     }
 
+    /// Read-only HAL300 power observation (sol-hal300-power-study.md,
+    /// sol-hal300-pstate-cap-study.md): the host's inputs in region C, the counted-control
+    /// tally, and the firmware's own arbitration in object Q (bundle +0x5380) - its applied
+    /// pstate and the floor/cap/selected values with the reason codes that attribute them.
+    /// Nothing here writes firmware memory.
+    pub(super) fn power_sample(&self) -> Result<([u64; 13], [u64; 9])> {
+        const Q: usize = 0x5380;
+        let region = self.object(self.region_c)?;
+        let effort_offset = self.layout.effort.ok_or(EIO)?;
+        let tally = region.pointer(self.layout.power_assert_tally, 4)?;
+        // SAFETY: the checked pointer stays inside the retained region-C mapping; the tally is
+        // unaligned, so it is read with the same four-byte copy the publisher uses.
+        let tally = unsafe {
+            let mut bytes = [0u8; 4];
+            core::ptr::copy_nonoverlapping(tally, bytes.as_mut_ptr(), 4);
+            u64::from(u32::from_le_bytes(bytes))
+        };
+        let c = |offset: usize| {
+            region
+                .word(offset)
+                .map(|w| u64::from(w.load(Ordering::Relaxed)))
+        };
+        let bundle = self.object(self.bundle)?;
+        let q = |offset: usize| {
+            bundle
+                .word(Q + offset)
+                .map(|w| u64::from(w.load(Ordering::Relaxed)))
+        };
+        Ok((
+            [
+                c(effort_offset)?,
+                c(effort_offset + 4)?,
+                tally,
+                c(0x88)?,
+                c(0x8c)?,
+                c(0x90)?,
+                c(0x94)?,
+                c(0x98)?,
+                c(0x9c)?,
+                c(0xa0)?,
+                c(0xa4)?,
+                c(0x7f0)?,
+                c(0x7f4)?,
+            ],
+            [
+                q(0x38)?,
+                q(0x3c)?,
+                q(0x40)?,
+                q(0x44)?,
+                q(0x48)?,
+                q(0x4c)?,
+                q(0x50)?,
+                q(0x54)?,
+                q(0x58)?,
+            ],
+        ))
+    }
+
+    /// Reason-4 seed witnesses (sol-hal300-seed-study.md): the aggregate output Q+0x2928 and
+    /// the three enabled entries' previous candidates at Q+0x298a + 0x20*i + 0x18. The entry
+    /// words are only 2-byte aligned, so they are copied, never loaded as atomics.
+    pub(super) fn power_seed(&self) -> Result<[u32; 4]> {
+        const Q: usize = 0x5380;
+        let bundle = self.object(self.bundle)?;
+        let copy = |offset: usize| -> Result<u32> {
+            let pointer = bundle.pointer(Q + offset, 4)?;
+            let mut bytes = [0u8; 4];
+            // SAFETY: the checked pointer covers four bytes of the retained bundle mapping.
+            unsafe { core::ptr::copy_nonoverlapping(pointer, bytes.as_mut_ptr(), 4) };
+            Ok(u32::from_le_bytes(bytes))
+        };
+        Ok([copy(0x2928)?, copy(0x29a2)?, copy(0x29c2)?, copy(0x29e2)?])
+    }
+
+    /// Firmware VA of region C and the host's last published effort, for the power view.
+    pub(super) fn power_identity(&self) -> Result<(u64, u32)> {
+        Ok((
+            self.object(self.region_c)?.gpu_va(),
+            self.hal300.as_ref().map_or(0, |graph| graph.effort.get()),
+        ))
+    }
+
     pub(super) fn effort(&self) -> Result<u32> {
         Ok(self
             .object(self.region_c)?
-            .word(abi::RegionC::EFFORT)?
+            .word(self.layout.effort.ok_or(EIO)?)?
             .load(Ordering::Relaxed))
     }
 
@@ -1201,24 +1793,18 @@ impl InitData {
         Ok(opps)
     }
 
-    fn state_offset(role: Role) -> usize {
-        match role {
-            Role::Primary => abi::private::PRIMARY_STATE,
-            Role::Secondary => abi::private::SECONDARY_STATE,
-        }
+    fn state_offset(&self, role: Role) -> usize {
+        self.layout.state[role as usize]
     }
 
-    fn status_offset(role: Role) -> usize {
-        match role {
-            Role::Primary => abi::private::PRIMARY_STATUS_A,
-            Role::Secondary => abi::private::SECONDARY_STATUS_A,
-        }
+    fn status_offset(&self, role: Role) -> usize {
+        self.layout.status_a[role as usize]
     }
 
     /// Recheck the host-authored event pointer pair after a bounded number of drains.
     /// The device mutex serializes the cache and all event consumption.
     pub(super) fn validate_event_ring(&self, role: Role) -> Result {
-        let status = self.object(self.cluster)?.gpu_va() + Self::status_offset(role) as u64;
+        let status = self.object(self.cluster)?.gpu_va() + self.status_offset(role) as u64;
         let expected = (
             status + abi::status::EVENT_STATE,
             status + abi::status::EVENT_RING,
@@ -1229,7 +1815,7 @@ impl InitData {
             cache.set((checked.0, checked.1, checked.2 - 1));
             return Ok(());
         }
-        let offset = abi::bundle::MAIN_CONFIG[role as usize]
+        let offset = self.layout.main_config[role as usize]
             + core::mem::offset_of!(abi::MainConfig, channels)
             + abi::EVENT_CHANNEL * size_of::<abi::ChannelEntry>();
         let bundle = self.object(self.bundle)?;
@@ -1249,7 +1835,7 @@ impl InitData {
 
     pub(super) fn status_word(&self, role: Role, offset: usize) -> Result<&AtomicU32> {
         self.object(self.cluster)?.word(
-            Self::status_offset(role)
+            self.status_offset(role)
                 .checked_add(offset)
                 .ok_or(EINVAL)?,
         )
@@ -1261,7 +1847,7 @@ impl InitData {
         offset: usize,
     ) -> Result<[u32; N]> {
         self.object(self.cluster)?.read_words(
-            Self::status_offset(role)
+            self.status_offset(role)
                 .checked_add(offset)
                 .ok_or(EINVAL)?,
         )
@@ -1302,13 +1888,13 @@ impl InitData {
         asserts_power: bool,
         next: u32,
     ) -> Result {
-        let offset = abi::bundle::MAIN_CONFIG[Role::Primary as usize]
+        let offset = self.layout.main_config[Role::Primary as usize]
             + abi::MainConfig::CONTROL_RING
             + (slot as usize).checked_mul(record.len()).ok_or(EINVAL)?;
         let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
         let power = self
             .object(self.region_c)?
-            .pointer(abi::RegionC::POWER_ASSERT_TALLY, 4)?;
+            .pointer(self.layout.power_assert_tally, 4)?;
         let producer = self.control_producer()?;
         // SAFETY: The checked pointers remain valid for the lifetime of this non-Sync owner.
         // Firmware only reads records after the producer store and the device mutex serializes
@@ -1329,16 +1915,107 @@ impl InitData {
     }
 
     pub(super) fn root_va(&self, role: Role) -> Result<u64> {
+        if let Some(graph) = self.hal300.as_ref() {
+            return Ok(graph.roots[role as usize]);
+        }
         Ok(self.object(self.roots)?.gpu_va() + role as u64 * abi::SECONDARY_ROOT_OFFSET as u64)
     }
 
+    /// Publishes one uncounted, otherwise zero 64-byte control record of `kind` on `role`'s own
+    /// control ring (native AGXArmFirmware::submitCmdFirmwareForceConfigSnapshot builds primary
+    /// kind 0x15 and secondary kind 0x2a this way; sol-hal300-gated-context-study.md 2.4).
+    /// Returns the new producer. Startup only: the device lock is not yet shared.
+    pub(super) fn publish_role_control(&self, role: Role, kind: u32) -> Result<u32> {
+        let base = self.state_offset(role) + abi::CONTROL_STATE_OFFSET;
+        let cluster = self.object(self.cluster)?;
+        fence(Ordering::Acquire);
+        let consumer = cluster.word(base + abi::ChannelState::CONSUMER)?.load(Ordering::Relaxed);
+        let producer_word = cluster.word(base + abi::ChannelState::PRODUCER)?;
+        let producer = producer_word.load(Ordering::Relaxed);
+        if consumer >= super::fw::channels::DEVICE_CONTROL_SLOTS || producer >= super::fw::channels::DEVICE_CONTROL_SLOTS {
+            return Err(EIO);
+        }
+        let next = (producer + 1) & (super::fw::channels::DEVICE_CONTROL_SLOTS - 1);
+        if next == consumer {
+            return Err(EAGAIN);
+        }
+        let mut record = [0u8; 64];
+        record[..4].copy_from_slice(&kind.to_le_bytes());
+        let offset = self.layout.main_config[role as usize]
+            + abi::MainConfig::CONTROL_RING
+            + (producer as usize) * record.len();
+        let ring = self.object(self.bundle)?.pointer(offset, record.len())?;
+        // SAFETY: checked pointer into the retained bundle; firmware reads it only after the
+        // producer store below.
+        unsafe { core::ptr::copy_nonoverlapping(record.as_ptr(), ring, record.len()) };
+        fence(Ordering::SeqCst);
+        producer_word.store(next, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        pr_info!("asahi: {:?} control slot {} kind {:#x}\n", role, producer, kind);
+        Ok(next)
+    }
+
+    /// Withdraws the startup idle permission (region C +0x30), so later configuration refreshes
+    /// keep the GPU awake after the one startup descent and wake.
+    pub(super) fn clear_startup_idle_permission(&self) -> Result {
+        self.set_startup_idle_permission(0)
+    }
+
+    /// Host-owned region C +0x30 (startup idle permission), consumed by the coprocessors at their
+    /// next configuration refresh (a force-config snapshot makes that immediate).
+    pub(super) fn set_startup_idle_permission(&self, value: u32) -> Result {
+        self.object(self.region_c)?.word(0x30)?.store(value, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Fills one empty host IOMapping record of the adopted HAL300 graph (allocation0 +0x640,
+    /// 0x28 bytes per slot: phys, firmware VA, total and element size, relative offset, rw)
+    /// before the coprocessors initialize. A record the graph already carries is left alone.
+    pub(super) fn set_io_mapping(
+        &mut self,
+        slot: usize,
+        phys: u64,
+        va: u64,
+        total: u32,
+        element: u32,
+        rw: u32,
+    ) -> Result {
+        const IO_MAPPINGS: usize = 0x640;
+        const IO_MAPPING_SIZE: usize = 0x28;
+        const IO_MAPPING_SLOTS: usize = 60;
+        if self.hal300.is_none() || slot >= IO_MAPPING_SLOTS {
+            return Err(EINVAL);
+        }
+        let offset = IO_MAPPINGS + slot * IO_MAPPING_SIZE;
+        let bundle = self.object_mut(self.bundle)?;
+        let current = bundle.read_words::<4>(offset)?;
+        if current.iter().any(|word| *word != 0) {
+            return Err(EEXIST);
+        }
+        bundle.write(offset, phys)?;
+        bundle.write(offset + 8, va)?;
+        bundle.write(offset + 0x10, total)?;
+        bundle.write(offset + 0x14, element)?;
+        bundle.write(offset + 0x18, 0u64)?;
+        bundle.write(offset + 0x20, rw)?;
+        bundle.write(offset + 0x24, 0u32)?;
+        fence(Ordering::SeqCst);
+        Ok(())
+    }
+
     pub(super) fn opening_retired(&self, role: Role) -> Result<bool> {
+        self.control_retired(role, abi::OPENING_PRODUCER)
+    }
+
+    /// Whether this role's control ring has produced and retired exactly `expected` records.
+    pub(super) fn control_retired(&self, role: Role, expected: u32) -> Result<bool> {
         for offset in [0, 0x10, abi::ChannelState::PRODUCER] {
             if self
                 .object(self.cluster)?
-                .word(Self::state_offset(role) + abi::CONTROL_STATE_OFFSET + offset)?
+                .word(self.state_offset(role) + abi::CONTROL_STATE_OFFSET + offset)?
                 .load(Ordering::SeqCst)
-                != abi::OPENING_PRODUCER
+                != expected
             {
                 return Ok(false);
             }
@@ -1347,18 +2024,48 @@ impl InitData {
     }
 }
 
+/// HAL300 native pre/post-recovery handshake in the primary status B
+/// (`sol-render-hang-study.md`): the firmware publishes 1 at +0x4ae0 after incrementing the epoch
+/// at +0x4ad0 and spins until the host writes 2 (`resumeFirmwarePreRecovery`,
+/// 0xfffffe0008bb6ce0); later it publishes 3 and spins until 0. Its summary precedes it.
+pub(super) const HAL300_RECOVERY_SUMMARY: usize = 0x4a90;
+/// The recovery report is the primary main configuration's fourth view (packed pointer at
+/// main +0x26c), bundle +0xc500 on HAL300.
+const HAL300_REPORT_VIEW: usize = 3;
+
 impl InitData {
+    /// Firmware addresses of the HAL300 recovery summary in status B and of the recovery report
+    /// view, after checking the report pointer the primary main configuration publishes.
+    pub(super) fn hal300_recovery_vas(&self) -> Result<(u64, u64)> {
+        let cluster = self.object(self.cluster)?;
+        let bundle = self.object(self.bundle)?;
+        let view = *self.layout.views.get(HAL300_REPORT_VIEW).ok_or(EINVAL)?;
+        let pointer_at = self.layout.main_config[Role::Primary as usize]
+            + core::mem::offset_of!(abi::MainConfig, view_va)
+            + HAL300_REPORT_VIEW * size_of::<u64>();
+        fence(Ordering::Acquire);
+        let pointer = bundle.read_words::<2>(pointer_at)?;
+        let actual = u64::from(pointer[0]) | u64::from(pointer[1]) << 32;
+        if actual != bundle.gpu_va() + view as u64 {
+            return Err(EINVAL);
+        }
+        Ok((
+            cluster.gpu_va() + (abi::private::STATUS_B + HAL300_RECOVERY_SUMMARY) as u64,
+            actual,
+        ))
+    }
+
     /// Validate the serialized view before reading its retained host mapping.
     fn recovery_view_words<const N: usize>(&self, view: usize, offset: usize) -> Result<[u32; N]> {
         let bundle = self.object(self.bundle)?;
-        let base = *abi::bundle::VIEWS.get(view).ok_or(EINVAL)?;
+        let base = *self.layout.views.get(view).ok_or(EINVAL)?;
         let extent = *abi::recovery::VIEW_EXTENTS.get(view).ok_or(EINVAL)?;
         let end = offset.checked_add(N.checked_mul(size_of::<u32>()).ok_or(EOVERFLOW)?)
             .ok_or(EOVERFLOW)?;
         if end > extent {
             return Err(EINVAL);
         }
-        let pointer_at = abi::bundle::MAIN_CONFIG[Role::Primary as usize]
+        let pointer_at = self.layout.main_config[Role::Primary as usize]
             + core::mem::offset_of!(abi::MainConfig, view_va) + view * size_of::<u64>();
         fence(Ordering::Acquire);
         let pointer = bundle.read_words::<2>(pointer_at)?;
@@ -1370,10 +2077,40 @@ impl InitData {
     }
 }
 
+impl InitData {
+    /// Whether this firmware's recovery handshake may be acknowledged. HAL300 acknowledgement is
+    /// opt-in (debug_flags bit 61): writing the native 1 -> 2 made the firmware run its
+    /// destructive cleanup and crash in its kick walker at P+0xfe80 (`ldr x8,[x1,#0x10]` of a
+    /// work slot whose descriptor pointer is zero - this runtime publishes a config-only outer
+    /// slot for a queue's first kick). Without it the firmware only stops, which the event
+    /// service reports as a lost device (asahi-render62-boot).
+    fn recovery_enabled(&self) -> bool {
+        // HAL300 firmware-initiated recovery is on by default since asahi-pw8-boot (three
+        // CDM-fault recoveries, desktop and new clients kept working); debug_flags bit 51
+        // restores the old behaviour (device lost at the first fault). Bit 61 is accepted for
+        // compatibility and no longer needed.
+        let flags = crate::module_parameters::debug_flags.value();
+        self.layout.recovery
+            && (!self.layout.recovery_fail_all || flags & (1 << 61) != 0 || flags & (1 << 51) == 0)
+    }
+}
+
 impl super::recovery::Memory for InitData {
     fn fault_sources(&self) -> Result<super::recovery::Sources> {
+        if !self.recovery_enabled() {
+            return Ok(super::recovery::Sources::sample(0, |_| None));
+        }
+        if self.layout.recovery_fail_all {
+            // HAL300: per-slot attribution reads T8140 physical slot keys; only the class is used.
+            let mut sources = super::recovery::Sources::sample(0, |_| None);
+            sources.reason = self
+                .recovery_view_words::<1>(abi::recovery::REPORT_VIEW, self.layout.recovery_reason)
+                .ok()
+                .map(|words| words[0]);
+            return Ok(sources);
+        }
         let mask = self.object(self.cluster)?
-            .dword(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_SLOT_MASK)?
+            .dword(abi::private::STATUS_B + self.layout.recovery_b[1])?
             .load(Ordering::Relaxed);
         let mut sources = super::recovery::Sources::sample(mask as u32, |slot| {
             let key = super::recovery::slot_key(slot)?;
@@ -1382,30 +2119,40 @@ impl super::recovery::Memory for InitData {
                 .ok().map(|words| words[0])?;
             Some((key, monitor))
         });
-        sources.reason = self.recovery_view_words::<1>(abi::recovery::REPORT_VIEW, abi::recovery::REASON)
+        sources.reason = self.recovery_view_words::<1>(abi::recovery::REPORT_VIEW, self.layout.recovery_reason)
             .ok().map(|words| words[0]);
         Ok(sources)
     }
 
     fn recovery_state(&self) -> Result<u32> {
+        // HAL300's recovery handshake words are not known; it never requests a restart here.
+        if !self.recovery_enabled() {
+            return Ok(0);
+        }
         fence(Ordering::Acquire);
         Ok(self
             .object(self.cluster)?
-            .word(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE)?
+            .word(abi::private::STATUS_B + self.layout.recovery_b[3])?
             .load(Ordering::Relaxed))
     }
 
     fn host_recovery(&self) -> Result<u32> {
+        if !self.recovery_enabled() {
+            return Ok(0);
+        }
         Ok(self
             .object(self.cluster)?
-            .word(abi::private::STATUS_B + abi::PrimaryStatusB::HOST_RECOVERY)?
+            .word(abi::private::STATUS_B + self.layout.recovery_b[4])?
             .load(Ordering::Relaxed))
     }
 
     fn transition(&self, expected: u32, next: u32) -> Result {
+        if !self.recovery_enabled() {
+            return Err(ENODEV);
+        }
         let state = self
             .object(self.cluster)?
-            .word(abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_STATE)?;
+            .word(abi::private::STATUS_B + self.layout.recovery_b[3])?;
         fence(Ordering::Acquire);
         if state.load(Ordering::Relaxed) != expected {
             return Err(EBUSY);
@@ -1417,11 +2164,19 @@ impl super::recovery::Memory for InitData {
     }
 
     fn clear_timestamps(&self) -> Result {
+        if !self.recovery_enabled() {
+            return Err(ENODEV);
+        }
+        // HAL300 firmware-initiated recovery skips the host timestamp override (native worker
+        // 10b3c..bc0); never clear view 4 under an active renderer there.
+        if self.layout.recovery_fail_all {
+            return Ok(());
+        }
         let bundle = self.object(self.bundle)?;
         // Validate the complete table before publishing its first live word.
         const ENTRIES: usize = 128;
         const STRIDE: usize = 0x10;
-        let offset = abi::bundle::VIEWS[4];
+        let offset = self.layout.views[4];
         bundle.pointer(offset, ENTRIES * STRIDE)?;
         for qid in 0..ENTRIES {
             bundle
@@ -1436,8 +2191,11 @@ impl super::recovery::Memory for InitData {
     }
 
     fn entries(&self) -> Result<super::recovery::Entries> {
+        if !self.recovery_enabled() {
+            return Ok(Default::default());
+        }
         let cluster = self.object(self.cluster)?;
-        let base = abi::private::STATUS_B + abi::PrimaryStatusB::RECOVERY_INFO;
+        let base = abi::private::STATUS_B + self.layout.recovery_b[0];
         fence(Ordering::Acquire);
         let mut entries = super::recovery::Entries::default();
         for index in 0..256 {
@@ -1450,5 +2208,9 @@ impl super::recovery::Memory for InitData {
 
     fn wait_tick(&self) {
         kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
+    }
+
+    fn fail_all_policy(&self) -> bool {
+        self.layout.recovery_fail_all && self.recovery_enabled()
     }
 }

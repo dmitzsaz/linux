@@ -3,7 +3,7 @@
 //! Decode a submission and validate its user resources before publishing any work.
 
 use super::fw::{
-    compute::{IntersectionTables, ScratchRequest},
+    compute::{ComputeProgram, ComputeStorage, IntersectionTables, ScratchRequest},
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
     render_rt::RayQueryStage,
@@ -13,6 +13,10 @@ use core::ops::Range;
 use kernel::{prelude::*, uapi};
 
 const _: () = assert!(uapi::drm_asahi_compute_flags_DRM_ASAHI_COMPUTE_AS_BUILD == 1 << 2);
+
+/// `DRM_ASAHI_SET_COMPUTE_RESOURCES`: the M5 per-dispatch storage declarations. The pinned
+/// uAPI header of this tree does not name it yet; the value is the uAPI's command type 6.
+const SET_COMPUTE_RESOURCES: u32 = 6;
 
 const MAX_ATTACHMENTS: usize = crate::microseq::MAX_ATTACHMENTS;
 const USC_WINDOW_SIZE: u64 = 1 << 32;
@@ -30,6 +34,7 @@ const ZLS_METADATA_STRIDE: u64 = 0x80;
 const MAX_DIMENSION: u16 = 16384;
 const MAX_LAYERS: u16 = 2048;
 const MAX_TILE_BUFFER: u64 = 32768;
+const MAX_TILE_BUFFER_G17G: u64 = 65536;
 const PROCESS_EMPTY: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_PROCESS_EMPTY_TILES;
 const RSRC_SPEC_HI: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_RSRC_SPEC_HI;
 const DBIAS_INT: u32 = uapi::drm_asahi_render_flags_DRM_ASAHI_RENDER_DBIAS_IS_INT;
@@ -88,7 +93,12 @@ impl Attachments {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
     Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2]),
-    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables),
+    Compute(
+        uapi::drm_asahi_cmd_compute,
+        Attachments,
+        IntersectionTables,
+        ComputeStorage,
+    ),
 }
 
 pub(crate) struct Command {
@@ -103,6 +113,9 @@ pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     counts: [u16; 2],
     attachments: [Attachments; 3],
+    /// Folded demand of the current `DRM_ASAHI_SET_COMPUTE_RESOURCES` list. The list stays in
+    /// force for every later compute command of the submission, as the uAPI describes.
+    storage: ComputeStorage,
 }
 
 impl<'a> Parser<'a> {
@@ -111,6 +124,7 @@ impl<'a> Parser<'a> {
             bytes,
             counts: [0; 2],
             attachments: [Attachments::EMPTY; 3],
+            storage: ComputeStorage::NONE,
         }
     }
 
@@ -150,9 +164,27 @@ impl<'a> Parser<'a> {
                             payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
                             self.attachments[2],
                             IntersectionTables::parse(bytes.get(COMPUTE_BASE_SIZE..).unwrap_or(&[]))?,
+                            self.storage,
                         )
                     };
                     return Ok(Some(Command { barriers, payload }));
+                }
+                SET_COMPUTE_RESOURCES => {
+                    // A software command: no barriers, and it advances no command index. The
+                    // list replaces the previous one; the firmware takes one demand per kick,
+                    // so it is folded field by field here.
+                    if barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2]
+                        || bytes.len() % size_of::<ComputeProgram>() != 0
+                    {
+                        return Err(EINVAL);
+                    }
+                    let cores = super::fw::compute::g17g_cores();
+                    let mut storage = ComputeStorage::NONE;
+                    let mut reader = Reader::new(bytes);
+                    for _ in 0..bytes.len() / size_of::<ComputeProgram>() {
+                        storage.fold(&reader.read::<ComputeProgram>()?, cores)?;
+                    }
+                    self.storage = storage;
                 }
                 uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS
                 | uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_FRAGMENT_ATTACHMENTS
@@ -328,6 +360,53 @@ pub(crate) enum Validated {
 }
 
 impl Validated {
+    /// Whether a HAL300 runtime may publish this command, and what refused it.
+    ///
+    /// The G17G render programs are implemented for the native disabled-feature profile only
+    /// (`features/gpu-bringup/sol-render-study.md`): every register whose native producer is
+    /// still unrecovered writes the zero that profile publishes. A pass that would need one of
+    /// them is refused here, before any firmware structure is built, rather than published
+    /// with a value this driver cannot justify. Compute is unrestricted: it is qualified.
+    pub(crate) fn hal300_refusal(&self) -> Option<&'static str> {
+        let Self::Render { pass, ray_query, .. } = self else {
+            return None;
+        };
+        // Empty-tile processing is not restricted either: a pass that clears needs its
+        // background program on every tile, and the request reaches the hardware only through
+        // the tile configuration (register 0x10039, worksheet index 57, which the native list
+        // writes from the same word) and, for a layered pass, the tiling layer mode this
+        // profile excludes anyway.
+        //
+        // The occlusion-query pointer is not restricted: the native fragment list writes
+        // register 0x15311 from the same command field (worksheet index 30), so a pass that
+        // carries one stays inside the implemented profile. Mesa supplies it for every M5 pass.
+        // Single-layer, single-sample depth and stencil surfaces are admitted: the G17G
+        // register lists, per-phase partial ZLS words and the descriptor ZLS block follow the
+        // native constructors (sol-render-features-study.md).
+        // Multisample and layered passes are admitted: sol-render-msaa-layers-study.md
+        // executed the native TA and fragment constructors over 36 profiles and found that
+        // samples and layers add no list entries and change no checkpoint or binding count.
+        // Every value they do change is already derived here the native way: the sample code
+        // in the low bits of the utile word (fragment 10009, TA 10149/1ca58), the packed
+        // sample positions Mesa supplies (TA 10139, fragment 10019), the tile-buffer block
+        // count scaled by samples, the layer-mode word (TA 10169/1c9e8), the layered bit of
+        // the tile configuration and bit 32 of the first tile state. TA 10131 stays the
+        // immediate 0x88 the native list writes, not a position operand.
+        let checks: [(&'static str, bool); 4] = [
+            ("layers", pass.layers > MAX_LAYERS),
+            ("samples", pass.samples_log2 > crate::g17::fw::render::samples_log2_max()),
+            ("sampler heap", pass.sampler_heap_va != 0 || pass.sampler_count != 0),
+            (
+                "ray query scratch",
+                ray_query.iter().any(|stage| stage.scratch.enabled()),
+            ),
+        ];
+        checks
+            .iter()
+            .find(|(_, violated)| *violated)
+            .map(|(name, _)| *name)
+    }
+
     pub(crate) fn long_job(&self) -> bool {
         match self {
             Self::Render { long_job, .. } | Self::Compute { long_job, .. } => *long_job,
@@ -344,7 +423,7 @@ impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
             Self::Render(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
-            Self::Compute(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Compute(cmd, _, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
 
@@ -370,13 +449,23 @@ impl Payload {
                     1 => 0,
                     2 => 1,
                     4 => 2,
+                    // G17G renders 8x (fw::render::samples_log2_max); G17P is refused there.
+                    8 => 3,
                     _ => return Err(EINVAL),
                 };
                 if u64::from(cmd.sample_size_B)
                     * u64::from(cmd.utile_width_px)
                     * u64::from(cmd.utile_height_px)
                     * u64::from(cmd.samples)
-                    > MAX_TILE_BUFFER
+                    > if crate::g17::fw::compute::g17g_selected() {
+                        // M5 imageblocks hold 64 KiB per tile; Honeykrisp lays out up to that
+                        // (hk_tilebuffer_layout: 65536 bytes, 2048 samples per tile on M5), and
+                        // a 32 KiB limit here refused eight-target dual-source passes (CTS
+                        // blend.dual_source.multi_attachments.*, asahi-pw26-boot).
+                        MAX_TILE_BUFFER_G17G
+                    } else {
+                        MAX_TILE_BUFFER
+                    }
                     || cmd.vdm_ctrl_stream_base == 0
                     || cmd.vdm_ctrl_stream_base & 3 != 0
                     || cmd.isp_scissor_base == 0
@@ -472,7 +561,7 @@ impl Payload {
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
-            Self::Compute(cmd, attachments, intersection) => {
+            Self::Compute(cmd, attachments, intersection, storage) => {
                 let as_build = super::timeout::as_build(cmd.flags).ok_or(EINVAL)?;
                 if cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -494,10 +583,24 @@ impl Payload {
                     let code = intersection.default_program & 0x0000_ffff_ffff_ffff;
                     if code != 0 { require_range(space, code, 64, Access::Read)?; }
                 }
+                // M5 declares per-dispatch storage with SET_COMPUTE_RESOURCES instead of an
+                // SCS layout, and its spills come from the queue's USC private-memory pool
+                // rather than a helper program. Only one of the two may describe a command.
+                let scratch = if super::fw::compute::g17g_selected() {
+                    if cmd.scs_layout != 0 {
+                        return Err(EINVAL);
+                    }
+                    ScratchRequest::m5(storage, super::fw::compute::g17g_cores())?
+                } else {
+                    if storage.enabled() {
+                        return Err(EINVAL);
+                    }
+                    ScratchRequest::new(cmd.scs_layout)?
+                };
                 Ok(Validated::Compute {
                     long_job: super::timeout::select(intersection.enabled(), [false; 2], as_build),
                     intersection: *intersection,
-                    scratch: ScratchRequest::new(cmd.scs_layout)?,
+                    scratch,
                     usc_base: window.base,
                     cdm_va: cmd.cdm_ctrl_stream_base,
                     cdm_end_va: cmd.cdm_ctrl_stream_end - 4,
