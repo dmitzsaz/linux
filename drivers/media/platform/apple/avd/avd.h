@@ -194,6 +194,8 @@ struct avd_variant {
 	u32 submit_queue_max_offset;
 	u32 submit_queue_status_offset;
 	unsigned int quirks;
+	/* bytes per macroblock of the H.264 co-located MV area; 0 means 64 */
+	unsigned int h264_mv_bytes;
 };
 
 /* Lifecycle of the one m2m job the device runs at a time. */

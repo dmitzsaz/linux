@@ -831,6 +831,45 @@ static const struct avd_variant avd_t6040_variant = {
 	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
 };
 
+/*
+ * T8142 (M5): the Hibiscus decoder. Its control word reads 0x00040020 (low 0x20 = Hibiscus;
+ * 0x18 would be Tansy as on T8140), and Apple's Hibiscus decode tunable table matches
+ * tunables_v5t2 record for record. Twelve VPs without holes (4 HEVC, 4 H.264, 1 VP9, 3 AV1),
+ * 15 instruction FIFOs, the v5 FIFO/IRQ register family, and 0x12000-byte code and SRAM
+ * windows (the SRAM starts 0x14000 after the code, the mailbox 0x28000 after it).
+ * Its H.264 co-located MV area needs more than the 64 bytes per macroblock earlier decoders use:
+ * with 64 (and 72) the last macroblocks of B-frames using temporal direct, implicit weights or a
+ * B-pyramid decoded wrong at 720p/1080p; 80 was the smallest exact size there. 128 keeps a margin.
+ */
+static const struct avd_variant avd_t8142_variant = {
+	.vp_slots = {
+		[AVD_CODEC_HEVC] = 4,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 3,
+	},
+	.vp_slot_base = {
+		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_H264] = 4,
+		[AVD_CODEC_VP9] = 8,
+		[AVD_CODEC_AV1] = 9,
+	},
+	.fifo_slots = 15,
+	.configure_stream = t8122_configure_stream,
+	.capabilities = AVD_CAPABILITY_HEVC |
+			AVD_CAPABILITY_H264 |
+			AVD_CAPABILITY_VP9 |
+			AVD_CAPABILITY_AV1,
+	.fw_name = "apple/avd-fw-v5-t2.bin",
+	.revision = 4,
+	.vp_slot_offset = 0xc,
+	.submit_offset = 0x40,
+	.submit_queue_max_offset = 0x44,
+	.submit_queue_status_offset = 0x7c,
+	.quirks = AVD_QUIRK_HEVC_V5_HEADER,
+	.h264_mv_bytes = 128,
+};
+
 /* can also be derived from a version register */
 static const struct of_device_id avd_of_match[] = {
 	{
@@ -864,6 +903,10 @@ static const struct of_device_id avd_of_match[] = {
 	{
 		.compatible = "apple,t8140-avd",
 		.data = &avd_t8140_variant
+	},
+	{
+		.compatible = "apple,t8142-avd",
+		.data = &avd_t8142_variant
 	},
 	{},
 };
@@ -1035,3 +1078,4 @@ MODULE_FIRMWARE("apple/avd-fw-v3-t1.bin");
 MODULE_FIRMWARE("apple/avd-fw-v4-t0.bin");
 MODULE_FIRMWARE("apple/avd-fw-v5-t0.bin");
 MODULE_FIRMWARE("apple/avd-fw-v5-t1.bin");
+MODULE_FIRMWARE("apple/avd-fw-v5-t2.bin");
