@@ -69,6 +69,18 @@ config PINCTRL_AMDISP
 	  Requires AMDGPU to MFD add device for enumeration to set up as
 	  platform device.
 
+config PINCTRL_J704_GPIO
+	tristate "Apple J704 GPIO pin controller"
+	depends on ARCH_APPLE && OF
+	select PINMUX
+	select GPIOLIB
+	select GPIOLIB_IRQCHIP
+	select GENERIC_PINCTRL_GROUPS
+	select GENERIC_PINMUX_FUNCTIONS
+	help
+	  T8142 GPIO and interrupts without reading native no-restore holes
+	  into a register cache. The module is called j704_gpio_pinctrl.
+
 config PINCTRL_APPLE_GPIO
 	tristate "Apple SoC GPIO pin controller driver"
 	depends on ARCH_APPLE
