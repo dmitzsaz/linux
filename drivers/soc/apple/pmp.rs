@@ -96,12 +96,16 @@ const fn from_fourcc(b: &[u8; 4]) -> u32 {
 
 /// Boot arguments set from an optional property when it is present; the
 /// firmware's default for each is 0.
-const OPTIONAL_BOOTARGS: [(&[u8; 4], &CStr); 5] = [
+const OPTIONAL_BOOTARGS: [(&[u8; 4], &CStr); 6] = [
     (b"DCAP", c"apple,dram-capacity"),
     (b"DCHD", c"apple,dram-channel-disable"),
     (b"PMC_", c"apple,pmc"),
     (b"PMCX", c"apple,pmc-msg-disabled"),
     (b"CVAR", c"apple,soc-chip-variant"),
+    // macOS patches the PMC bandwidth-request latency limit (pmc-max-bwr-
+    // latency-us, at least 1000000 for customer builds) where the image has
+    // the tag (T8142).
+    (b"PMCM", c"apple,pmc-max-bwr-latency-us"),
 ];
 
 struct PmpAllocation {
@@ -692,6 +696,18 @@ const HW_CFG_T6041: PmpHwConfig = PmpHwConfig {
     coreanalytics: Ep7::Always,
 };
 
+/// T8142 (M5): the SRAM image carries the version-5 `uuid` boot argument
+/// header (J704: magic at +0x204, version 5 at +0x208, image uuid at +0x214
+/// equal to the iop-pmp-nub uuid); its DART window starts at 1 TiB (ADT
+/// vm-base; 42 bits is the T8140/T6041 width, not a measured T8142 one).
+/// The image's endpoint table lists analytics (7), and its power callback
+/// asks the host for that buffer before it continues, as on T6041.
+const HW_CFG_T8142: PmpHwConfig = PmpHwConfig {
+    dma_mask: Some(DmaMask::new::<42>()),
+    check_bootargs_uuid: true,
+    coreanalytics: Ep7::Always,
+};
+
 const HW_CFG_T8132: PmpHwConfig = PmpHwConfig {
     dma_mask: None,
     check_bootargs_uuid: false,
@@ -712,6 +728,7 @@ kernel::of_device_table!(
         (of::DeviceId::new(c"apple,t8132-pmp-v2"), &HW_CFG_T8132),
         (of::DeviceId::new(c"apple,t8140-pmp-v2"), &HW_CFG_T8140),
         (of::DeviceId::new(c"apple,t6041-pmp-v2"), &HW_CFG_T6041),
+        (of::DeviceId::new(c"apple,t8142-pmp-v2"), &HW_CFG_T8142),
         (of::DeviceId::new(c"apple,t6000-pmp-v2"), &HW_CFG_DEFAULT),
     ]
 );
@@ -747,7 +764,7 @@ impl platform::Driver for PmpDriver {
             .property_read(c"apple,dram-vendor-id")
             .required_by(&dev)?;
         let bdid = node.property_read(c"apple,board-id").required_by(&dev)?;
-        let mut patches = KVec::with_capacity(9, GFP_KERNEL)?;
+        let mut patches = KVec::with_capacity(10, GFP_KERNEL)?;
         patches.push((from_fourcc(b"BDID"), bdid), GFP_KERNEL)?;
         patches.push((from_fourcc(b"DVID"), dvid), GFP_KERNEL)?;
         for (tag, prop) in OPTIONAL_BOOTARGS.iter() {

@@ -89,3 +89,13 @@ config APPLE_PMP_REPORT_KUNIT_TEST
 	  argument validation without accessing hardware.
 	  Includes malformed tables, address arithmetic and device ordering.
 	  The PMP report driver does not need to be enabled to run this suite.
+
+config APPLE_J704_PMP_REPORT
+	tristate "Apple J704 PMP report adapter"
+	depends on ARCH_APPLE && OF && PM
+	select PM_GENERIC_DOMAINS
+	select OF_DYNAMIC
+	help
+	  Separate T8142 report layout and ready/temperature API alongside
+	  the baseline built-in report driver. Requires a J704 device tree.
+	  The module is called j704_pmp_report.
