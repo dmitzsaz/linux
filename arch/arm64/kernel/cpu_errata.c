@@ -307,10 +307,23 @@ static bool has_impdef_pmuv3(const struct arm64_cpu_capabilities *entry, int sco
 	return is_midr_in_range_list(apple_cpus);
 }
 
+/*
+ * T8142 uses the Apple vGIC interface too. Keep this separate from
+ * apple_cpus: that list also enables unqualified IMPDEF PMUv3 traps.
+ * As in Aurora fcb377a25449 for T6040, qualify the workaround through
+ * the hardware SEIS bit and EL2, and let KVM read the real LR count.
+ */
+static const struct midr_range t8142_broken_seis_cpus[] = {
+	MIDR_ALL_VERSIONS(MIDR_APPLE_T8142_E),
+	MIDR_ALL_VERSIONS(MIDR_APPLE_T8142_P),
+	{},
+};
+
 static bool has_broken_gic_v3_seis(const struct arm64_cpu_capabilities *entry, int scope)
 {
 	return (is_kernel_in_hyp_mode() &&
-		is_midr_in_range_list(apple_cpus) &&
+		(is_midr_in_range_list(apple_cpus) ||
+		 is_midr_in_range_list(t8142_broken_seis_cpus)) &&
 		(read_sysreg_s(SYS_ICH_VTR_EL2) & ICH_VTR_EL2_SEIS));
 }
 
