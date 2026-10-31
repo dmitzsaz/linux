@@ -44,6 +44,10 @@
 #define DCP_V26_CALL_TIMEOUT	(5 * HZ)
 #define DCP_V26_TAG_D590	DCP_V26_TAG('D', 590)
 #define DCP_V26_D590_IN_SIZE	0x730
+/* Batched swap completion: u32 ids[256], u32 count at 0x400, then flags and records. */
+#define DCP_V26_BATCH_IN_SIZE	0x2708
+#define DCP_V26_BATCH_COUNT	0x400
+#define DCP_V26_BATCH_MAX	256
 
 enum dcp_v26_event_kind {
 	DCP_V26_EVENT_REPLY = 1,
@@ -103,10 +107,21 @@ void dcp_v26_link_init(struct dcp_v26_link *link, struct device *dev,
 {
 	link->dev = dev;
 	link->rtk = rtk;
+	link->ready_msg = DCP_V26_LINK_READY_MSG;
+	link->completion_tag = DCP_V26_TAG_D590;
+	link->batch_tag = 0;
 	mutex_init(&link->lock);
 	init_waitqueue_head(&link->wait);
 	INIT_LIST_HEAD(&link->events);
 	init_completion(&link->ready);
+}
+
+void dcp_v26_link_set_abi(struct dcp_v26_link *link, u64 ready_msg, u32 completion_tag,
+			  u32 batch_tag)
+{
+	link->ready_msg = ready_msg;
+	link->completion_tag = completion_tag;
+	link->batch_tag = batch_tag;
 }
 
 void dcp_v26_link_fail(struct dcp_v26_link *link)
@@ -191,7 +206,7 @@ void dcp_v26_link_receive(struct dcp_v26_link *link, u64 message)
 		/* Firmware-side INIT needs no answer; READY ends the handshake. */
 		if ((message & 3) == APPLE_DCP_LINK_MSG_FIRMWARE_INIT)
 			goto out;
-		link->ready_result = message == DCP_V26_LINK_READY_MSG ? 0 : -EPROTO;
+		link->ready_result = message == link->ready_msg ? 0 : -EPROTO;
 		if (link->ready_result)
 			dev_err(link->dev, "unexpected DCPLink ready message %#llx\n", message);
 		mutex_unlock(&link->lock);
@@ -363,7 +378,7 @@ static struct dcp_v26_event *link_next_event(struct dcp_v26_link *link, unsigned
 }
 
 static int link_callback(struct dcp_v26_link *link, struct dcp_v26_event *e,
-			 dcp_v26_callback_fn callback, void *cookie, u32 *completed)
+			 dcp_v26_callback_fn callback, void *cookie, u32 *completed, u32 wanted)
 {
 	struct apple_dcp_link_rpc_header *h = (void *)e->data;
 	u32 in, out, tag;
@@ -382,13 +397,27 @@ static int link_callback(struct dcp_v26_link *link, struct dcp_v26_event *e,
 	ret = callback(cookie, tag, h + 1, in, e->data + sizeof(*h) + in, out);
 	link->callback_depth--;
 	if (ret) {
-		dev_err(link->dev, "J613/25G83 callback %#x %u/%u depth=%u failed=%d\n", tag, in, out, link->callback_depth + 1, ret);
+		dev_err(link->dev, "DCP callback %#x %u/%u depth=%u failed=%d\n", tag, in, out, link->callback_depth + 1, ret);
 		return ret;
 	}
-	if (tag == DCP_V26_TAG_D590 && in == DCP_V26_D590_IN_SIZE) {
+	if (tag == link->completion_tag && in == DCP_V26_D590_IN_SIZE) {
 		link->completion_time = e->time;
 		if (completed)
 			*completed = get_unaligned_le32(h + 1);
+	} else if (link->batch_tag && tag == link->batch_tag && in == DCP_V26_BATCH_IN_SIZE) {
+		const u8 *ids = (const u8 *)(h + 1);
+		u32 count = get_unaligned_le32(ids + DCP_V26_BATCH_COUNT), i;
+
+		/* The swap being waited for, if the batch names it; else the newest. */
+		if (count && count <= DCP_V26_BATCH_MAX) {
+			link->completion_time = e->time;
+			if (completed) {
+				*completed = get_unaligned_le32(ids + (count - 1) * 4);
+				for (i = 0; i < count; i++)
+					if (get_unaligned_le32(ids + i * 4) == wanted)
+						*completed = wanted;
+			}
+		}
 	}
 	return link_reply(link, e->message, e->data + sizeof(*h) + in, out);
 }
@@ -401,7 +430,7 @@ int dcp_v26_link_pump(struct dcp_v26_link *link, unsigned long timeout,
 
 	if (IS_ERR(e))
 		return PTR_ERR(e);
-	ret = link_callback(link, e, callback, cookie, NULL);
+	ret = link_callback(link, e, callback, cookie, NULL, 0);
 	kfree(e);
 	return ret;
 }
@@ -488,13 +517,20 @@ retry:
 				replied = true;
 			}
 		} else {
-			ret = link_callback(link, e, callback, cookie, &completed);
+			ret = link_callback(link, e, callback, cookie, &completed, completion_id);
 			if (!ret && completion_id && completed && completed != completion_id)
 				ret = -EPROTO;
 		}
 		kfree(e);
 		if (ret)
 			return ret;
+		/*
+		 * A swap the firmware refused (its status, at byte 5 of the 12-byte reply, is not
+		 * zero) never completes: do not wait for that completion.
+		 */
+		if (replied && completion_id && output_size == 12 &&
+		    get_unaligned_le32((u8 *)output + 5))
+			return -EREMOTEIO;
 		if (replied && (!completion_id || completed == completion_id))
 			return 0;
 	}

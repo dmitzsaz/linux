@@ -99,3 +99,11 @@ config DRM_APPLE_DISPLAY_KUNIT_TEST
 	  status updates before hotplug notifications and same-state retrains.
 	  Check which 14.x board record an internal display gets on which
 	  machine, and which DCP firmware image each record admits.
+
+config DRM_APPLE_J704_EXT
+	tristate "Apple J704 external display processor"
+	depends on DRM_APPLE = m
+	help
+	  Build the independently tested J704 external DCP driver as
+	  appledrmext. Its source snapshot is kept separate from internal
+	  DCP fixes while the two implementations are reconciled.

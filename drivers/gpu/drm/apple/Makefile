@@ -46,3 +46,8 @@ obj-$(CONFIG_DRM_APPLE_PARSER_KUNIT_TEST) += afkv2-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += parser-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += hotplug-test.o
 appledrm-$(CONFIG_DRM_APPLE_DISPLAY_KUNIT_TEST) += v14-board-test.o
+
+# Preserve the independently validated external snapshot alongside internal DCP.
+appledrmext-y := $(foreach o,$(appledrm-y),ext-$(subst /,-,$(o)))
+CFLAGS_ext-trace.o = -I$(src)/j704-ext
+obj-$(CONFIG_DRM_APPLE_J704_EXT) += appledrmext.o

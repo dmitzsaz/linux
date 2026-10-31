@@ -80,7 +80,8 @@
 #define DCP_V26_CPU_CONTROL	0x44
 #define DCP_V26_CPU_STATUS	0x48
 #define DCP_V26_MAX_PROPERTIES	256
-#define DCP_V26_MAX_RAW		32
+/* SDK 27 publishes many more properties (D413..D422, D550..D570) than 25G83. */
+#define DCP_V26_MAX_RAW		160
 #define DCP_V26_MAX_RAW_BYTES	SZ_8M
 #define DCP_V26_MAX_BUFFERS	64
 #define DCP_V26_MAX_BUFFER	SZ_16M
@@ -118,6 +119,11 @@ struct dcp_v26_board {
 	bool promotion;
 	/* If set and true, start without apple,pmp-report (not measured). */
 	const bool *without_pmp;
+	/*
+	 * SDK 27 (macOS 27 DCP firmware, J704): its own callback table, A408
+	 * swaps and start sequence (dcp_v27_callback()), not the 25G83 ones.
+	 */
+	bool sdk27;
 };
 
 static const struct dcp_v26_board dcp_v26_board_j613 = {
@@ -141,10 +147,29 @@ static const struct dcp_v26_board dcp_v26_board_j615 = {
 	.panel_width = 2880,
 	.panel_height = 1864,
 };
+/*
+ * J704 (MacBook Pro 14, M5): the macOS 27.0 DCP firmware iBoot left running.
+ * Its DCPLink READY carries the image hash 0x15a5c96b; nothing else is
+ * accepted. The 3024x1964 panel has a 74-row notch, which iBoot hides.
+ */
+static const struct dcp_v26_board dcp_v26_board_j704 = {
+	.name = "J704/27.0",
+	.dcp_compatible = "apple,t8142-dcp-v27",
+	.machine = "apple,j704",
+	.handoff = "apple,j704-mapping-handoff",
+	.max_nits = 600,
+	.panel_width = 3024,
+	.panel_height = 1964,
+	.promotion = true,
+	.sdk27 = true,
+};
 static const struct dcp_v26_board *const dcp_v26_boards[] = {
 	&dcp_v26_board_j613,
 	&dcp_v26_board_j615,
+	&dcp_v26_board_j704,
 };
+
+#define DCP_V27_READY_MSG	0x004015a5c96b0101ULL
 
 struct dcp_v26_property {
 	u32 service;
@@ -250,6 +275,10 @@ struct apple_dcp_v26 {
 	ktime_t d590_time[2];
 	u64 d590_count;
 
+	/* SDK 27: PMGR bandwidth scratch and doorbell (D003), and logged callbacks. */
+	u64 bw_scratch, bw_doorbell;
+	DECLARE_BITMAP(v27_logged, 1000);
+
 	/* Panel brightness, carried by swaps. Under the lock. */
 	u32 bl_nits;		/* requested */
 	u32 bl_sent;		/* carried by the last brightness swap */
@@ -259,6 +288,7 @@ struct apple_dcp_v26 {
 	bool bl_off;		/* the CRTC is off: the target is 0 */
 	bool bl_pending;	/* the target has not been carried yet */
 	bool bl_queued;		/* the backlight device is being registered */
+	bool bl_refused;	/* SDK 27: the firmware refused a brightness swap */
 	wait_queue_head_t bl_wait;
 
 	/* The backlight device, registered after the first frame. */
@@ -289,6 +319,28 @@ MODULE_PARM_DESC(j613_25g83_flip_timestamp,
 
 static int dcp_v26_callback(void *cookie, u32 tag, const void *input, u32 in_size,
 			    void *output, u32 out_size);
+static int dcp_v27_callback(struct apple_dcp_v26 *v26, u32 tag, const u8 *in, u32 in_size,
+			    u8 *out, u32 out_size);
+
+static unsigned int j704_dcp_layer = 2;
+module_param(j704_dcp_layer, uint, 0444);
+MODULE_PARM_DESC(j704_dcp_layer,
+		 "J704/27.0: IOMFB layer of the primary plane, 0..3 (default: 2, as on J813)");
+
+static bool j704_dcp_boot_chain = true;
+module_param(j704_dcp_boot_chain, bool, 0444);
+MODULE_PARM_DESC(j704_dcp_boot_chain,
+		 "J704/27.0: answer start_hardware_boot (D120) with the 25G83 chain at its SDK-27 numbers (default: on)");
+
+static bool j704_dcp_client_open = true;
+module_param(j704_dcp_client_open, bool, 0444);
+MODULE_PARM_DESC(j704_dcp_client_open,
+		 "J704/27.0: send first_client_open (A466) after the start signal (default: on)");
+
+static bool j704_dcp_service_match = true;
+module_param(j704_dcp_service_match, bool, 0444);
+MODULE_PARM_DESC(j704_dcp_service_match,
+		 "J704/27.0: answer the PMU/backlight service matches (D206/D207) with A136/A137 (default: on)");
 static void dcp_v26_backlight_register(struct work_struct *work);
 static void dcp_v26_backlight_detach(struct apple_dcp_v26 *v26);
 
@@ -303,7 +355,8 @@ static int dcp_v26_call(struct apple_dcp_v26 *v26, u32 tag, const void *in, u32 
 	dev_dbg(v26->dev, "call %#x in %u out %u\n", tag, in_size, out_size);
 	ret = dcp_v26_link_call(&v26->link, tag, in, in_size, out, out_size, completion,
 				dcp_v26_callback, v26);
-	if (ret) {
+	/* A refused swap leaves the link intact; its caller decides. */
+	if (ret && ret != -EREMOTEIO) {
 		v26->failed = true;
 		dev_err(v26->dev, "DCP call %#x failed: %d; recovery requires a reboot\n",
 			tag, ret);
@@ -512,6 +565,8 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 	int ret;
 
 #define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	if (v26->board->sdk27)
+		return dcp_v27_callback(v26, tag, input, in_size, output, out_size);
 	/* The transport zeroes output, so absent optional metadata stays absent. */
 	if (tag == D(114) && SHAPE(4164, 4100)) {
 		/* J613 CoreAnalyticsSendEvent: name[64], serialized dictionary[4096],
@@ -771,6 +826,439 @@ static int dcp_v26_callback(void *cookie, u32 tag,
 #undef SHAPE
 }
 
+/*
+ * SDK 27 (J704) calls: a method's u32 reply is logged, not checked, so that
+ * one unexpected answer does not end the session while the numbering is
+ * being qualified. Returns the transport result.
+ */
+static int dcp_v27_call(struct apple_dcp_v26 *v26, u32 number, bool one, bool reply,
+			u32 *result)
+{
+	__le32 in = cpu_to_le32(1), out = 0;
+	u32 tag = DCP_V26_TAG('A', number);
+	int ret;
+
+	ret = dcp_v26_call(v26, tag, one ? &in : NULL, one ? 4 : 0, reply ? &out : NULL,
+			   reply ? 4 : 0, 0);
+	if (result)
+		*result = le32_to_cpu(out);
+	dev_info(v26->dev, "IOMFB27 A%03u in=%u out=%u ret=%d reply=%#x\n", number,
+		 one ? 4 : 0, reply ? 4 : 0, ret, le32_to_cpu(out));
+	return ret;
+}
+
+/* A setProperty-style callback: keep the bytes under the key, answer true. */
+static int dcp_v27_store(struct apple_dcp_v26 *v26, u32 service, const u8 *key,
+			 const u8 *data, u32 size, u8 *out)
+{
+	int ret;
+
+	if (!memchr(key, 0, 64))
+		return -EINVAL;
+	ret = dcp_v26_raw_property(v26, service, key, data, size);
+	if (ret == -ENOSPC) {
+		dev_warn_once(v26->dev, "IOMFB27 property store full; not keeping %.64s\n", key);
+		ret = 0;
+	}
+	if (!ret && out)
+		out[0] = 1;
+	return ret;
+}
+
+static u32 dcp_v27_number(u32 tag)
+{
+	return ((tag >> 16) & 0xff) * 100 + ((tag >> 8) & 0xff) * 10 + (tag & 0xff) -
+	       '0' * 111;
+}
+
+/*
+ * The SDK-27 callback table. Shapes are the firmware's own size gates
+ * (sol-j704-dcp-27-profile-spec); numbering against 25G83: D108..D129 moved
+ * to D107..D128 and D582..D599 to D586..D603. A callback this table does not
+ * know is answered with zeroes and logged once with its first bytes.
+ */
+static int dcp_v27_callback(struct apple_dcp_v26 *v26, u32 tag, const u8 *in, u32 in_size,
+			    u8 *out, u32 out_size)
+{
+	u32 n = dcp_v27_number(tag), count, offset, service, id, value;
+	struct apple_dcp *dcp = READ_ONCE(v26->dcp);
+	struct dcp_v26_property *p;
+	int ret;
+
+	if ((tag >> 24) != 'D' || n >= 1000)
+		return -EPROTO;
+#define SHAPE(i, o) (in_size == (i) && out_size == (o))
+	switch (n) {
+	case 0: case 1: case 107: case 108: case 109: case 110: case 111: case 112:
+		/* Service creation and the two early queries: true. */
+		if (!SHAPE(0, 4))
+			break;
+		out[0] = 1;
+		return 0;
+	case 2: case 103: case 116: case 130: case 132: case 208: case 402: case 404:
+	case 406: case 407: case 423: case 424: case 576: case 577: case 578: case 579:
+	case 580: case 581: case 582: case 584: case 587: case 588: case 590: case 592:
+	case 593: case 596: case 597: case 598: case 599: case 600:
+		/* Notifications: nothing to answer. */
+		if (out_size)
+			break;
+		return 0;
+	case 3:
+		if (!SHAPE(4, 0x14))
+			break;
+		/* Real-time bandwidth: the PMGR scratch word and request doorbell. */
+		if (!(get_unaligned_le32(in) & 1)) {
+			put_unaligned_le64(v26->bw_scratch, out);
+			put_unaligned_le64(v26->bw_doorbell, out + 8);
+		}
+		return 0;
+	case 4: case 5: case 7: case 8: case 115: case 117: case 118: case 119: case 121:
+	case 122: case 123: case 133: case 200: case 204: case 205: case 211: case 412:
+	case 452: case 453: case 571: case 572: case 573: case 586: case 601: case 602:
+		/* Queries without a qualified positive answer: zero (false, status 0). */
+		return 0;
+	case 6:
+		if (!SHAPE(0x54, 0x50))
+			break;
+		if (!(in[0x50] & 1))
+			memcpy(out, in, 0x50);
+		return 0;
+	case 100:
+		if (!SHAPE(0, 0))
+			break;
+		/* 25G83 D100 -> A390, same number here (0/4). */
+		return dcp_v27_call(v26, 390, false, true, NULL);
+	case 101:
+		if (!SHAPE(0, 4))
+			break;
+		put_unaligned_le32(v26->stride, out);
+		return 0;
+	case 102: case 104:
+		if (!SHAPE(0x44, 0))
+			break;
+		p = dcp_v26_property(v26, 0, in, true);
+		if (IS_ERR(p))
+			return PTR_ERR(p) == -ENOSPC ? 0 : PTR_ERR(p);
+		p->value = n == 104 ? in[64] : get_unaligned_le32(in + 64);
+		return 0;
+	case 106:
+		if (!SHAPE(0x40, 0))
+			break;
+		p = dcp_v26_property(v26, 0, in, false);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		if (p) {
+			*p = v26->properties[--v26->property_count];
+			memset(&v26->properties[v26->property_count], 0, sizeof(*p));
+		}
+		return 0;
+	case 113:
+		if (!SHAPE(0x1044, 0x1004))
+			break;
+		/* CoreAnalyticsSendEvent: hand its serialized dictionary back unchanged. */
+		if (!memchr(in, 0, 64) || in[0x1040] > 1)
+			return -EINVAL;
+		v26->analytics++;
+		if (!in[0x1040] && in[64] == 'd')
+			memcpy(out, in + 64, 0x1000);
+		else
+			out[0] = 'd';
+		return 0;
+	case 114:
+		if (!SHAPE(0x10, 8))
+			break;
+		if (!(in[0xc] & 1))
+			memcpy(out, in + 8, 4);
+		return 0;
+	case 120:
+		if (!SHAPE(0, 4))
+			break;
+		/*
+		 * start_hardware_boot. The 25G83 host sends A389 A446 A029 A468(1)
+		 * A000(1) A465 here; on SDK 27 those are A389 A454 A027 A478 A000 A475.
+		 */
+		if (READ_ONCE(j704_dcp_boot_chain)) {
+			ret = dcp_v27_call(v26, 389, false, false, NULL);
+			if (!ret)
+				ret = dcp_v27_call(v26, 454, false, true, NULL);
+			if (!ret)
+				ret = dcp_v27_call(v26, 27, false, false, NULL);
+			if (!ret)
+				ret = dcp_v27_call(v26, 478, true, false, NULL);
+			if (!ret)
+				ret = dcp_v27_call(v26, 0, true, true, NULL);
+			if (!ret)
+				ret = dcp_v27_call(v26, 475, false, true, NULL);
+			if (ret)
+				return ret;
+		}
+		dev_info(v26->dev, "IOMFB27 D120 start_hardware_boot answered true (chain %d)\n",
+			 READ_ONCE(j704_dcp_boot_chain));
+		out[0] = 1;
+		return 0;
+	case 124:
+		if (!SHAPE(0x64, 0x24))
+			break;
+		/* read_edt_data: no EDT here; keep the caller's defaults. */
+		count = get_unaligned_le32(in + 0x40);
+		if (count > 8)
+			return -EINVAL;
+		memcpy(out, in + 0x44, count * 4);
+		return 0;
+	case 125:
+		if (!SHAPE(0x48, 0x48))
+			break;
+		return 0;
+	case 126:
+		if (!SHAPE(4, 4))
+			break;
+		count = get_unaligned_le32(in);
+		if (v26->chunk || !count || count > 0x100001)
+			return -EINVAL;
+		v26->chunk_size = count - 1;
+		v26->chunk_offset = 0;
+		v26->chunk = kvzalloc(max_t(u32, 1, v26->chunk_size), GFP_KERNEL);
+		if (!v26->chunk)
+			return -ENOMEM;
+		out[0] = 1;
+		return 0;
+	case 127:
+		if (!SHAPE(0x1008, 4))
+			break;
+		offset = get_unaligned_le32(in + 0x1000);
+		count = get_unaligned_le32(in + 0x1004);
+		if (!v26->chunk || offset != v26->chunk_offset || count > 0x1000 ||
+		    offset > v26->chunk_size || count > v26->chunk_size - offset)
+			return -EINVAL;
+		memcpy(v26->chunk + offset, in, count);
+		v26->chunk_offset += count;
+		out[0] = 1;
+		return 0;
+	case 128:
+		if (!SHAPE(0x40, 4))
+			break;
+		if (!v26->chunk || v26->chunk_offset != v26->chunk_size || !memchr(in, 0, 64))
+			return -EINVAL;
+		ret = dcp_v26_raw_property(v26, 0, in, v26->chunk, v26->chunk_size);
+		dev_info(v26->dev, "IOMFB27 property %.64s: %u bytes (%d)\n", in,
+			 v26->chunk_size, ret);
+		kvfree(v26->chunk);
+		v26->chunk = NULL;
+		if (ret)
+			return ret;
+		out[0] = 1;
+		return 0;
+	case 201:
+		if (!SHAPE(0xc, 0x10))
+			break;
+		/* Map a firmware buffer for PIODMA at its own address. */
+		id = get_unaligned_le64(in);
+		if (!id || id > v26->buffer_count || get_unaligned_le32(in + 8) != 1)
+			return -EINVAL;
+		ret = dcp_v26_map_piodma(v26, id);
+		if (ret)
+			return ret;
+		put_unaligned_le32(id, out);
+		put_unaligned_le64(v26->buffers[id - 1].iova, out + 4);
+		return 0;
+	case 202:
+		if (!SHAPE(0x18, 0))
+			break;
+		return 0; /* Unmap: the buffer stays mapped until reboot. */
+	case 206: case 207:
+		if (!SHAPE(0, 4))
+			break;
+		/* 25G83 answers these with A131/A132 (0/4); here they are A136/A137. */
+		if (READ_ONCE(j704_dcp_service_match)) {
+			ret = dcp_v27_call(v26, n == 206 ? 136 : 137, false, true, &value);
+			if (ret)
+				return ret;
+			out[0] = !value;
+		}
+		return 0;
+	case 209:
+		if (!SHAPE(0, 8))
+			break;
+		put_unaligned_le64(ktime_get_real_ns() / NSEC_PER_MSEC, out);
+		return 0;
+	case 300:
+		if (!SHAPE(0x10, 0))
+			break;
+		dcp_v26_publish(v26, in);
+		return 0;
+	case 400:
+		if (!SHAPE(0x4c, 0xc04))
+			break;
+		count = get_unaligned_le32(in + 0x44);
+		service = get_unaligned_le32(in);
+		if (count > 0xc00 || !memchr(in + 4, 0, 64))
+			return -EINVAL;
+		for (offset = 0; offset < v26->raw_count; offset++) {
+			if (v26->raw[offset].service != service || strcmp(v26->raw[offset].key, in + 4))
+				continue;
+			if (v26->raw[offset].size <= count) {
+				memcpy(out, v26->raw[offset].data, v26->raw[offset].size);
+				put_unaligned_le32(v26->raw[offset].size, out + 0xc00);
+			}
+			break;
+		}
+		return 0;
+	case 401:
+		if (!SHAPE(0x50, 0xc))
+			break;
+		p = dcp_v26_property(v26, get_unaligned_le32(in), in + 4, false);
+		if (IS_ERR(p))
+			return PTR_ERR(p);
+		if (p) {
+			put_unaligned_le64(p->value, out);
+			out[8] = 1;
+		} else if (!(in[0x4c] & 1)) {
+			memcpy(out, in + 0x44, 8);
+		}
+		return 0;
+	case 405:
+		if (!SHAPE(0x4c, 8))
+			break;
+		if (!(in[0x48] & 1))
+			memcpy(out, in + 0x44, 4);
+		return 0;
+	case 408:
+		if (!SHAPE(8, 8))
+			break;
+		/*
+		 * Clock rates. Selector 0 must cover the panel's video clock: the
+		 * firmware compares it with 402278400 and otherwise gives up on its
+		 * frequency table. 402280000 is the video clock it then defaults to
+		 * (ADT clock-frequencies[6]); selector 1 is the 24 MHz reference.
+		 */
+		value = get_unaligned_le32(in + 4);
+		put_unaligned_le64(value == 0 ? 402280000 : value == 1 ? 24000000 : 0, out);
+		return 0;
+	case 409:
+		if (!SHAPE(0xc, 4))
+			break;
+		put_unaligned_le32(1, out);
+		return 0;
+	case 410:
+		if (!SHAPE(0x14, 8))
+			break;
+		if (!(in[0x10] & 1))
+			memcpy(out, in + 8, 4);
+		put_unaligned_le32(1, out + 4);
+		return 0;
+	case 411:
+		if (!SHAPE(0x10, 0x1c))
+			break;
+		/* mapDeviceMemoryWithIndex: disp-N, reached physically (dva == address). */
+		id = get_unaligned_le32(in + 4);
+		if (!dcp || id >= dcp->nr_disp_registers || !dcp->disp_registers[id]) {
+			put_unaligned_le32(1, out + 0x18);
+			return 0;
+		}
+		put_unaligned_le64(dcp->disp_registers[id]->start, out);
+		put_unaligned_le64(dcp->disp_registers[id]->start, out + 8);
+		put_unaligned_le64(resource_size(dcp->disp_registers[id]), out + 0x10);
+		return 0;
+	case 413: case 418:
+		if (!SHAPE(0x1048, 4))
+			break;
+		if (in[0x1044] & 1) {
+			out[0] = 1;
+			return 0;
+		}
+		return dcp_v27_store(v26, get_unaligned_le32(in), in + 4, in + 0x44, 0x1000, out);
+	case 414: case 415: case 416: case 417: case 419: case 420: case 421: case 422:
+		if (in_size < 0x45 || out_size != 4)
+			break;
+		return dcp_v27_store(v26, get_unaligned_le32(in), in + 4, in + 0x44,
+				     in_size - 0x44, out);
+	case 451:
+		if (!SHAPE(0x14, 0x14))
+			break;
+		{
+			u64 size = get_unaligned_le64(in + 4);
+			u32 options = get_unaligned_le32(in + 0xc);
+			struct dcp_v26_buffer *buf;
+
+			dev_info(v26->dev, "IOMFB27 D451 allocate %#x size %llu options %#x\n",
+				 get_unaligned_le32(in), size, options);
+			ret = dcp_v26_alloc(v26, size, &id);
+			if (ret)
+				return ret;
+			buf = &v26->buffers[id - 1];
+			put_unaligned_le64(buf->iova, out);
+			put_unaligned_le64(buf->size, out + 8);
+			put_unaligned_le32(id, out + 0x10);
+		}
+		return 0;
+	case 454:
+		if (!SHAPE(4, 4))
+			break;
+		id = get_unaligned_le32(in);
+		if (!id || id > v26->buffer_count || v26->buffers[id - 1].retired)
+			return -EINVAL;
+		v26->buffers[id - 1].retired = true;
+		return 0;
+	case 550: case 551: case 552: case 553: case 554: case 555: case 556: case 557:
+	case 558: case 559: case 560: case 561: case 562: case 563: case 564: case 565:
+	case 566: case 567: case 568: case 569: case 570:
+		if (in_size < 0x41 || out_size != 4)
+			break;
+		return dcp_v27_store(v26, 0, in, in + 0x40, in_size - 0x40, out);
+	case 574:
+		if (!SHAPE(4, 8))
+			break;
+		/* Luminance span: binary32 219.0 for selector 0, as on H17P. */
+		if (!get_unaligned_le32(in))
+			put_unaligned_le64(0x435b0000, out);
+		return 0;
+	case 575:
+		if (!SHAPE(0x58, 0x4c))
+			break;
+		dev_info(v26->dev, "IOMFB27 hotplug connected=%llu\n", get_unaligned_le64(in));
+		if (!(in[0x54] & 1))
+			memcpy(out, in + 8, 0x4c);
+		return 0;
+	case 589:
+		if (!SHAPE(0xe4, 0xe0))
+			break;
+		if (!(in[0xe0] & 1))
+			memcpy(out, in, 0xe0);
+		return 0;
+	case 594:
+		if (!SHAPE(DCP_V26_D590_SIZE, 0))
+			break;
+		id = v26->d590_count++ % ARRAY_SIZE(v26->d590);
+		memcpy(v26->d590[id], in, DCP_V26_D590_SIZE);
+		v26->d590_time[id] = v26->link.callback_time;
+		return 0;
+	case 595:
+		if (!SHAPE(0x2708, 0x400))
+			break;
+		/* Batched completion: the ids go back as they came. */
+		memcpy(out, in, 0x400);
+		count = get_unaligned_le32(in + 0x400);
+		if (count && count <= 256) {
+			id = v26->d590_count++ % ARRAY_SIZE(v26->d590);
+			memcpy(v26->d590[id], in, DCP_V26_D590_SIZE);
+			v26->d590_time[id] = v26->link.callback_time;
+		}
+		return 0;
+	case 603:
+		if (!SHAPE(0, 0))
+			break;
+		/* 25G83 D599 -> A412 (is_main_display), same number here. */
+		return dcp_v27_call(v26, 412, false, true, NULL);
+	default:
+		break;
+	}
+#undef SHAPE
+	if (!test_and_set_bit(n, v26->v27_logged))
+		dev_warn(v26->dev, "IOMFB27 D%03u %#x/%#x answered with zeroes: %*phN\n", n,
+			 in_size, out_size, (int)min_t(u32, in_size, 32), in);
+	return 0;
+}
+
 static void dcp_v26_idle(struct work_struct *work)
 {
 	struct apple_dcp_v26 *v26 = container_of(work, struct apple_dcp_v26, idle_work);
@@ -1005,6 +1493,128 @@ static int keep_display_power(struct device *dev)
 	return 0;
 }
 
+/* PMGR bandwidth scratch word and doorbell of the SDK-27 D003 reply, from the DT. */
+static int dcp_v27_bandwidth(struct apple_dcp_v26 *v26, struct device_node *np)
+{
+	struct of_phandle_args args;
+	struct resource res;
+	int ret;
+
+	ret = of_parse_phandle_with_args(np, "apple,bw-scratch", "#apple,bw-scratch-cells",
+					 0, &args);
+	if (ret)
+		return ret;
+	ret = args.args_count == 3 ? of_address_to_resource(args.np, args.args[0], &res) :
+				     -EINVAL;
+	of_node_put(args.np);
+	if (ret)
+		return ret;
+	v26->bw_scratch = res.start + args.args[2];
+	ret = of_parse_phandle_with_args(np, "apple,bw-doorbell", "#apple,bw-doorbell-cells",
+					 0, &args);
+	if (ret)
+		return ret;
+	ret = args.args_count == 2 ? of_address_to_resource(args.np, args.args[0], &res) :
+				     -EINVAL;
+	of_node_put(args.np);
+	if (ret)
+		return ret;
+	v26->bw_doorbell = res.start;
+	return 0;
+}
+
+/* The disp-N register windows that D411 hands out. */
+static int dcp_v27_disp_regs(struct apple_dcp *dcp)
+{
+	struct platform_device *pdev = to_platform_device(dcp->dev);
+	struct resource *res;
+	char name[16];
+	unsigned int i;
+
+	for (i = 0; i < MAX_DISP_REGISTERS; i++) {
+		snprintf(name, sizeof(name), "disp-%u", i);
+		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, name);
+		if (!res)
+			break;
+		dcp->disp_registers[i] = res;
+	}
+	dcp->nr_disp_registers = i;
+	return i ? 0 : -ENODEV;
+}
+
+/*
+ * J704: the macOS 27.0 DCP session iBoot left running. The overlay that
+ * describes it marks the DCP, display and PIODMA nodes once their live
+ * mappings are reserved; the firmware image itself is checked by the DCPLink
+ * READY message before the first call.
+ */
+static int dcp_v27_probe(struct apple_dcp *dcp, const struct dcp_v26_board *board)
+{
+	struct device *dev = dcp->dev;
+	struct device_node *np = dev->of_node, *display, *piodma;
+	struct apple_dcp_v26 *v26;
+	const char *sdk = NULL;
+	u32 markers[3] = {};
+	int ret;
+
+	if (of_property_read_string(np, "apple,j704-dcp-sdk", &sdk) || strcmp(sdk, "27.0"))
+		return dev_err_probe(dev, -ENODEV, "%s display not started: DCP SDK %s\n",
+				     board->name, sdk ?: "(unknown)");
+	/*
+	 * The display subsystem is found by its compatible. boot.bin v6 carries these nodes in the
+	 * boot device tree without the dcp/disp0 aliases, which would switch on Aura's own T8142
+	 * display carve-outs; the runtime overlay still provides the alias.
+	 */
+	display = of_find_node_by_path("disp0");
+	if (display && !of_device_is_compatible(display, "apple,t8142-display-subsystem")) {
+		of_node_put(display);
+		display = NULL;
+	}
+	if (!display)
+		display = of_find_compatible_node(NULL, NULL, "apple,t8142-display-subsystem");
+	piodma = of_get_child_by_name(np, "piodma");
+	ret = !of_property_read_u32(np, board->handoff, &markers[0]) && markers[0] == 1 &&
+	      display && !of_property_read_u32(display, board->handoff, &markers[1]) &&
+	      markers[1] == 1 && piodma &&
+	      !of_property_read_u32(piodma, board->handoff, &markers[2]) && markers[2] == 1 ?
+	      0 : -ENODEV;
+	of_node_put(display);
+	of_node_put(piodma);
+	if (ret)
+		return dev_err_probe(dev, ret, "%s display mapping handoff missing\n", board->name);
+	if (!iommu_get_domain_for_dev(dev))
+		return dev_err_probe(dev, -ENODEV, "%s display not started: the DCP has no DART domain\n",
+				     board->name);
+	ret = dcp_v26_cpu_running(dev, board->name);
+	if (ret)
+		return ret;
+	ret = dcp_v27_disp_regs(dcp);
+	if (ret)
+		return dev_err_probe(dev, ret, "%s display registers missing\n", board->name);
+
+	v26 = kzalloc_obj(*v26);
+	if (!v26)
+		return -ENOMEM;
+	v26->dev = get_device(dev);
+	v26->board = board;
+	v26->dcp = dcp;
+	mutex_init(&v26->lock);
+	INIT_WORK(&v26->idle_work, dcp_v26_idle);
+	init_waitqueue_head(&v26->bl_wait);
+	mutex_init(&v26->bl_lock);
+	INIT_WORK(&v26->bl_register_work, dcp_v26_backlight_register);
+	ret = devm_add_action_or_reset(dev, dcp_v26_release, v26);
+	if (ret)
+		return ret;
+	ret = dcp_v27_bandwidth(v26, np);
+	if (ret)
+		return dev_err_probe(dev, ret, "%s bandwidth registers missing\n", board->name);
+	dcp->v26 = v26;
+	dev_info(dev, "%s: DCP running, %u display windows, bandwidth %#llx/%#llx\n",
+		 board->name, dcp->nr_disp_registers, v26->bw_scratch, v26->bw_doorbell);
+	return 0;
+}
+
 int iomfb_v26_6_probe(struct apple_dcp *dcp)
 {
 	struct device *dev = dcp->dev;
@@ -1017,6 +1627,8 @@ int iomfb_v26_6_probe(struct apple_dcp *dcp)
 	int ret;
 	u32 version[3];
 
+	if (!IS_ERR_OR_NULL(board) && board->sdk27)
+		return dcp_v27_probe(dcp, board);
 	if (of_property_count_u32_elems(np, "apple,j613-25g83-profile") != 1 ||
 	    of_property_read_u32(np, "apple,j613-25g83-profile", &profile) ||
 	    of_property_count_u32_elems(np, "apple,firmware-compat") != 3 ||
@@ -1156,11 +1768,13 @@ int iomfb_v26_6_bind(struct apple_dcp *dcp)
 		return dev_err_probe(dev, ret,
 				     "%s display not started: no usable boot framebuffer\n",
 				     v26->board->name);
-	v26->clock_rate = apple_j613_25g83_clock_hz();
+	v26->clock_rate = v26->board->sdk27 ? 48000000 : apple_j613_25g83_clock_hz();
 	if (!v26->clock_rate)
 		return dev_err_probe(dev, -EINVAL, "J613/25G83 same-boot clock observation required\n");
 
 	dcp_v26_link_init(&v26->link, dev, NULL);
+	if (v26->board->sdk27)
+		dcp_v26_link_set_abi(&v26->link, DCP_V27_READY_MSG, D(594), D(595));
 	rtk = apple_rtkit_init(dev, v26, "mbox", 0, &dcp_v26_rtkit_ops);
 	if (IS_ERR(rtk))
 		return dev_err_probe(dev, PTR_ERR(rtk),
@@ -1423,7 +2037,12 @@ int iomfb_v26_6_start(struct apple_dcp *dcp)
 	mutex_lock(&v26->lock);
 	step = "start signal";
 	ret = dcp_v26_simple_call(v26, A(401), false, true, true);
-	if (!ret) {
+	if (!ret && v26->board->sdk27) {
+		/* 25G83 A457 first_client_open (0/0) is A466 on SDK 27. */
+		step = "first client open";
+		if (READ_ONCE(j704_dcp_client_open))
+			ret = dcp_v27_call(v26, 466, false, false, NULL);
+	} else if (!ret) {
 		step = "first client open";
 		ret = dcp_v26_simple_call(v26, A(457), false, false, false);
 	}
@@ -1444,8 +2063,10 @@ int iomfb_v26_6_start(struct apple_dcp *dcp)
 	v26->bl_nits = min_t(u32, DCP_V26_DEFAULT_NITS, v26->bl_max);
 	v26->started = true;
 	/* Never removed, like the session it describes. */
-	debugfs_create_file("dcp-j613_25g83", 0400, NULL, v26, &dcp_v26_status_fops);
-	debugfs_create_file("dcp-j613_25g83-present", 0400, NULL, v26, &dcp_v26_present_fops);
+	debugfs_create_file(v26->board->sdk27 ? "dcp-j704" : "dcp-j613_25g83", 0400, NULL, v26,
+			    &dcp_v26_status_fops);
+	debugfs_create_file(v26->board->sdk27 ? "dcp-j704-present" : "dcp-j613_25g83-present",
+			    0400, NULL, v26, &dcp_v26_present_fops);
 	dcp->connector->connected = true;
 	dcp_set_dimensions(dcp, dcp_modes_transfer_begin(dcp));
 	dcp_mode_set_valid(&dcp->mode_state, true);
@@ -1493,7 +2114,10 @@ static u64 dcp_v26_brightness_encode(struct apple_dcp_v26 *v26, u8 *swap)
 	lockdep_assert_held(&v26->lock);
 	if (!v26->bl_pending)
 		return 0;
-	dcp_v26_encode_brightness(swap, v26->bl_off ? 0 : v26->bl_nits);
+	if (v26->board->sdk27)
+		dcp_v27_encode_brightness(swap, v26->bl_off ? 0 : v26->bl_nits, v26->bl_max);
+	else
+		dcp_v26_encode_brightness(swap, v26->bl_off ? 0 : v26->bl_nits);
 	return v26->bl_seq;
 }
 
@@ -1583,14 +2207,15 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 	if (surface && (!iova || !width || width > v26->panel_width || !height ||
 			dst_y > v26->panel_height || height > v26->panel_height - dst_y))
 		return -EINVAL;
-	swap = kmalloc(DCP_V26_SWAP_SIZE, GFP_KERNEL);
+	swap = kmalloc(max(DCP_V26_SWAP_SIZE, DCP_V27_SUBMIT_SIZE), GFP_KERNEL);
 	if (!swap)
 		return -ENOMEM;
 
 	mutex_lock(&v26->lock);
 	rec.surface = !!surface;
 	rec.start = ktime_get();
-	ret = dcp_v26_ctm_locked(v26, ctm_state);
+	/* The SDK-27 colour-matrix methods are not qualified: identity stays. */
+	ret = v26->board->sdk27 ? 0 : dcp_v26_ctm_locked(v26, ctm_state);
 	if (!ret)
 	ret = dcp_v26_call(v26, A(406), start, sizeof(start), started, sizeof(started), 0);
 	if (!ret && le32_to_cpu(started[1]))
@@ -1599,8 +2224,13 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 	if (!ret && !id)
 		ret = -EPROTO;
 	if (!ret) {
-		dcp_v26_encode_swap(swap, id, DCP_V26_BLACK, surface, iova, width, height,
-				    dst_y, DCP_V26_LAYER);
+		if (v26->board->sdk27)
+			dcp_v27_encode_swap(swap, id, DCP_V26_BLACK, surface, iova, width, height,
+					    dst_y, min_t(u32, READ_ONCE(j704_dcp_layer),
+							 DCP_V27_LAYERS - 1));
+		else
+			dcp_v26_encode_swap(swap, id, DCP_V26_BLACK, surface, iova, width,
+					    height, dst_y, DCP_V26_LAYER);
 		/* A target long past: show it at the next refresh, as on M1/M2. */
 		if (surface && READ_ONCE(v26->timed) && READ_ONCE(j613_25g83_swap_timestamps)) {
 			dcp_v26_swap_set_timing(swap, 120);
@@ -1609,13 +2239,31 @@ static int dcp_v26_swap(struct apple_dcp_v26 *v26, const u8 *surface, u64 iova,
 		rec.id = id;
 		rec.submitted = ktime_get();
 		brightness = dcp_v26_brightness_encode(v26, swap);
-		ret = dcp_v26_call(v26, A(407), swap, DCP_V26_SWAP_SIZE, result, sizeof(result),
-				   id);
+		if (v26->board->sdk27)
+			ret = dcp_v26_call(v26, A(408), swap, DCP_V27_SUBMIT_SIZE, result,
+					   sizeof(result), id);
+		else
+			ret = dcp_v26_call(v26, A(407), swap, DCP_V26_SWAP_SIZE, result,
+					   sizeof(result), id);
+		if (v26->board->sdk27 && v26->swaps < 3)
+			dev_info(v26->dev, "IOMFB27 swap %u A408 ret=%d status=%#x\n", id, ret,
+				 get_unaligned_le32((u8 *)result + 5));
 		/* The swap status sits at byte 5 of the reply. */
 		if (!ret && get_unaligned_le32((u8 *)result + 5))
 			ret = -EIO;
 	}
-	if (ret) {
+	if (ret == -EREMOTEIO && brightness && v26->board->sdk27) {
+		/*
+		 * The firmware refused a swap that carried a brightness change: the SDK-27
+		 * brightness block is not qualified, so stop sending it and keep the session.
+		 */
+		dev_warn(v26->dev, "IOMFB27 swap %u with brightness %u refused (status %#x); brightness changes disabled\n",
+			 id, v26->bl_nits, get_unaligned_le32((u8 *)result + 5));
+		v26->bl_refused = true;
+		v26->bl_owned = false;
+		WRITE_ONCE(v26->bl_pending, false);
+		wake_up_all(&v26->bl_wait);
+	} else if (ret) {
 		v26->failed = true;
 	} else {
 		dcp_v26_brightness_done(v26, brightness);
@@ -1776,6 +2424,14 @@ void iomfb_v26_6_flush(struct apple_dcp *dcp, struct drm_crtc *crtc,
 		dcp_v26_cancel_event(dcp);
 		return;
 	}
+	/*
+	 * This client holds the framebuffer it shows itself (active_fb) and the swap above
+	 * completed, so nothing displaced by this or an earlier commit is scanned out any
+	 * more. Nothing here arms the retained-framebuffer list the commit tail fills, so
+	 * release it now: J704 kept one framebuffer reference per flip, 154708 on one
+	 * framebuffer after 309k swaps (asahi-pw57-boot).
+	 */
+	dcp_release_all_retained_framebuffers(dcp);
 	if (READ_ONCE(j613_25g83_flip_timestamp)) {
 		/*
 		 * The flip completed when the firmware's swap-complete message
@@ -1843,7 +2499,7 @@ static int dcp_v26_backlight_update(struct backlight_device *bd)
 	int ret = 0;
 
 	mutex_lock(&v26->lock);
-	if (v26->failed) {
+	if (v26->failed || v26->bl_refused) {
 		ret = -EIO;
 	} else {
 		/* Sent even when unchanged: it also repairs the firmware's value. */
@@ -1923,6 +2579,7 @@ void iomfb_v26_6_poweroff(struct apple_dcp *dcp)
 	/* Blank to black; the panel and the DCP stay powered. */
 	if (dcp->v26 && dcp->v26->started) {
 		dcp_v26_brightness_power(dcp->v26, false);
-		dcp_v26_present(dcp->v26, NULL, 0, NULL, NULL);
+		if (dcp_v26_present(dcp->v26, NULL, 0, NULL, NULL))
+			dcp_release_all_retained_framebuffers(dcp);
 	}
 }

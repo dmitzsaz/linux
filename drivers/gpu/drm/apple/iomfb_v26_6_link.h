@@ -39,6 +39,14 @@ typedef int (*dcp_v26_callback_fn)(void *cookie, u32 tag, const void *in,
 struct dcp_v26_link {
 	struct device *dev;
 	struct apple_rtkit *rtk;
+	/*
+	 * The firmware's ABI: its exact READY message, the tag of the ordinary
+	 * swap-complete callback (0x730 bytes, swap id first) and, if it has
+	 * one, of the batched swap-complete callback (ids[256], count at 0x400).
+	 */
+	u64 ready_msg;
+	u32 completion_tag;
+	u32 batch_tag;
 	void *rpc;
 	dma_addr_t rpc_dva;
 
@@ -86,6 +94,8 @@ struct dcp_v26_link {
 
 void dcp_v26_link_init(struct dcp_v26_link *link, struct device *dev,
 		       struct apple_rtkit *rtk);
+void dcp_v26_link_set_abi(struct dcp_v26_link *link, u64 ready_msg, u32 completion_tag,
+			  u32 batch_tag);
 int dcp_v26_link_start(struct dcp_v26_link *link);
 void dcp_v26_link_receive(struct dcp_v26_link *link, u64 message);
 void dcp_v26_link_fail(struct dcp_v26_link *link);

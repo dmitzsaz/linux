@@ -172,4 +172,68 @@ static inline void dcp_v26_encode_brightness(u8 *swap, u32 nits)
 	put_unaligned_le64(dcp_v26_nits_to_double(nits), swap + DCP_V26_SWAP_BRIGHTNESS_NITS);
 }
 
+/*
+ * SDK 27 (J704) swap_submit_dcp_main, A408: the 0x6e0-byte IOMFBSwap (the
+ * offsets above are unchanged in it), four 0x22c-byte surfaces, two arrays of
+ * four DVAs, scalar arguments and the null flags of every pointer argument.
+ * Its 12-byte reply has the method status at byte 5.
+ */
+#define DCP_V27_SUBMIT_SIZE		0xff4
+#define DCP_V27_SWAP_SIZE		0x6e0
+#define DCP_V27_SURFACE(p)		(DCP_V27_SWAP_SIZE + (p) * DCP_V26_SURFACE_SIZE)
+#define DCP_V27_IOVA(p)			(0xf90 + (p) * 8)
+#define DCP_V27_SWAP_NULL		0xfea
+#define DCP_V27_SURF_NULL(p)		(0xfeb + (p))
+#define DCP_V27_OUT_BOOL_NULL		0xfef
+#define DCP_V27_IN_U32_NULL		0xff0
+#define DCP_V27_OUT_U32_NULL		0xff1
+#define DCP_V27_LAYERS			4
+
+static inline void dcp_v27_encode_swap(u8 *req, u32 id, u32 background, const u8 *surface,
+				       u64 iova, u32 width, u32 height, u32 dst_y, u32 layer)
+{
+	u32 layers = DCP_V26_SWAP_LAYERS | (BIT(layer + 1) - 1);
+
+	memset(req, 0, DCP_V27_SUBMIT_SIZE);
+	put_unaligned_le32(id, req + DCP_V26_SWAP_ID);
+	put_unaligned_le32(DCP_V26_SWAP_SET_BACKGROUND | layers, req + DCP_V26_SWAP_ENABLED);
+	put_unaligned_le32(DCP_V26_SWAP_SET_BACKGROUND | layers, req + DCP_V26_SWAP_COMPLETED);
+	put_unaligned_le32(background, req + DCP_V26_SWAP_BACKGROUND);
+	memset(req + DCP_V27_SURF_NULL(0), 1, DCP_V27_LAYERS);
+	req[DCP_V27_OUT_BOOL_NULL] = 1;
+	req[DCP_V27_IN_U32_NULL] = 1;
+	req[DCP_V27_OUT_U32_NULL] = 1;
+	if (surface) {
+		memcpy(req + DCP_V27_SURFACE(layer), surface, DCP_V26_SURFACE_SIZE);
+		put_unaligned_le64(iova, req + DCP_V27_IOVA(layer));
+		put_unaligned_le32(1, req + DCP_V26_SWAP_SURF_ID(layer));
+		dcp_v26_put_rect(req + DCP_V26_SWAP_SRC(layer), 0, 0, width, height);
+		dcp_v26_put_rect(req + DCP_V26_SWAP_DST(layer), 0, dst_y, width, height);
+		req[DCP_V27_SURF_NULL(layer)] = 0;
+	}
+}
+
+/*
+ * SDK 27 brightness. The firmware reads the H17-generation block at 0x354..0x3ed of its
+ * IOMFBSwap (sol-j704-dcp-27-profile-spec: +354, vectors at +35e/+36e/+37e, +3e6), the layout
+ * the A18 (H17P) host fills: the activation words, the commanded nits, the ceiling pair and the
+ * two unity scale factors, all as binary64.
+ */
+static inline void dcp_v27_encode_brightness(u8 *swap, u32 nits, u32 maximum)
+{
+	u64 ceiling = dcp_v26_nits_to_double(maximum), unity = dcp_v26_nits_to_double(1);
+
+	memset(swap + 0x354, 0, 0x9a);
+	put_unaligned_le64(ceiling, swap + 0x36e);
+	put_unaligned_le64(ceiling, swap + 0x376);
+	put_unaligned_le32(1, swap + 0x354);
+	swap[0x358] = 1;
+	swap[0x359] = 1;
+	swap[0x35a] = 1;
+	put_unaligned_le16(1, swap + 0x35c);
+	put_unaligned_le64(dcp_v26_nits_to_double(nits), swap + 0x35e);
+	put_unaligned_le64(unity, swap + 0x37e);
+	put_unaligned_le64(unity, swap + 0x3e6);
+}
+
 #endif /* __APPLE_IOMFB_V26_6_SWAP_H__ */

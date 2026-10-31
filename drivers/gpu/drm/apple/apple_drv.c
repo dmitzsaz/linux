@@ -79,9 +79,15 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		struct apple_dcp *dcp;
 
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
-		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) {
-			/* H17P applies the stored fourth byte as straight alpha. */
+		/*
+		 * H17P applies the stored fourth byte as straight alpha, and so does the SDK-27
+		 * DCP (J704), which ignores the surface's opaque flag: an XRGB8888 console, drawn
+		 * with that byte zero, was fully transparent (a black panel behind a working
+		 * login). Depth 32 makes the console ARGB8888 with an opaque palette.
+		 */
+		if ((dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		     dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
+		    of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcp-v27")) {
 			sizes->surface_bpp = 32;
 			sizes->surface_depth = 32;
 			break;
@@ -389,7 +395,13 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
-	.fb_create		= drm_gem_fb_create,
+	/*
+	 * With a dirty callback the DMA fbdev helper draws the console into a shadow buffer and
+	 * commits its damage. Without one the console wrote straight into the scanout buffer and
+	 * never committed, so a DCP that only presents on a swap (J704 SDK 27, ProMotion) kept
+	 * showing the last swapped frame: a black screen behind a working login prompt.
+	 */
+	.fb_create		= drm_gem_fb_create_with_dirty,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
@@ -1100,6 +1112,13 @@ static int apple_drm_init(struct device *dev)
 		goto err_unbind;
 
 	drm_mode_config_reset(&apple->drm);
+	/*
+	 * The connectors are HPD-only, so this starts no periodic polling. It lets a
+	 * status change found by a probe outside the driver's own hotplug path reach
+	 * userspace as a hotplug event: e.g. a forced "off"/"detect" written to
+	 * /sys/class/drm/cardN-eDP-1/status (J704 clamshell mode).
+	 */
+	drmm_kms_helper_poll_init(&apple->drm);
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
 		drm_for_each_crtc(crtc, &apple->drm) {
 			if (iomfb_is_m4(platform_get_drvdata(to_apple_crtc(crtc)->dcp))) {

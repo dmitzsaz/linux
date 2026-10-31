@@ -5089,6 +5089,15 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.firmware_compat = DCP_FIRMWARE_H17P,
 };
 
+/*
+ * J704 (T8142) with macOS 27.0 DCP firmware: the SDK-27 board of the DCPLink
+ * client in iomfb_v26_6.c, selected only by its own overlay compatible.
+ */
+static const struct apple_dcp_hw_data apple_dcp_hw_t8142_v27 = {
+	.num_dptx_ports = 0,
+	.firmware_compat = DCP_FIRMWARE_V_26_6,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -5132,6 +5141,7 @@ static const struct of_device_id of_match[] = {
 	{ .compatible = "apple,t8112-dcp", .data = &apple_dcp_hw_t8112,  },
 	{ .compatible = "apple,t8140-dcp", .data = &apple_dcp_hw_t8140,  },
 	{ .compatible = "apple,t8140-dcpext", .data = &apple_dcp_hw_t8140_external, },
+	{ .compatible = "apple,t8142-dcp-v27", .data = &apple_dcp_hw_t8142_v27, },
 	{ .compatible = "apple,t8142-dcp", .data = &apple_dcp_hw_t8142,  },
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp", .data = &apple_dcp_hw_t8132, },
