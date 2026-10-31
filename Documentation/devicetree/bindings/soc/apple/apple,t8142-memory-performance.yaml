@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/soc/apple/apple,t8142-memory-performance.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+title: Apple T8142 memory and fabric performance controls
+maintainers:
+  - Dmitriy <noc@pimk.in>
+description: |
+  PMC voter and rail interfaces used to adjust the CLPC memory/fabric floor
+  from CPU and GPU demand. The GPU supplies activity registers; the consumer
+  waits for its bound driver before sampling those registers.
+properties:
+  compatible:
+    const: apple,t8142-memory-performance
+  reg:
+    maxItems: 4
+  reg-names:
+    items:
+      - const: voters
+      - const: rails
+      - const: gpu-core-power
+      - const: gpu-pstate
+  apple,gpu:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: GPU provider whose activity registers may be sampled after startup.
+required:
+  - compatible
+  - reg
+  - reg-names
+  - apple,gpu
+additionalProperties: false
+...

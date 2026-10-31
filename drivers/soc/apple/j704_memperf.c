@@ -44,23 +44,19 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
+#include <linux/of_platform.h>
+#include <linux/platform_device.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
 #include <linux/tick.h>
 #include <linux/workqueue.h>
 
-#define PMC_VOTERS		0x382700000ULL
-#define PMC_VOTERS_SIZE		0x10000	/* four agents: PMP, CLPC, GFX, AP */
-#define PMC_RAILS		0x382806000ULL
-#define PMC_RAILS_SIZE		0x3000
 #define PMC_AGENT_STRIDE	0x4000
 #define PMC_PENDING		0x4
 #define PMC_STATE(agent)	(4 * (agent))
 #define PMC_ENABLE(rail)	(0x2000 + 4 * (rail))
 
-#define GPU_CORE_POWER		0x580e01000ULL
-#define GPU_GFX_PSTATE		0x580e80110ULL
 
 #define AGENT_PMP		0
 #define AGENT_CLPC		1
@@ -391,22 +387,55 @@ static void free_all(void)
 	kfree(mp.idle);
 	kfree(mp.wall);
 	unmap_all();
+	memset(&mp, 0, sizeof(mp));
 }
 
-static int __init memperf_init(void)
+static int memperf_probe(struct platform_device *pdev)
 {
 	unsigned int i, rail;
+	struct device_node *node;
+	struct platform_device *gpu;
+	struct resource *resource;
+	void __iomem **windows[] = { &mp.voters, &mp.rails, &mp.gpu_power, &mp.gfx_pstate };
+	static const resource_size_t minimum[] = { 0x10000, 0x3000, 4, 4 };
 	int ret = -ENOMEM;
 
 	if (!of_machine_is_compatible("apple,t8142") || !of_machine_is_compatible("apple,j704")) {
 		pr_info("j704-memperf: not a J704 (T8142); refusing\n");
 		return -ENODEV;
 	}
+	/* Sample SGX only after its normal driver has completed startup. */
+	node = of_parse_phandle(pdev->dev.of_node, "apple,gpu", 0);
+	if (!node)
+		return -EINVAL;
+	if (!of_device_is_available(node)) {
+		of_node_put(node);
+		return -ENODEV;
+	}
+	gpu = of_find_device_by_node(node);
+	of_node_put(node);
+	if (!gpu)
+		return -EPROBE_DEFER;
+	if (!device_is_bound(&gpu->dev)) {
+		put_device(&gpu->dev);
+		return -EPROBE_DEFER;
+	}
+	if (!device_link_add(&pdev->dev, &gpu->dev, DL_FLAG_AUTOREMOVE_CONSUMER)) {
+		put_device(&gpu->dev);
+		return -ENOMEM;
+	}
+	put_device(&gpu->dev);
 	mutex_init(&mp.lock);
-	mp.voters = ioremap(PMC_VOTERS, PMC_VOTERS_SIZE);
-	mp.rails = ioremap(PMC_RAILS, PMC_RAILS_SIZE);
-	mp.gpu_power = ioremap(GPU_CORE_POWER, 4);
-	mp.gfx_pstate = ioremap(GPU_GFX_PSTATE, 4);
+	for (i = 0; i < ARRAY_SIZE(windows); i++) {
+		resource = platform_get_resource(pdev, IORESOURCE_MEM, i);
+		if (!resource || resource_size(resource) < minimum[i]) {
+			ret = -EINVAL;
+			goto err;
+		}
+		*windows[i] = ioremap(resource->start, resource_size(resource));
+		if (!*windows[i])
+			goto err;
+	}
 	mp.idle = kcalloc(nr_cpu_ids, sizeof(*mp.idle), GFP_KERNEL);
 	mp.wall = kcalloc(nr_cpu_ids, sizeof(*mp.wall), GFP_KERNEL);
 	if (!mp.voters || !mp.rails || !mp.gpu_power || !mp.gfx_pstate || !mp.idle || !mp.wall)
@@ -447,7 +476,7 @@ err:
 	return ret;
 }
 
-static void __exit memperf_exit(void)
+static void memperf_remove(struct platform_device *pdev)
 {
 	unsigned int rail;
 
@@ -461,7 +490,21 @@ static void __exit memperf_exit(void)
 	free_all();
 }
 
-module_init(memperf_init);
-module_exit(memperf_exit);
+static const struct of_device_id memperf_of_match[] = {
+	{ .compatible = "apple,t8142-memory-performance" },
+	{},
+};
+MODULE_DEVICE_TABLE(of, memperf_of_match);
+
+static struct platform_driver memperf_driver = {
+	.probe = memperf_probe,
+	.remove = memperf_remove,
+	.driver = {
+		.name = "apple-j704-memperf",
+		.of_match_table = memperf_of_match,
+		.suppress_bind_attrs = true,
+	},
+};
+module_platform_driver(memperf_driver);
 MODULE_DESCRIPTION("J704 (Apple M5) PMC memory/fabric performance floors");
 MODULE_LICENSE("Dual MIT/GPL");

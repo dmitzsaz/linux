@@ -71,3 +71,8 @@ void asahi_hal300_dump_stack(void)
 {
 	dump_stack();
 }
+
+/* The report starts PMP before the GPU claims its firmware resources. */
+#if IS_ENABLED(CONFIG_APPLE_J704_PMP_REPORT)
+MODULE_SOFTDEP("pre: j704_pmp_report");
+#endif
