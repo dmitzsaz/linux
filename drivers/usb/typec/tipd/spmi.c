@@ -14,6 +14,10 @@
 
 #define tps_to_sn(tps) container_of_const((tps), struct sn201202x, cd.tps)
 
+/* Wake attempts at probe; each one waits up to 0.5 s (polled) or 0.1 s (IRQ). */
+#define SN201202X_WAKE_ATTEMPTS		10
+#define SN201202X_WAKE_RETRY_MS		250
+
 static int regmap_sn201202x_select_reg(struct spmi_device *sdev, u8 reg)
 {
 	int err;
@@ -232,7 +236,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	struct sn201202x *sn;
 	struct tps6598x *tps;
 	int irq_select, irq_sleep, irq_wake;
-	int ret;
+	int attempt, ret;
 
 	match = of_match_device(sn201202x_of_match, &device->dev);
 	if (!match)
@@ -313,9 +317,23 @@ static int sn201202x_probe(struct spmi_device *device)
 	if (IS_ERR(tps->regmap))
 		return PTR_ERR(tps->regmap);
 
-	ret = sn201202x_wake(sn);
+	/*
+	 * Early in boot a controller can still be busy after the bootloader
+	 * hand-over and stay silent through the first wake window: on J704 the
+	 * right-hand port's controller timed out at ~4 s after power-on and the
+	 * port was then gone until the driver was bound again by hand, which
+	 * worked at once. Repeat the wake instead of failing the probe for good.
+	 */
+	for (attempt = 1; ; attempt++) {
+		ret = sn201202x_wake(sn);
+		if (ret != -ETIMEDOUT || attempt == SN201202X_WAKE_ATTEMPTS)
+			break;
+		msleep(SN201202X_WAKE_RETRY_MS);
+	}
 	if (ret)
 		return ret;
+	if (attempt > 1)
+		dev_info(&device->dev, "awake after %d wake attempts\n", attempt);
 
 	ret = tipd_init(tps);
 	if (ret)

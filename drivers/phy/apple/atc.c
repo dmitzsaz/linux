@@ -523,6 +523,12 @@ enum atcphy_lane_mode {
 #define PIPEHANDLER_NONSELECTED_OVERRIDE 0x20
 #define PIPEHANDLER_NATIVE_RESET BIT(12)
 #define PIPEHANDLER_DUMMY_PHY_EN BIT(15)
+/*
+ * Unnamed. On T8142 the boot ROM/loader leaves it set on the DFU port (atc0) and the PIPE lock
+ * is then never acknowledged, even with DUMMY_PHY_EN set; the ports the loader brought up
+ * (atc1/atc3) have it clear. Clearing it let the lock complete on hardware.
+ */
+#define PIPEHANDLER_NONSELECTED_BOOT_HOLD BIT(16)
 #define PIPEHANDLER_NATIVE_POWER_DOWN GENMASK(3, 0)
 
 #define PIPEHANDLER_LOCK_ACK_TIMEOUT_US 1000
@@ -659,6 +665,11 @@ struct apple_atcphy;
  * @restore_after_pd_off: The PHY's power domain may be switched off in system
  *                        sleep, which resets the block; bring the tracked
  *                        state back once the domain is on again
+ * @j704_dp_native_cfg: Before DisplayPort AUX, apply the two native tunable
+ *	groups the T8122 lists leave out (J704 ATC3: tunable_ATCAXI2AF_LIOA_IOA,
+ *	bank30 at axi2af + 0x20000, and tunable_ATC_COMMON_CFG, bank31 = lpdptx)
+ * @clear_boot_hold: Clear PIPEHANDLER_NONSELECTED_BOOT_HOLD when enabling the
+ *                   dummy PIPE backend
  */
 struct atcphy_hw {
 	void (*configure_post_tunable)(struct apple_atcphy *, enum atcphy_mode);
@@ -677,6 +688,8 @@ struct atcphy_hw {
 	bool park_pipe_unlocked;
 	bool park_dummy_phy;
 	bool restore_after_pd_off;
+	bool clear_boot_hold;
+	bool j704_dp_native_cfg;
 };
 
 enum atcphy_t8132_bank {
@@ -857,6 +870,7 @@ struct apple_atcphy {
 		void __iomem *usb2phy_reg;
 		void __iomem *pipehandler;
 		void __iomem *lpdptx;
+		void __iomem *lioa;
 	} regs;
 
 	struct {
@@ -1644,6 +1658,9 @@ static int atcphy_configure_pipehandler_usb4(struct apple_atcphy *atcphy)
  */
 static void atcphy_enable_dummy_phy(struct apple_atcphy *atcphy)
 {
+	if (atcphy->hw->clear_boot_hold)
+		clear32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
+			PIPEHANDLER_NONSELECTED_BOOT_HOLD);
 	set32(atcphy->regs.pipehandler + PIPEHANDLER_NONSELECTED_OVERRIDE,
 	      PIPEHANDLER_DUMMY_PHY_EN);
 }
@@ -3667,6 +3684,54 @@ failed:
 	return ret;
 }
 
+/*
+ * J704 (T8142): the native PHY init (aciophy_phy_init partB, KC
+ * 0xa201e38..0xa20221c, sol-j704-extdisp-r7.md A4) applies, besides the lists
+ * the T8122 code programs, the ADT tunables ATCAXI2AF_LIOA_IOA (bank30) and
+ * ATC_COMMON_CFG (bank31). On J704 ATC3 the J704 ADT values are five clears
+ * in bank30 and bit 0 of bank31 + 8; boot leaves all six at other values.
+ * Applied before DP AUX; before/after values are logged.
+ */
+static const struct {
+	u32 offset;
+	u32 clear;
+	u32 set;
+} atcphy_j704_lioa[] = {
+	{ 0x28, 0xfe2f, 0 },
+	{ 0x2c, 0x7, 0 },
+	{ 0x30, 0x7f, 0 },
+	{ 0x34, 0xff, 0 },
+	{ 0x58, 0x10b, 0 },
+};
+
+static void atcphy_j704_dp_native_cfg(struct apple_atcphy *atcphy)
+{
+	u32 before, after;
+
+	if (atcphy->regs.lioa) {
+		for (unsigned int i = 0; i < ARRAY_SIZE(atcphy_j704_lioa); i++) {
+			void __iomem *reg = atcphy->regs.lioa + atcphy_j704_lioa[i].offset;
+
+			before = readl(reg);
+			mask32(reg, atcphy_j704_lioa[i].clear, atcphy_j704_lioa[i].set);
+			after = readl(reg);
+			dev_info(atcphy->dev, "J704 DP: LIOA +0x%x %08x -> %08x\n",
+				 atcphy_j704_lioa[i].offset, before, after);
+		}
+	}
+	if (atcphy->regs.lpdptx) {
+		before = readl(atcphy->regs.lpdptx + 0x8);
+		mask32(atcphy->regs.lpdptx + 0x8, BIT(0), BIT(0));
+		after = readl(atcphy->regs.lpdptx + 0x8);
+		if (after & BIT(0))
+			dev_info(atcphy->dev, "J704 DP: COMMON_CFG +0x8 %08x -> %08x\n",
+				 before, after);
+		else
+			dev_warn(atcphy->dev, "J704 DP: COMMON_CFG +0x8 bit 0 did not hold (%08x -> %08x)\n",
+				 before, after);
+	}
+}
+
 static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 {
 	int ret = 0;
@@ -3768,6 +3833,8 @@ static int atcphy_configure(struct apple_atcphy *atcphy, enum atcphy_mode mode)
 	}
 
 	atcphy_apply_tunables(atcphy, mode);
+	if (atcphy->hw->j704_dp_native_cfg && atcphy_modes[mode].enable_dp_aux)
+		atcphy_j704_dp_native_cfg(atcphy);
 	atcphy->hw->configure_post_tunable(atcphy, mode);
 
 	/* Setup AUX channel if DP altmode is requested */
@@ -4139,6 +4206,17 @@ static int atcphy_dpphy_validate(struct phy *phy, enum phy_mode mode, int submod
 		return -EINVAL;
 	if (submode != 0)
 		return -EINVAL;
+
+	/*
+	 * J704: report DisplayPort lanes only once the current mode has
+	 * finished its configuration with AUX powered, so a display pipeline
+	 * notified with the same Type-C state does not start AUX early.
+	 */
+	if (atcphy->hw->j704_dp_native_cfg &&
+	    (READ_ONCE(atcphy->mode_dirty) || !READ_ONCE(atcphy->dp_t8122.aux))) {
+		opts->lanes = 0;
+		return 0;
+	}
 
 	switch (atcphy->mode) {
 	case APPLE_ATCPHY_MODE_USB3_DP:
@@ -5461,6 +5539,18 @@ static int atcphy_map_resources(struct platform_device *pdev, struct apple_atcph
 			*resources[i].res = res;
 	}
 
+	/*
+	 * J704: bank30 (LIOA) lies at axi2af + 0x20000, outside the described
+	 * axi2af window; map just its 16 KiB for the native DP configuration.
+	 */
+	if (atcphy->hw->j704_dp_native_cfg && of_machine_is_compatible("apple,j704") &&
+	    atcphy->res.axi2af) {
+		atcphy->regs.lioa = devm_ioremap(&pdev->dev, atcphy->res.axi2af->start + 0x20000,
+						 0x4000);
+		if (!atcphy->regs.lioa)
+			return dev_err_probe(atcphy->dev, -ENOMEM, "Unable to map LIOA bank\n");
+	}
+
 	if (atcphy->hw->has_usb2phy_reg) {
 		res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "usb2phy-reg");
 		addr = devm_ioremap_resource(&pdev->dev, res);
@@ -5785,6 +5875,12 @@ static const struct atcphy_hw atcphy_hw_t8140 = {
 	.optional_tunables = true,
 };
 
+/*
+ * T8142 (M5) is the T8122 PHY generation and needs the same dummy PIPE backend: on J704 a port
+ * whose power domain started from reset (the left-front/DFU port) never acknowledged the PIPE lock
+ * until DUMMY_PHY_EN was set and the boot hold cleared; the loader-initialised ports only kept
+ * working while their domains stayed on.
+ */
 static const struct atcphy_hw atcphy_hw_t8142 = {
 	.configure_post_tunable = atcphy_configure_post_tunable_all_modes,
 	.gen = ATCPHY_GENERATION_T8122,
@@ -5793,6 +5889,15 @@ static const struct atcphy_hw atcphy_hw_t8142 = {
 	.pipe_mux_clk = PIPEHANDLER_MUX_CTRL_CLK_T8142,
 	.pipe_mux_data = PIPEHANDLER_MUX_CTRL_DATA_T8142,
 	.has_usb4 = true,
+	/*
+	 * J704: the T8142 DP PHY (native T8132TypeCPhy) runs the T8122 AUX,
+	 * AUSPLL (same rate descriptors, lock at +0x7034, APB handshake) and
+	 * lane sequences; sol-j704-extdisp-r3.md section 3 audits them.
+	 */
+	.dp_t8122 = true,
+	.park_dummy_phy = true,
+	.clear_boot_hold = true,
+	.j704_dp_native_cfg = true,
 };
 
 static const struct of_device_id atcphy_match[] = {
