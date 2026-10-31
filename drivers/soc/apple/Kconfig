@@ -276,3 +276,11 @@ config APPLE_DISPLAY_GATE_KUNIT_TEST
 endmenu
 
 endif
+
+config APPLE_J704_MEMPERF
+	tristate "Apple J704 memory and fabric performance floors"
+	depends on ARCH_APPLE && CPU_FREQ && OF
+	help
+	  Apply CPU/GPU demand to the T8142 CLPC voter, releasing the floor
+	  at idle and suspend. Only J704 is admitted by this module.
+	  The module is called j704_memperf.

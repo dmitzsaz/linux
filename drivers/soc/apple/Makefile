@@ -53,3 +53,5 @@ obj-$(CONFIG_APPLE_MCC) += apple-mcc.o
 apple-mcc-y := mcc.o
 
 obj-$(CONFIG_APPLE_CLPC) += clpc.o
+
+obj-$(CONFIG_APPLE_J704_MEMPERF) += j704_memperf.o
