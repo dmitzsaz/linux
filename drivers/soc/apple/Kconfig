@@ -284,3 +284,14 @@ config APPLE_J704_MEMPERF
 	  Apply CPU/GPU demand to the T8142 CLPC voter, releasing the floor
 	  at idle and suspend. Only J704 is admitted by this module.
 	  The module is called j704_memperf.
+
+config APPLE_J704_PLATFORM
+	tristate "Apple J704 platform startup"
+	depends on ARCH_APPLE && OF_DYNAMIC && PCI && APPLE_DART && MFD_MACSMC
+	default ARCH_APPLE
+	help
+	  Ordered startup of the J704 shared PCIe PHY, radio and SD reader.
+	  The driver waits for the SMC provider, validates the current loader
+	  data, then enables dormant DART and PCI host nodes. No separate
+	  stage modules or userspace insmod sequence are required.
+	  Partial hardware state is retained until reboot and never replayed.

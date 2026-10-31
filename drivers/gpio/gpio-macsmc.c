@@ -43,6 +43,10 @@
 #define MACSMC_J713_RADIO_REG_ON_GPIO	0x13
 #define MACSMC_J713_RADIO_REG_ON_TEMPLATE	0x00800000
 
+/* J704 multi-touch/function-afe-reset: pKW4("gP1c", 0x00010000). */
+#define MACSMC_J704_AFE_RESET_GPIO	0x1c
+#define MACSMC_J704_AFE_RESET_TEMPLATE	0x00010000
+
 /*
  * Commands 0-6 are, presumably, the intended API.
  * Command 0xff lets you get/set the pin configuration in detail directly,
@@ -108,9 +112,10 @@ struct macsmc_gpio {
 	DECLARE_BITMAP(j700_pcio_level, MAX_GPIO);
 
 	bool j713;
-	struct mutex j713_reg_on_lock;
-	bool j713_reg_on_known;
-	bool j713_reg_on_level;
+	bool j704;
+	struct mutex function_lock;
+	bool function_known;
+	bool function_level;
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
@@ -121,11 +126,16 @@ static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
 		offset == MACSMC_J700_RADIO_REG_ON_GPIO);
 }
 
-static bool macsmc_gpio_is_j713_reg_on(struct macsmc_gpio *smcgp,
-				      unsigned int offset)
+static u32 macsmc_gpio_function_template(struct macsmc_gpio *smcgp,
+					unsigned int offset)
 {
-	return smcgp->j713 && smcgp->base_key == (smc_key)_SMC_KEY("gP\0\0") &&
-	       offset == MACSMC_J713_RADIO_REG_ON_GPIO;
+	if (smcgp->j713 && smcgp->base_key == (smc_key)_SMC_KEY("gP\0\0") &&
+	    offset == MACSMC_J713_RADIO_REG_ON_GPIO)
+		return MACSMC_J713_RADIO_REG_ON_TEMPLATE;
+	if (smcgp->j704 && smcgp->base_key == (smc_key)_SMC_KEY("gP\0\0") &&
+	    offset == MACSMC_J704_AFE_RESET_GPIO)
+		return MACSMC_J704_AFE_RESET_TEMPLATE;
+	return 0;
 }
 
 static int macsmc_gpio_nr(smc_key key)
@@ -199,7 +209,7 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
-	    macsmc_gpio_is_j713_reg_on(smcgp, offset))
+	    macsmc_gpio_function_template(smcgp, offset))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -223,10 +233,10 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	/* No qualified readback: report only the last successful native command. */
-	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
-		mutex_lock(&smcgp->j713_reg_on_lock);
-		ret = smcgp->j713_reg_on_known ? smcgp->j713_reg_on_level : -EOPNOTSUPP;
-		mutex_unlock(&smcgp->j713_reg_on_lock);
+	if (macsmc_gpio_function_template(smcgp, offset)) {
+		mutex_lock(&smcgp->function_lock);
+		ret = smcgp->function_known ? smcgp->function_level : -EOPNOTSUPP;
+		mutex_unlock(&smcgp->function_lock);
 		return ret;
 	}
 
@@ -256,18 +266,18 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 	smc_key key = macsmc_gpio_key(smcgp->base_key, offset);
 	int ret;
 
-	if (macsmc_gpio_is_j713_reg_on(smcgp, offset)) {
-		mutex_lock(&smcgp->j713_reg_on_lock);
+	if (macsmc_gpio_function_template(smcgp, offset)) {
+		mutex_lock(&smcgp->function_lock);
 		ret = apple_smc_write_u32(smcgp->smc, key,
-					  MACSMC_J713_RADIO_REG_ON_TEMPLATE | !!value);
+					  macsmc_gpio_function_template(smcgp, offset) | !!value);
 		if (!ret) {
-			smcgp->j713_reg_on_level = !!value;
-			smcgp->j713_reg_on_known = true;
+			smcgp->function_level = !!value;
+			smcgp->function_known = true;
 		}
-		mutex_unlock(&smcgp->j713_reg_on_lock);
+		mutex_unlock(&smcgp->function_lock);
 		if (ret < 0)
-			dev_err_ratelimited(smcgp->dev, "gP13 set to %u failed: %d\n",
-					    !!value, ret);
+			dev_err_ratelimited(smcgp->dev, "Native GPIO %p4ch set to %u failed: %d\n",
+					    &key, !!value, ret);
 		return ret;
 	}
 
@@ -364,7 +374,17 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 	smcgp->j700_pcio = of_machine_is_compatible("apple,j700") &&
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
 	smcgp->j713 = of_machine_is_compatible("apple,j713");
-	mutex_init(&smcgp->j713_reg_on_lock);
+	smcgp->j704 = of_machine_is_compatible("apple,j704");
+	if (smcgp->j704 && device_is_compatible(&pdev->dev, "apple,smc-gpio")) {
+		struct apple_smc_key_info info;
+
+		ret = apple_smc_get_key_info(smc, SMC_KEY(gP1c), &info);
+		if (ret < 0)
+			return dev_err_probe(&pdev->dev, ret, "Cannot query gP1c\n");
+		if (info.size != sizeof(u32) || !(info.flags & APPLE_SMC_WRITABLE))
+			return dev_err_probe(&pdev->dev, -EINVAL, "Invalid gP1c function key\n");
+	}
+	mutex_init(&smcgp->function_lock);
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)

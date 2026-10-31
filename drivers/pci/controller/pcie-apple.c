@@ -280,6 +280,17 @@ static const struct hw_info t602x_hw = {
  * Keep the PHY and application clock policy established by the bootloader;
  * runtime clock gating has not been qualified on this controller.
  */
+/* J704 uses this profile only after independently qualified port startup. */
+static const struct hw_info t8142_hw = {
+	.port_msiaddr = PORT_T602X_MSIADDR,
+	.port_perst = PORT_T602X_PERST,
+	.port_rid2sid = PORT_T602X_RID2SID,
+	.port_msimap = PORT_T602X_MSIMAP,
+	.max_rid2sid = 19,
+	.sid_indexed_rid2sid = true,
+	.retain_clocks = true,
+};
+
 static const struct hw_info t8140_hw = {
 	.port_msiaddr		= PORT_T602X_MSIADDR,
 	.port_perst		= PORT_T602X_PERST,
@@ -1750,6 +1761,12 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 		goto rid2sid_ready;
 	}
 
+	if (pcie->hw == &t8142_hw) {
+		/* No destructive size probing; reserve only ordinary SID slots. */
+		port->sid_map_sz = 16;
+		goto rid2sid_ready;
+	}
+
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
 		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
@@ -2307,6 +2324,39 @@ static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
 	struct apple_pcie *pcie = apple_pcie_lookup(cfg->parent);
 	struct apple_pcie_port *port;
 
+	if (pcie->hw == &t8142_hw) {
+		/*
+   * Only the described ports and the functions each one actually carries;
+   * never scan any other port or function. The secondary bus numbers come
+   * from the core, so match on the bridge a device sits behind instead of
+   * on a fixed bus number.
+   */
+		if (bus->number == cfg->busr.start) {
+			if (PCI_FUNC(devfn))
+				return NULL;
+			list_for_each_entry(port, &pcie->ports, entry)
+				if (port->idx == PCI_SLOT(devfn))
+					return pci_ecam_map_bus(bus, devfn,
+								where);
+			return NULL;
+		}
+		if (!bus->self)
+			return NULL;
+		switch (PCI_SLOT(bus->self->devfn)) {
+		case 0:
+			/* Wi-Fi and Bluetooth. */
+			return devfn <= 1 ?
+				       pci_ecam_map_bus(bus, devfn, where) :
+				       NULL;
+		case 2:
+			/* The SD card reader is that port's only function. */
+			return devfn == 0 ?
+				       pci_ecam_map_bus(bus, devfn, where) :
+				       NULL;
+		default:
+			return NULL;
+		}
+	}
 	if (!pcie->hw->root_bus_only)
 		return pci_ecam_map_bus(bus, devfn, where);
 
@@ -2340,13 +2390,14 @@ static int apple_pcie_config_write(struct pci_bus *bus, unsigned int devfn,
 	if (ret || !pcie || !pcie->kernel_init)
 		return ret;
 	/* Root-port prefetchable window. The port block has to be told too. */
-	if (bus->number != cfg->busr.start || devfn)
+	if (bus->number != cfg->busr.start || PCI_FUNC(devfn))
 		return ret;
 	if (where < 0x24 || where >= 0x30)
 		return ret;
 
 	list_for_each_entry(port, &pcie->ports, entry)
-		apple_pcie_port_writel(port, 1, PORT_PREFMEM_ENABLE);
+		if (port->idx == PCI_SLOT(devfn))
+			apple_pcie_port_writel(port, 1, PORT_PREFMEM_ENABLE);
 	return 0;
 }
 
@@ -2822,6 +2873,49 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	hw = of_device_get_match_data(dev);
 	if (!hw)
 		return -ENODEV;
+	if (hw == &t8142_hw) {
+		/*
+   * Every port this description publishes is staged outside this driver: the
+   * radio on port 0, the built-in SD reader on port 2. Each named one must
+   * already be ready and linked with no inherited stream routing, and at
+   * least one must be named.
+   */
+		static const struct {
+			const char *property;
+			u64 regs;
+		} staged[] = {
+			{ "apple,j704-preinitialized-port0", 0x488028000ULL },
+			{ "apple,j704-preinitialized-port2", 0x48a028000ULL },
+		};
+		unsigned int i, sid, named = 0;
+		if (!of_machine_is_compatible("apple,j704") ||
+		    !of_machine_is_compatible("apple,t8142"))
+			return -ENODEV;
+		for (i = 0; i < ARRAY_SIZE(staged); i++) {
+			void __iomem *p;
+			bool ready;
+			if (!of_property_read_bool(dev->of_node,
+						   staged[i].property))
+				continue;
+			named++;
+			p = ioremap_np(staged[i].regs, 0x8000);
+			if (!p)
+				return -ENOMEM;
+			ready = (readl(p + PORT_STATUS) & PORT_STATUS_READY) &&
+				(readl(p + PORT_LINKSTS) & PORT_LINKSTS_UP);
+			for (sid = 0; sid < 16; sid++)
+				if (readl(p + PORT_T602X_RID2SID + 4 * sid))
+					ready = false;
+			iounmap(p);
+			if (!ready)
+				return dev_err_probe(
+					dev, -EBUSY,
+					"%s is not staged and linked\n",
+					staged[i].property);
+		}
+		if (!named)
+			return -ENODEV;
+	}
 
 	/*
 	 * A tunneled PCIe-C port has no host GPIO for PERST#: the tunnel
@@ -2829,7 +2923,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	 * reset-gpios provider here rejects the valid synthesized port before
 	 * the tunneled setup path can consume that handoff.
 	 */
-	if (!hw->tunneled) {
+	if (!hw->tunneled && hw != &t8142_hw) {
 		/* Check for probe dependencies for all ports first */
 		for_each_available_child_of_node(dev->of_node, of_port) {
 			ret = apple_pcie_probe_port(of_port);
@@ -2873,7 +2967,7 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	}
 	pcie->piodma_supplier = piodma_supplier;
 	/* Only this retained-DMA radio hierarchy forbids user reset/removal. */
-	if (piodma_supplier || pcie->managed_sids) {
+	if (piodma_supplier || pcie->managed_sids || hw == &t8142_hw) {
 		bridge->no_user_remove = true;
 		bridge->reset_sensitive = true;
 		bridge->native_pcie_hotplug = false;
@@ -2998,7 +3092,13 @@ static int apple_pcie_probe(struct platform_device *pdev)
 
 	if (pcie->hw->tunneled)
 		pci_walk_bus(bridge->bus, apple_pcie_tunnel_keep_d0, NULL);
-
+	if (hw == &t8142_hw) {
+		/* Prototype owns a retained radio link; reboot is its teardown boundary. */
+		if (!try_module_get(THIS_MODULE))
+			return -ENODEV;
+		dev_info(dev,
+			 "J704 port0 host attached; retained until reboot\n");
+	}
 	return 0;
 }
 
@@ -3719,15 +3819,16 @@ static const struct dev_pm_ops apple_pcie_pm_ops = {
 };
 
 static const struct of_device_id apple_pcie_of_match[] = {
-	{ .compatible = "apple,t8122-pciec",	.data = &t8122_pciec_hw },
-	{ .compatible = "apple,t8103-pciec",	.data = &t8103_pciec_hw },
-	{ .compatible = "apple,t6000-pciec",	.data = &t8103_pciec_hw },
+	{ .compatible = "apple,t8142-pcie", .data = &t8142_hw },
+	{ .compatible = "apple,t8122-pciec", .data = &t8122_pciec_hw },
+	{ .compatible = "apple,t8103-pciec", .data = &t8103_pciec_hw },
+	{ .compatible = "apple,t6000-pciec", .data = &t8103_pciec_hw },
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
-	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
-	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
-	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
-	{ .compatible = "apple,pcie",		.data = &t8103_hw },
-	{ }
+	{ .compatible = "apple,t8132-pcie", .data = &t602x_hw },
+	{ .compatible = "apple,t6020-pcie", .data = &t602x_hw },
+	{ .compatible = "apple,t8140-pcie", .data = &t8140_hw },
+	{ .compatible = "apple,pcie", .data = &t8103_hw },
+	{}
 };
 MODULE_DEVICE_TABLE(of, apple_pcie_of_match);
 

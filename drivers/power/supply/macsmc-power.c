@@ -24,6 +24,8 @@
 
 #include <kunit/static_stub.h>
 
+#include "macsmc-power-j704.h"
+
 #define MAX_STRING_LENGTH 256
 
 /*
@@ -875,6 +877,11 @@ static int macsmc_power_probe(struct platform_device *pdev)
 	enum power_supply_property *props;
 	size_t nprops;
 
+	if (of_machine_is_compatible("apple,j704") &&
+	    of_machine_is_compatible("apple,t8142")) {
+		return j704_power_probe(pdev);
+	}
+
 	if (!smc)
 		return -ENODEV;
 
@@ -1113,6 +1120,12 @@ static int macsmc_power_probe(struct platform_device *pdev)
 static void macsmc_power_remove(struct platform_device *pdev)
 {
 	struct macsmc_power *power = dev_get_drvdata(&pdev->dev);
+
+	if (of_machine_is_compatible("apple,j704") &&
+	    of_machine_is_compatible("apple,t8142")) {
+		j704_power_remove(pdev);
+		return;
+	}
 
 	cancel_work(&power->critical_work);
 	cancel_delayed_work(&power->dbg_log_work);
