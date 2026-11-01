@@ -487,7 +487,8 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	struct snd_soc_component *component = codec_dai->component;
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
 	unsigned int inv = fmt & SND_SOC_DAIFMT_INV_MASK;
-	unsigned int ch2_edge;
+	unsigned int ch1_edge, ch2_edge;
+	int ret;
 
 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
 	case SND_SOC_DAIFMT_BC_FC:
@@ -499,7 +500,8 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	/*
 	 * Both formats have the same bus polarities: data one bit clock after
 	 * the rising FSYNC edge, which ASoC calls IB_IF for I2S and IB_NF for
-	 * DSP_A. In I2S each channel follows its own FSYNC edge, so the frame
+	 * DSP_A with IB_NF. IB_IF selects the other FSYNC edge for pulse
+	 * frames. In I2S each channel follows its own FSYNC edge, so the frame
 	 * must be 50 %. DSP_A takes a pulse frame: in TDM mode both channels
 	 * follow the frame-start edge, one slot apart (set in hw_params).
 	 */
@@ -510,7 +512,7 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		cs42l84->dsp_a = false;
 		break;
 	case SND_SOC_DAIFMT_DSP_A:
-		if (inv != SND_SOC_DAIFMT_IB_NF)
+		if (inv != SND_SOC_DAIFMT_IB_NF && inv != SND_SOC_DAIFMT_IB_IF)
 			return -EINVAL;
 		cs42l84->dsp_a = true;
 		break;
@@ -518,14 +520,33 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		return -EINVAL;
 	}
 
-	ch2_edge = cs42l84->dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
-	snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
+	/* Pulse frames may select either frame edge. J704 uses the falling
+	 * edge for both channels, matching its firmware-owned serializer.
+	 */
+	ch1_edge = cs42l84->dsp_a && inv == SND_SOC_DAIFMT_IB_IF ?
+		CS42L84_ASP_RX_CHx_CTL1_EDGE : 0;
+	ch2_edge = cs42l84->dsp_a ? ch1_edge : CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
 			CS42L84_ASP_CTL_TDM_MODE,
 			cs42l84->dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
-	snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
 			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
-	snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
 			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	if (ret < 0)
+		return ret;
 
 	return 0;
 }
