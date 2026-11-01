@@ -14,6 +14,7 @@ properties:
     oneOf:
       - const: apple,t8015-nvme-ans2
       - const: apple,t6041-nvme-ans2
+      - const: apple,t8142-nvme-ans2
       - items:
           - enum:
               - apple,t6020-nvme-ans2
@@ -95,16 +96,41 @@ properties:
 
       The SART address filter is documented in iommu/apple,sart.yaml.
 
+  apple,pmp-report:
+    $ref: /schemas/types.yaml#/definitions/phandle
+    description: PMP request that must be published before waking ANS.
+
   apple,rtkit-handoff:
     $ref: /schemas/types.yaml#/definitions/string
-    const: nvme-disabled-v1
+    enum: [nvme-disabled-v1, nvme-quiesced-v1, nvme-running-v1]
     description: |
       Added at boot when the bootloader leaves the ANS firmware running,
       with the NVMe controller disabled and its queues drained. The kernel
       adopts that RTKit session without renegotiating it. Shared firmware
-      buffers must remain reserved and protected by the SART.
+      buffers must remain reserved and protected by the SART. The quiesced
+      variant describes resident firmware before its first RTKit handshake;
+      the kernel wakes it and negotiates the session before enabling NVMe.
+      The running variant describes a completed T8142 RTKit startup with
+      the controller still enabled and ready, but all I/O queues retired.
+      The kernel adopts the live session before disabling the controller.
 
 allOf:
+  - if:
+      properties:
+        compatible:
+          not:
+            contains:
+              const: apple,t8142-nvme-ans2
+    then:
+      required: [resets]
+      properties:
+        apple,rtkit-handoff:
+          const: nvme-disabled-v1
+    else:
+      properties:
+        apple,rtkit-handoff:
+          enum: [nvme-quiesced-v1, nvme-running-v1]
+
   - if:
       properties:
         compatible:
@@ -113,6 +139,7 @@ allOf:
               enum:
                 - apple,t8132-nvme-ans2
                 - apple,t8140-nvme-ans2
+                - apple,t8142-nvme-ans2
     then:
       properties:
         apple,rtkit-handoff: false
@@ -126,6 +153,7 @@ allOf:
               - apple,t6020-nvme-ans2
               - apple,t6041-nvme-ans2
               - apple,t8140-nvme-ans2
+              - apple,t8142-nvme-ans2
     then:
       properties:
         power-domains:
@@ -146,6 +174,7 @@ allOf:
             enum:
               - apple,t6041-nvme-ans2
               - apple,t8132-nvme-ans2
+              - apple,t8142-nvme-ans2
     then:
       properties:
         reg:
@@ -163,7 +192,6 @@ required:
   - compatible
   - reg
   - reg-names
-  - resets
   - power-domains
   - power-domain-names
   - mboxes

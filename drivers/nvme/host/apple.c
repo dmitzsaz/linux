@@ -36,6 +36,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm_domain.h>
 #include <linux/soc/apple/rtkit.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/soc/apple/sart.h>
 #include <linux/reset.h>
 #include <linux/time64.h>
@@ -206,6 +207,8 @@ struct apple_nvme_hw {
 	bool needs_ioq_registers;
 	/* T8132 needs a PMGR reset when starting a stopped coprocessor. */
 	bool cold_reset;
+	/* Firmware starts quiesced and needs a fresh RTKit handshake. */
+	bool quiesced_boot;
 	u32 max_queue_depth;
 	unsigned long quirks;
 };
@@ -219,6 +222,7 @@ struct apple_nvme {
 	spinlock_t event_lock;
 	bool reset_ready;
 	bool handoff_disabled;
+	bool handoff_quiesced;
 	struct list_head quarantine_node;
 	resource_size_t controller_start;
 	bool quarantined;
@@ -366,12 +370,37 @@ static int apple_nvme_read_handoff(struct apple_nvme *anv)
 	ret = of_property_read_string(anv->dev->of_node, "apple,rtkit-handoff",
 				      &handoff);
 	if (ret == -EINVAL)
-		return 0;
-	if (ret || !anv->hw->needs_ioq_registers ||
-	    strcmp(handoff, "nvme-disabled-v1"))
+		return anv->hw->quiesced_boot ? -ENODATA : 0;
+	if (ret || !anv->hw->needs_ioq_registers)
 		return -EINVAL;
+	if (!strcmp(handoff, "nvme-quiesced-v1")) {
+		if (!anv->hw->quiesced_boot)
+			return -EINVAL;
+		anv->handoff_quiesced = true;
+	} else if (!strcmp(handoff, "nvme-running-v1")) {
+		/* U-Boot completed RTKit startup and retains its live buffers. */
+		if (!anv->hw->quiesced_boot || !apple_nvme_can_adopt_rtkit(anv) ||
+		    readq(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER) ||
+		    readq(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER))
+			return -EIO;
+		return 0;
+	} else if (strcmp(handoff, "nvme-disabled-v1") || anv->hw->quiesced_boot) {
+		return -EINVAL;
+	}
 	anv->handoff_disabled = true;
-	return apple_nvme_can_adopt_rtkit(anv) ? 0 : -EIO;
+	if (!apple_nvme_can_adopt_rtkit(anv))
+		return -EIO;
+	if (anv->handoff_quiesced &&
+	    (readl(anv->mmio_nvme + NVME_REG_CSTS) ||
+	     readq(anv->mmio_nvme + APPLE_ANS_IOSQ_REGISTER) ||
+	     readq(anv->mmio_nvme + APPLE_ANS_IOCQ_REGISTER) ||
+	     !(readl(anv->mmio_nvmmu + APPLE_ANS_LINEAR_SQ_CTRL) &
+	       APPLE_ANS_LINEAR_SQ_EN) ||
+	     readq(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE) ||
+	     readq(anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE) ||
+	     readl(anv->mmio_nvmmu + APPLE_NVMMU_TCB_STAT)))
+		return -EBUSY;
+	return 0;
 }
 
 static inline struct apple_nvme *queue_to_apple_nvme(struct apple_nvme_queue *q)
@@ -1597,15 +1626,19 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	}
 
 	/*
-	 * Post-M4 firmware can be handed over live, but cannot renegotiate HELLO
-	 * and EPMAP across boot stages. Adopt the first healthy inherited session;
-	 * subsequent post-M4 controller resets retain the owned RTKit session.
+	 * Active post-M4 firmware keeps its existing RTKit session. A quiesced
+	 * boot handoff instead needs wake and a fresh HELLO/EPMAP exchange.
+	 * Later controller resets retain the session Linux already owns.
 	 */
 	if (!anv->owns_rtkit && apple_nvme_can_adopt_rtkit(anv)) {
-		ret = apple_rtkit_adopt_running(anv->rtk);
+		if (anv->handoff_quiesced)
+			ret = apple_rtkit_wake(anv->rtk);
+		else
+			ret = apple_rtkit_adopt_running(anv->rtk);
 		if (ret)
 			goto out;
-		dev_dbg(anv->dev, "adopted inherited post-M4 RTKit session\n");
+		dev_dbg(anv->dev, "%s post-M4 RTKit session\n",
+			anv->handoff_quiesced ? "woke quiesced" : "adopted inherited");
 
 		/*
 		 * U-Boot keeps the controller enabled until the mailbox session has
@@ -2237,6 +2270,36 @@ static void apple_nvme_flush_work(struct work_struct *work)
 	}
 }
 
+static int apple_nvme_wait_pmp(struct apple_nvme *anv)
+{
+	struct device_node *entry;
+	int ret;
+
+	if (!of_property_present(anv->dev->of_node, "apple,pmp-report"))
+		return anv->hw->quiesced_boot ? -ENODATA : 0;
+	entry = of_parse_phandle(anv->dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return -EINVAL;
+#if IS_REACHABLE(CONFIG_APPLE_J704_PMP_REPORT)
+	/* Keep the generic NVMe module loadable on other Apple platforms. */
+	{
+		typeof(&j704_pmp_report_wait_ready) wait_ready;
+
+		wait_ready = symbol_get(j704_pmp_report_wait_ready);
+		if (!wait_ready) {
+			ret = -EPROBE_DEFER;
+		} else {
+			ret = wait_ready(entry, msecs_to_jiffies(30000));
+			symbol_put(j704_pmp_report_wait_ready);
+		}
+	}
+#else
+	ret = -ENODEV;
+#endif
+	of_node_put(entry);
+	return ret;
+}
+
 static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2276,6 +2339,12 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 	anv->hw = of_device_get_match_data(&pdev->dev);
 	if (!anv->hw) {
 		ret = -ENODEV;
+		goto out_detach_genpd;
+	}
+
+	ret = apple_nvme_wait_pmp(anv);
+	if (ret) {
+		dev_err_probe(dev, ret, "PMP request is not ready\n");
 		goto out_detach_genpd;
 	}
 
@@ -2347,7 +2416,10 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto out_detach_genpd;
 	}
 
-	anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
+	if (anv->hw->quiesced_boot)
+		anv->reset = devm_reset_control_array_get_optional_exclusive(anv->dev);
+	else
+		anv->reset = devm_reset_control_array_get_exclusive(anv->dev);
 	if (IS_ERR(anv->reset)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->reset),
 				    "Failed to get reset control");
@@ -2412,7 +2484,7 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		dev_dbg(dev, "post-M4 firmware handoff: CC=%#x CSTS=%#x adopt=%d\n",
 			readl(anv->mmio_nvme + NVME_REG_CC),
 			readl(anv->mmio_nvme + NVME_REG_CSTS), inherited_rtkit);
-	if (inherited_rtkit)
+	if (inherited_rtkit && !anv->handoff_quiesced)
 		anv->rtk = apple_rtkit_init_adopted(dev, anv, NULL, 0,
 						    &apple_nvme_rtkit_ops);
 	else
@@ -2695,7 +2767,19 @@ static const struct apple_nvme_hw apple_nvme_t6040_hw = {
 	.quirks = NVME_QUIRK_NO_APST,
 };
 
+/* T8142 retains firmware but starts a new RTKit session after quiesce. */
+static const struct apple_nvme_hw apple_nvme_t8142_hw = {
+	.has_lsq_nvmmu = true,
+	.has_separate_nvmmu = true,
+	.needs_ioq_registers = true,
+	.lsq_in_nvmmu = true,
+	.quiesced_boot = true,
+	.max_queue_depth = 64,
+	.quirks = NVME_QUIRK_NO_APST | NVME_QUIRK_BROKEN_FUA,
+};
+
 static const struct of_device_id apple_nvme_of_match[] = {
+	{ .compatible = "apple,t8142-nvme-ans2", .data = &apple_nvme_t8142_hw },
 	{ .compatible = "apple,t6041-nvme-ans2", .data = &apple_nvme_t6040_hw },
 	{ .compatible = "apple,t8015-nvme-ans2", .data = &apple_nvme_t8015_hw },
 	{ .compatible = "apple,t8103-nvme-ans2", .data = &apple_nvme_t8103_hw },
