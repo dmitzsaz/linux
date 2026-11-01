@@ -13,6 +13,9 @@
 struct device_node;
 struct device;
 
+/* J704 report provider; consumers must depend on APPLE_J704_PMP_REPORT. */
+int j704_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);
+
 #if IS_ENABLED(CONFIG_APPLE_PMP_REPORT)
 int apple_pmp_report_wait_supplier_ready(struct device *supplier, unsigned int timeout_ms);
 int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout);

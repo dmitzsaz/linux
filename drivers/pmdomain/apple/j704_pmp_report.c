@@ -999,11 +999,12 @@ static int apple_pmp_start_init(struct apple_pmp_report *rep)
 
 /*
  * Starts the PMP if no one has yet, and waits for request bit @id to be
- * acknowledged. The caller holds a waiter on @st (st->waiters), which this
- * gives back: teardown waits for it, so @st stays valid until then.
+ * acknowledged (or published for a no-ack entry). The caller holds a waiter
+ * on @st (st->waiters), which this gives back: teardown waits for it, so @st
+ * stays valid until then.
  */
 static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
-				unsigned long timeout)
+				unsigned long timeout, bool needs_ack)
 {
 	u64 status, ack;
 	int ret;
@@ -1021,6 +1022,12 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
 		} else if (!ret) {
 			if (st->result) {
 				ret = st->result;
+			} else if (!needs_ack) {
+				status = readq(st->rep->base + st->rep->offsets->status);
+				ack = readq(st->rep->base + st->rep->offsets->tgt_read);
+				ret = (st->seed & BIT_ULL(id)) &&
+				      apple_pmp_report_status_ready(st->rep, status) &&
+				      (ack & BIT_ULL(id)) ? 0 : -EIO;
 			} else if (!(st->ack & BIT_ULL(id))) {
 				ret = -EINVAL;
 			} else {
@@ -1037,7 +1044,7 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
 }
 
 /**
- * j704_pmp_report_wait_ready() - wait until a PMP report entry is acknowledged
+ * j704_pmp_report_wait_ready() - wait until a PMP request is ready
  * @entry: report entry node whose request must be acknowledged
  * @timeout: in jiffies
  *
@@ -1045,7 +1052,8 @@ static int apple_pmp_start_wait(struct apple_pmp_start *st, u32 id,
  * call starts it.
  *
  * Context: Process context; sleeps.
- * Return: 0 once the PMP runs and has acknowledged @entry, -EPROBE_DEFER
+ * Return: 0 once the PMP runs and has acknowledged @entry, or has its
+ * request published if @entry explicitly has apple,no-ack, -EPROBE_DEFER
  * while the report driver has not probed yet, -ENODEV if no PMP was handed
  * over to this report, -EINVAL if @entry is not one of its acknowledged
  * requests, or the reason the PMP was not started or is not ready.
@@ -1094,7 +1102,8 @@ int j704_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout)
 		goto out;
 	}
 
-	ret = apple_pmp_start_wait(st, id, timeout);
+	ret = apple_pmp_start_wait(st, id, timeout,
+				   !of_property_read_bool(entry, "apple,no-ack"));
 out:
 	of_node_put(parent);
 	return ret;
