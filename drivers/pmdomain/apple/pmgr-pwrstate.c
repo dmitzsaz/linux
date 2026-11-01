@@ -377,10 +377,11 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	struct of_phandle_iterator it;
 	int ret;
 	const char *name;
-	bool active, t8132, strict_state = false;
+	bool active, t8132, t8142, strict_state = false;
 	struct device_node *tvm;
 
 	t8132 = of_device_is_compatible(node, "apple,t8132-pmgr-pwrstate");
+	t8142 = of_device_is_compatible(node, "apple,t8142-pmgr-pwrstate");
 	/*
 	 * The original J713 loader tree exposes domains Linux cannot access.
 	 * The early compatibility adapter supplies the board's explicit status
@@ -436,11 +437,12 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	 */
 	ps->firmware_owned = of_property_read_bool(node, "apple,firmware-owned");
 	/*
-	 * Only T8132 hands over inherited-on domains with this contract. Older
+	 * T8132 and T8142 use this inherited-on contract. Older
 	 * M3 device trees carry the property with another meaning; keep them
 	 * as they were.
 	 */
-	ps->inherited_on = t8132 && of_property_read_bool(node, "apple,inherited-on");
+	ps->inherited_on = (t8132 || t8142) &&
+		of_property_read_bool(node, "apple,inherited-on");
 	if (ps->inherited_on &&
 	    (ps->firmware_owned || of_property_present(node, "apple,min-state") ||
 	     of_property_present(node, "apple,always-on") ||
@@ -471,7 +473,9 @@ static int apple_pmgr_ps_probe(struct platform_device *pdev)
 	if (ps->inherited_on) {
 		ret = apple_pmgr_ps_check_inherited(ps);
 		if (ret)
-			return dev_err_probe(dev, ret, "domain was not handed over active\n");
+			return dev_err_probe(dev, t8142 && ret == -EBUSY ?
+					     -EPROBE_DEFER : ret,
+					     "domain was not handed over active\n");
 		ps->genpd.flags |= GENPD_FLAG_ALWAYS_ON;
 		active = true;
 	} else if (ps->firmware_owned) {

@@ -15,7 +15,9 @@ allOf:
       properties:
         compatible:
           contains:
-            const: apple,t8132-pmgr-pwrstate
+            enum:
+              - apple,t8132-pmgr-pwrstate
+              - apple,t8142-pmgr-pwrstate
       required:
         - compatible
         - apple,inherited-on
