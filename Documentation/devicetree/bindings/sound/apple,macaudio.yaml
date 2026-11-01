@@ -23,6 +23,8 @@ properties:
           - apple,j616-macaudio
           - apple,j616-macaudio-jack
           - apple,j700-macaudio
+          - apple,j704-macaudio
+          - apple,j704-macaudio-speakers
       - const: apple,macaudio
 
   "#address-cells":
