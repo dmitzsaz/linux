@@ -140,11 +140,14 @@ static int j704_pcie_cold_init(void)
 			iounmap(axi);
 		return -ENOMEM;
 	}
-	/* PHY-ready may deassert after its dynamic clock handoff. The clock
-	 * requests/ACKs and released reset are the stable inherited state. Do
-	 * not reset an already running RC when that state is inconsistent. */
-	if (readl(rc + 0x58) & BIT(0)) {
-		if ((readl(glue + 0x20000) & 0x1f) != 0xf ||
+	/* RC+0x58 is a retained acknowledgement: iBoot can leave it set with
+	 * RC+0x50 RUN disabled and the PHY held in reset. The native startup
+	 * producer asserts RUN only after completing the PHY sequence. Adopt
+	 * only a requested, acknowledged RUN with valid PHY clocks/reset;
+	 * never reset an active or partially started controller. */
+	if (readl(rc + 0x50) & BIT(0)) {
+		if (!(readl(rc + 0x58) & BIT(0)) ||
+		    (readl(glue + 0x20000) & 0x1f) != 0xf ||
 		    (readl(glue + 0x20004) & 0x11) != 0x11)
 			ret = -EBUSY;
 		else

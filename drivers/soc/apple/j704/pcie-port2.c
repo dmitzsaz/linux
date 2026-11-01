@@ -58,6 +58,7 @@ static int stage(void)
 		{ 0x144, 0x253770 },  { 0x21c, 0 },
 		{ 0x834, 0 },	      { 0x83c, 0 },
 	};
+	/* AFISOCNI4 is a no_ps software parent, not a physical PS register. */
 	static const u32 gates[] = { 0x280, 0x300, 0x2f0, 0x408, 0x410,
 				     0x520, 0x560, 0x578, 0x580 };
 	void __iomem *common, *phy, *lane, *lane0, *gpio, *port;
@@ -79,14 +80,18 @@ static int stage(void)
 	of_node_put(np);
 	if (IS_ERR(pmgr))
 		return PTR_ERR(pmgr);
-	for (i = 0; i < ARRAY_SIZE(gates); i++) {
+	/* Skip the no_ps parent at index 0. */
+	for (i = 1; i < ARRAY_SIZE(gates); i++) {
 		ret = regmap_read(pmgr, gates[i], &v);
 		if (ret)
 			return ret;
 		pr_debug("J704_SD_STAGE power offset=%#x value=%#x\n", gates[i],
 			v);
-		if ((v & 0xff) != 0xff || (i && v & BIT(28)))
+		if ((v & 0xff) != 0xff || v & BIT(28)) {
+			pr_err("J704_SD_STAGE power not ready: offset=%#x value=%#x\n",
+			       gates[i], v);
 			return -EAGAIN;
+		}
 	}
 
 	common = ioremap_np(RC_COMMON, 0x4000);
@@ -106,8 +111,12 @@ static int stage(void)
 
 	/* Same admission as the port-0 stage: the shared PHY must be initialized and running. */
 	if (!(readl(common + 0x58) & 1) || (readl(phy) & 0x1f) != 0xf ||
-	    (readl(phy + 4) & 0x11) != 0x11)
+	    (readl(phy + 4) & 0x11) != 0x11) {
+		pr_err("J704_SD_STAGE shared PHY not ready: RUN=%#x ACK=%#x ctrl=%#x aux=%#x\n",
+		       readl(common + 0x50), readl(common + 0x58),
+		       readl(phy), readl(phy + 4));
 		return -EAGAIN;
+	}
 
 	pr_debug("J704_SD_STAGE requesting port2 lane clocks; external PERST# untouched\n");
 	change(lane, 0, BIT(0));
