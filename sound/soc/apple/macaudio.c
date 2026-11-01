@@ -2142,6 +2142,43 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.jack_max_vol = CS42L84_DAC_DB(-6),
 };
 
+/*
+ * J704 (T8142, MacBook Pro 14" M5): the AOP design of the A18 (J700) driver,
+ * with the J616s speakers. Two cards, as on the J616s.
+ *
+ * The jack: a CS42L84 on the T8140 component's "cout" back-end, which the
+ * firmware runs as a 64-SCLK frame at 48 kHz (3.072 MHz) with two 32-bit
+ * slots: DSP_A with inverted bit/frame clocks, the codec in TDM mode (as macOS
+ * programs it). Capped at the DAC's 0 dB.
+ */
+struct macaudio_platform_cfg macaudio_j704_cfg = {
+	.fe_dai_names = { "j700-pcm-0", "j700-pcm-1", "j700-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_IF,
+	.primary_bclk_ratio = 64,
+	.fe_cpu_is_platform = true,
+	.jack_max_vol = CS42L84_DAC_DB(0),
+};
+
+/*
+ * The J704 speakers: six SN012776 on the AOP's "spkr" service, exactly the
+ * J616s stream (ADT audio-speaker: 12 MHz, 250-bit frame, six 32-bit playback
+ * slots, twelve 16-bit sense slots), served by the j704_spkr component of the
+ * T8140 driver (front-ends j704-spkr-pcm-N).
+ */
+struct macaudio_platform_cfg macaudio_j704_spk_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	.fe_dai_names = { "j704-spkr-pcm-0", "j704-spkr-pcm-1", "j704-spkr-pcm-2" },
+	.dai_fmt = SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_CBC_CFC |
+		   SND_SOC_DAIFMT_GATED | SND_SOC_DAIFMT_NB_IF,
+	.secondary_bclk_ratio = 250,
+	.fe_cpu_is_platform = true,
+};
+
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
 	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
 };
@@ -2205,6 +2242,10 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio", .data = &macaudio_j616_cfg },
 	/* j616    AID35   cs42l84     -       the jack, a card of its own (AOP-fed) */
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
+	/* j704    AID39   cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j704-macaudio", .data = &macaudio_j704_cfg },
+	/* j704    AID39   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j704-macaudio-speakers", .data = &macaudio_j704_spk_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
 	/* Fallback, jack only */
