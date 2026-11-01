@@ -36,7 +36,8 @@ use kernel::{
         IoBase,
         IoSysMap,
         Mmio,
-        Region, //
+        Region,
+        SysMem, //
     },
     module_platform_driver,
     new_condvar,
@@ -135,7 +136,9 @@ const SETUP_PAGE: usize = 0x4000;
 /// Five message pages plus the reply windows: the endpoints request either
 /// 0x400 or 0x1000 16-byte reply entries, one or four pages, and the five of
 /// them take eight pages in total.
-const SETUP_ARENA_PAGES: usize = 13;
+/// J704 announces more setup endpoints than the A18's five (a 0x400-entry request on
+/// endpoint 0x4 was the first one seen); 64 pages leave room for twelve 1+4-page endpoints.
+const SETUP_ARENA_PAGES: usize = 64;
 const SETUP_MGMT_EP: u8 = 0;
 /// Management message types, in bits 52..60 of the word.
 const SETUP_TYPE_HELLO: u64 = 1;
@@ -157,6 +160,9 @@ const SETUP_BUFFER_ENTRY_SIZE: usize = 16;
 /// The service endpoints that request buffers; boot completes once all of
 /// them have theirs.
 const SETUP_ENDPOINTS: [u8; 5] = [0x20, 0x21, 0x23, 0x30, 0x32];
+/// Endpoint slots: the endpoints come from the firmware's own endpoint map (J704 differs
+/// from the A18 list above, which only remains the fallback when no map arrived).
+const SETUP_MAX_ENDPOINTS: usize = 16;
 const SETUP_BOOT_TIMEOUT_MS: u32 = 15000;
 // A request to a service endpoint: the payload goes into the endpoint's
 // message page, (3 << 60) | length announces it, the firmware answers with a
@@ -879,7 +885,7 @@ impl AFKEndpoint {
         {
             // Replies carry no tag here: until the reply to the abandoned call
             // has arrived, a new call's reply could not be told from it.
-            dev_dbg!(
+            dev_warn!(
                 client.dev,
                 "Endpoint {:#04x} waits for a late reply, call refused",
                 self.index
@@ -938,6 +944,13 @@ impl AFKEndpoint {
         self.seq = self.seq.wrapping_add(1);
         self.calls[slot] = Some(CallSlot::Pending(call.clone(), ret));
         if let Err(e) = rtkit.send_message(self.index, doorbell) {
+            dev_err!(
+                client.dev,
+                "Endpoint {:#04x}: doorbell {:#x} not sent ({:?}); call abandoned",
+                self.index,
+                doorbell,
+                e
+            );
             // The entry is in the ring and the next doorbell delivers it, so
             // its reply still arrives; keep the tag reserved until it does.
             self.calls[slot] = Some(CallSlot::Abandoned);
@@ -999,7 +1012,9 @@ struct SetupState {
     arena: Option<Coherent<[u8]>>,
     /// The next unassigned page of the arena.
     next_page: usize,
-    endpoints: [Option<SetupEndpoint>; SETUP_ENDPOINTS.len()],
+    endpoints: [Option<SetupEndpoint>; SETUP_MAX_ENDPOINTS],
+    /// Service endpoints announced in the endpoint map (bit per endpoint number).
+    announced: [u64; 4],
     map_done: bool,
     ap_ready: bool,
     power_sent: bool,
@@ -1013,7 +1028,8 @@ impl SetupState {
             mbox: None,
             arena: None,
             next_page: 0,
-            endpoints: [None; SETUP_ENDPOINTS.len()],
+            endpoints: [None; SETUP_MAX_ENDPOINTS],
+            announced: [0; 4],
             map_done: false,
             ap_ready: false,
             power_sent: false,
@@ -1027,6 +1043,32 @@ impl SetupState {
 
     fn endpoint_count(&self) -> usize {
         self.endpoints.iter().flatten().count()
+    }
+
+    /// The announced service endpoints (the management endpoint excluded).
+    fn announced_count(&self) -> usize {
+        let mut n = 0usize;
+        for (i, w) in self.announced.iter().enumerate() {
+            let mut w = *w;
+            if i == 0 {
+                w &= !1;
+            }
+            n += w.count_ones() as usize;
+        }
+        n
+    }
+
+    fn is_announced(&self, ep: u8) -> bool {
+        self.announced[usize::from(ep) / 64] & (1u64 << (ep % 64)) != 0
+    }
+
+    /// The number of service endpoints boot waits for: the announced ones, or the A18 list
+    /// when the firmware sent no map.
+    fn expected_count(&self) -> usize {
+        match self.announced_count() {
+            0 => SETUP_ENDPOINTS.len(),
+            n => n,
+        }
     }
 
     fn arena_iova(&self) -> Result<u64> {
@@ -1055,12 +1097,13 @@ impl SetupState {
     /// Boot is complete once the AP power state is on and every service
     /// endpoint has its buffers.
     fn ready(&self) -> bool {
-        self.ap_ready && self.endpoint_count() == SETUP_ENDPOINTS.len()
+        self.ap_ready && self.endpoint_count() >= self.expected_count()
     }
 
     /// Sends one word to a setup-port endpoint. Callers run in process
     /// context, so the send may sleep for room in the mailbox FIFO.
     fn send(&self, ep: u8, word: u64) -> Result<()> {
+        pr_debug!("aop setup port tx: ep {:#04x} word {:#018x}\n", ep, word);
         let mbox = self.mbox.as_ref().ok_or(ENXIO)?;
         mbox.send(
             mailbox::Message {
@@ -1390,6 +1433,7 @@ impl AopData {
             if !rtk.as_mut().has_endpoint(rtk_ep_num) {
                 continue;
             }
+            dev_dbg!(self.dev, "AFK: starting endpoint {:#04x}\n", rtk_ep_num);
             let required =
                 self.required_endpoints.is_empty() || self.required_endpoints.contains(&rtk_ep_num);
             let started = rtk.as_mut().start_endpoint(rtk_ep_num).and_then(|()| {
@@ -1423,6 +1467,13 @@ impl AopData {
             channel,
             endpoint: ep.index,
         };
+        dev_dbg!(
+            self.dev,
+            "EPIC service {:?} announced on endpoint {:#04x} channel {}\n",
+            core::str::from_utf8(name).unwrap_or("?"),
+            ep.index,
+            channel
+        );
         let dev_name = match name {
             b"aop-audio" => c_str!("audio"),
             b"las" => c_str!("las"),
@@ -1864,6 +1915,8 @@ impl AopData {
     }
 
     fn setup_handle(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
+        // Setup messages are available through dynamic debug.
+        dev_dbg!(self.dev, "setup port rx: ep {:#04x} word {:#018x}\n", ep, word);
         if ep == SETUP_MGMT_EP {
             return match (word >> 52) & 0xff {
                 SETUP_TYPE_HELLO => {
@@ -1881,7 +1934,24 @@ impl AopData {
                 }
                 SETUP_TYPE_EPMAP => {
                     // Each fragment of the endpoint map is acknowledged by
-                    // echoing it.
+                    // echoing it. Decoded like the RTKit map: a 32-bit bitmap,
+                    // its base (in units of 32 endpoints) in bits 32..35.
+                    let base = ((word >> 32) & 0x7) as usize * 32;
+                    for bit in 0..32usize {
+                        if word & (1u64 << bit) != 0 {
+                            let ep = base + bit;
+                            st.announced[ep / 64] |= 1u64 << (ep % 64);
+                        }
+                    }
+                    dev_dbg!(
+                        self.dev,
+                        "setup port: endpoint map {:#018x} (announced so far: {:#x} {:#x} {:#x} {:#x})",
+                        word,
+                        st.announced[0],
+                        st.announced[1],
+                        st.announced[2],
+                        st.announced[3]
+                    );
                     st.send(SETUP_MGMT_EP, word)?;
                     if word & SETUP_EPMAP_LAST != 0 {
                         st.map_done = true;
@@ -1939,13 +2009,17 @@ impl AopData {
     /// from the arena.
     fn setup_endpoint_request(&self, st: &mut SetupState, ep: u8, word: u64) -> Result<()> {
         let requested = (word & 0xffff_ffff) as usize;
-        let slot = SETUP_ENDPOINTS
-            .iter()
-            .position(|e| *e == ep)
-            .ok_or(EINVAL)?;
-        if st.endpoints[slot].is_some() || (requested != 0x400 && requested != 0x1000) {
+        dev_dbg!(
+            self.dev,
+            "setup port: endpoint {:#x} requests {:#x} reply entries (announced: {})",
+            ep,
+            requested,
+            st.is_announced(ep)
+        );
+        if st.endpoint_mut(ep).is_some() || (requested != 0x400 && requested != 0x1000) {
             return Err(EINVAL);
         }
+        let slot = st.endpoints.iter().position(|e| e.is_none()).ok_or(ENOSPC)?;
         let rx_pages = (requested * SETUP_BUFFER_ENTRY_SIZE).div_ceil(SETUP_PAGE);
         if st.next_page + 1 + rx_pages > SETUP_ARENA_PAGES {
             return Err(ENOMEM);
@@ -2177,32 +2251,101 @@ impl AopData {
         if let Err(e) = self.setup_wait(&mut st, SETUP_BOOT_TIMEOUT_MS, SetupState::ready) {
             dev_err!(
                 self.dev,
-                "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}): {:?}",
+                "setup port: boot incomplete (AP power on: {}, endpoints: {}/{}, announced {:#x} {:#x} {:#x} {:#x}): {:?}",
                 st.ap_ready,
                 st.endpoint_count(),
-                SETUP_ENDPOINTS.len(),
+                st.expected_count(),
+                st.announced[0],
+                st.announced[1],
+                st.announced[2],
+                st.announced[3],
                 e
             );
             return Err(e);
         }
+        dev_info!(
+            self.dev,
+            "setup port: boot complete, {} endpoints served",
+            st.endpoint_count()
+        );
         Ok(())
     }
 }
 
-struct NoBuffer;
-impl rtkit::Buffer for NoBuffer {
+/// A shared buffer of the RTKit side.
+///
+/// The J704 AOP places some of its buffers itself (a 0xf000-byte request carrying its own IOVA
+/// was refused with EINVAL while the RTKit core had no buffer operations, 2026-10-31). Such a
+/// buffer is already mapped by the firmware's own DART root; the host acknowledges the request
+/// and keeps only a zeroed shadow for the RTKit core's own reads (syslog, crashlog), which
+/// therefore never see the firmware's data. Requests without an IOVA get host memory, as the
+/// RTKit core allocates without these operations.
+enum AopBuffer {
+    Placed { iova: usize, shadow: KVVec<u8> },
+    Host(Coherent<[u8]>),
+}
+
+impl rtkit::Buffer for AopBuffer {
     fn iova(&self) -> Result<usize> {
-        unreachable!()
+        match self {
+            Self::Placed { iova, .. } => Ok(*iova),
+            Self::Host(mem) => usize::try_from(mem.dma_address()).map_err(|_| EINVAL),
+        }
     }
     fn buf(&mut self) -> Result<IoSysMap<'_, Region>> {
-        unreachable!()
+        let (base, len) = match self {
+            Self::Placed { shadow, .. } => (shadow.as_mut_ptr(), shadow.len()),
+            Self::Host(mem) => (mem.as_mut_ptr().cast::<u8>(), mem.size()),
+        };
+        let region = Region::<0>::ptr_try_from_raw_parts_mut(base, len)?;
+        // SAFETY: the memory belongs to `self` and stays valid and kernel accessible for as long
+        // as `self` is borrowed.
+        Ok(IoSysMap::Sys(unsafe { SysMem::new(region) }))
     }
 }
 
 #[vtable]
 impl rtkit::Operations for AopData {
     type Data = Arc<AopData>;
-    type Buffer = NoBuffer;
+    type Buffer = AopBuffer;
+
+    const COPROC_PLACES_BUFFERS: bool = true;
+
+    fn shmem_map(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        iova: usize,
+        size: usize,
+    ) -> Result<AopBuffer> {
+        dev_dbg!(
+            data.dev,
+            "RTKit: firmware-placed buffer of {:#x} bytes at {:#x} acknowledged\n",
+            size,
+            iova
+        );
+        Ok(AopBuffer::Placed {
+            iova,
+            shadow: KVVec::from_elem(0u8, size, GFP_KERNEL)?,
+        })
+    }
+
+    fn shmem_alloc(
+        data: <Self::Data as ForeignOwnable>::Borrowed<'_>,
+        size: usize,
+    ) -> Result<AopBuffer> {
+        // SAFETY: RTKit callbacks run only while the RTKit handle exists, which `remove()` drops
+        // while the device is still bound (see the AFK buffer requests above).
+        let bound = unsafe { data.dev.as_bound() };
+        let mem = Coherent::<u8>::zeroed_slice(bound, size, GFP_KERNEL)?;
+        // Keep firmware log buffers addressable by the RTKit core.
+        dev_dbg!(
+            data.dev,
+            "RTKit: host buffer of {:#x} bytes at {:#x} (cpu {:#x})\n",
+            size,
+            mem.dma_address(),
+            mem.as_mut_ptr().cast::<u8>() as usize
+        );
+        Ok(AopBuffer::Host(mem))
+    }
 
     fn recv_message(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, ep: u8, msg: u64) {
         let Some(index) = afk_endpoint_index(ep) else {
