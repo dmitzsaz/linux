@@ -96,6 +96,8 @@ use kernel::{
     }, //
 };
 
+mod j704_spkr;
+
 const EPIC_SUBTYPE_WRAPPED_CALL: u16 = 0x20;
 const EPIC_SUBTYPE_PRODUCER_REPORT: u16 = 0x20;
 const CALLTYPE_AUDIO_ATTACH_DEVICE: u32 = 0xc3000002;
@@ -556,7 +558,10 @@ struct SndSocT8140AopData {
     dev: ARef<device::Device>,
     adata: Arc<dyn AOP>,
     service: EPICService,
-    ring: Arc<SourceRing>,
+    /// The low-power microphone's source ring; `None` when the trusted side refused the
+    /// binding (J704: lpmic-srvr answers the A18 bind request with 0x2000000000000009), which
+    /// leaves the LPAI PCM out and everything else working.
+    ring: Option<Arc<SourceRing>>,
     ring_bytes: Atomic<u32>,
     sequence: Atomic<u32>,
     /// The low-power microphone PCM holds a reference on `lpai_run`.
@@ -588,6 +593,14 @@ struct SndSocT8140AopData {
     pd_tx0: Option<PowerDomain>,
     pd_leap_mca: Option<PowerDomain>,
     pd_rx0: Option<PowerDomain>,
+    /// J704: a single serializer domain in the DT is attached by the platform core to the
+    /// device itself (named attaches then fail with EEXIST); it is on while the device is,
+    /// so a missing named leaf counts as satisfied.
+    pd_device_level: bool,
+    /// J704: the audio node lists the J616s-style speaker channels ("spkr" on base-ns TX0 and
+    /// "sense"); they belong to the `j704_spkr` component, so the J700 LEAP speaker and tap
+    /// paths of this component stay closed.
+    j704_speakers: bool,
     /// A speaker stream has been triggered and not yet stopped.
     spkr_want_run: AtomicFlag,
     /// A microphone-array stream has been triggered and not yet stopped.
@@ -905,6 +918,9 @@ impl SndSocT8140AopData {
     fn power_up(&self, name: &str, pds: &[&Option<PowerDomain>], attempts: u32) -> Result<()> {
         for (i, slot) in pds.iter().enumerate() {
             let Some(pd) = slot else {
+                if self.pd_device_level {
+                    continue;
+                }
                 dev_err!(self.dev, "{}: power domain not attached\n", name);
                 self.power_down(&pds[..i]);
                 return Err(ENODEV);
@@ -967,6 +983,11 @@ impl SndSocT8140AopData {
     /// microphone is attached for the firmware's lifetime, so hold it in
     /// `runn` around `f`, once its first report has arrived.
     fn with_fabric_raised<R>(&self, f: impl FnOnce() -> Result<R>) -> Result<R> {
+        // J704 without the low-power microphone ring: nothing can raise the fabric this way;
+        // the firmware keeps it up itself after its audio init, so go straight on.
+        if self.ring.is_none() {
+            return f();
+        }
         self.lpai_run_get()?;
         let mut polls = 0;
         while !self.reported.load(Relaxed) && polls < FABRIC_RAISE_POLLS {
@@ -1339,8 +1360,11 @@ impl ReportListener for SndSocT8140AopData {
         // (where `buffer_bytes` was taken) and every triggered state.
         let dma_area = unsafe { (*(*st.substream).runtime).dma_area };
         let buffer_bytes = st.buffer_bytes;
+        let Some(ring) = self.ring.as_ref() else {
+            return Ok(());
+        };
         let new_ptr = copy_span(
-            &self.ring,
+            ring,
             dma_area,
             buffer_bytes,
             ring_bytes,
@@ -1702,9 +1726,7 @@ unsafe extern "C" fn hpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
     }
     // SAFETY: the platform device is live and the channel name is
     // NUL-terminated.
-    let chan = match from_err_ptr(unsafe {
-        bindings::dma_request_chan(data.dev.as_raw(), c"hpai".as_char_ptr())
-    }) {
+    let chan = match request_dma_chan(&data.dev, c"hpai") {
         Ok(chan) => chan,
         Err(e) => {
             dev_err!(data.dev, "hpai: DMA channel unavailable: {:?}\n", e);
@@ -1916,6 +1938,70 @@ fn copy_str(target: &mut [u8], source: &[u8]) -> Result {
 // ---- ASoC component: DPCM front-end PCMs on the ADMAC channels, back-end
 // DAIs on the AOP output services (macaudio's J700 variant links them) ----
 
+unsafe extern "C" {
+    fn of_find_device_by_node(np: *mut bindings::device_node) -> *mut bindings::platform_device;
+    fn device_attach(dev: *mut bindings::device) -> core::ffi::c_int;
+    fn put_device(dev: *mut bindings::device);
+    fn of_node_put(np: *mut bindings::device_node);
+    fn of_property_match_string(
+        np: *const bindings::device_node,
+        propname: *const core::ffi::c_char,
+        string: *const core::ffi::c_char,
+    ) -> core::ffi::c_int;
+    fn __of_parse_phandle_with_args(
+        np: *const bindings::device_node,
+        list_name: *const core::ffi::c_char,
+        cells_name: *const core::ffi::c_char,
+        cell_count: core::ffi::c_int,
+        index: core::ffi::c_int,
+        out_args: *mut bindings::of_phandle_args,
+    ) -> core::ffi::c_int;
+}
+
+/// Request a DMA channel by name. J704: the base-ns DMA controller sits in a
+/// power domain under the audio fabric that only the AOP brings up, so its
+/// boot-time probe is deferred and may never be retried once the fabric is
+/// up. When a request is deferred, attach the provider named by `dmas` and
+/// retry once.
+fn request_dma_chan(dev: &device::Device, name: &core::ffi::CStr) -> Result<*mut bindings::dma_chan> {
+    // SAFETY: the device is live and the channel name is NUL-terminated.
+    match from_err_ptr(unsafe { bindings::dma_request_chan(dev.as_raw(), name.as_char_ptr()) }) {
+        Err(e) if e == EPROBE_DEFER => {}
+        other => return other,
+    }
+    // SAFETY: the device's OF node outlives the device; the provider node and
+    // device are only used while their references are held.
+    unsafe {
+        let np = (*dev.as_raw()).of_node;
+        if !np.is_null() {
+            let idx = of_property_match_string(np, c"dma-names".as_char_ptr(), name.as_char_ptr());
+            let mut args: bindings::of_phandle_args = mem::zeroed();
+            if idx >= 0
+                && __of_parse_phandle_with_args(
+                    np,
+                    c"dmas".as_char_ptr(),
+                    c"#dma-cells".as_char_ptr(),
+                    0,
+                    idx,
+                    &mut args,
+                ) == 0
+            {
+                let pdev = of_find_device_by_node(args.np);
+                of_node_put(args.np);
+                if !pdev.is_null() {
+                    let provider = ptr::addr_of_mut!((*pdev).dev);
+                    let ret = device_attach(provider);
+                    dev_info!(dev, "DMA provider for {:?} attached on demand ({})\n", name, ret);
+                    put_device(provider);
+                }
+            }
+        }
+    }
+    // SAFETY: as above.
+    from_err_ptr(unsafe { bindings::dma_request_chan(dev.as_raw(), name.as_char_ptr()) })
+}
+
+
 /// Front-end PCM DAIs ("j700-pcm-N"): 0 the jack (playback and the headset
 /// microphone), 1 the speaker (playback only), 2 the speaker tap (capture).
 const FE_COUNT: usize = 3;
@@ -2107,6 +2193,9 @@ unsafe extern "C" fn asoc_pcm_open(
         return ENODEV.to_errno();
     };
     let leap = fe == FE_SPKR;
+    if data.j704_speakers && fe != 0 {
+        return ENODEV.to_errno();
+    }
     if leap {
         if let Err(e) = data.power_up_raising(data.spkr.name, &data.spkr_domains()) {
             return e.to_errno();
@@ -2114,9 +2203,7 @@ unsafe extern "C" fn asoc_pcm_open(
     }
     // SAFETY: the platform device is live and the channel name is
     // NUL-terminated.
-    let chan = match from_err_ptr(unsafe {
-        bindings::dma_request_chan(data.dev.as_raw(), name.as_char_ptr())
-    }) {
+    let chan = match request_dma_chan(&data.dev, name) {
         Ok(chan) => chan,
         Err(e) => {
             dev_err!(
@@ -2850,6 +2937,7 @@ impl AsocContext {
             sync_stop: Some(asoc_pcm_sync_stop),
             pointer: Some(asoc_pcm_pointer),
             copy: Some(asoc_pcm_copy),
+            of_xlate_dai_name: Some(asoc_of_xlate_dai_name),
             ..Default::default()
         };
         Ok(KBox::new(
@@ -2866,6 +2954,31 @@ impl AsocContext {
     }
 }
 
+/// The DAI names by table index (see `dai_drivers`).
+const DAI_NAMES: [&CStr; DAI_COUNT] = [c"cout", c"j700-pcm-0", c"j700-pcm-1", c"j700-pcm-2", c"spkr"];
+
+/// `sound-dai = <&aop_audio N>`: this component answers its own table indices. Another index
+/// (the J704 speaker component's) defers: ASoC asks the next component on the node, and a card
+/// that probes before that component registered waits for it instead of failing.
+///
+/// # Safety
+///
+/// Called by ASoC with live arguments.
+unsafe extern "C" fn asoc_of_xlate_dai_name(
+    _component: *mut bindings::snd_soc_component,
+    args: *const bindings::of_phandle_args,
+    dai_name: *mut *const kernel::ffi::c_char,
+) -> i32 {
+    // SAFETY: by the caller's contract.
+    unsafe {
+        if (*args).args_count != 1 || (*args).args[0] as usize >= DAI_COUNT {
+            return EPROBE_DEFER.to_errno();
+        }
+        *dai_name = DAI_NAMES[(*args).args[0] as usize].as_char_ptr();
+    }
+    0
+}
+
 struct SndSocT8140AopDriver {
     card: *mut bindings::snd_card,
     data: Arc<SndSocT8140AopData>,
@@ -2873,6 +2986,8 @@ struct SndSocT8140AopDriver {
     asoc_registered: bool,
     lid_registered: bool,
     closed: AtomicFlag,
+    /// J704: the speaker component, registered after this one and dropped after `teardown`.
+    spkr: Option<j704_spkr::SpeakerComponent>,
 }
 
 // SAFETY: the raw card pointer is only used from probe, unbind and drop,
@@ -2929,16 +3044,19 @@ impl SndSocT8140AopDriver {
             asoc_registered: false,
             lid_registered: false,
             closed: AtomicFlag::new(false),
+            spkr: None,
         };
 
         // The low-power microphone: its ring is reported to us by the
         // firmware for the AOP's lifetime.
-        data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
-        data.set_channel_control()?;
-        data.read_geometry()?;
-        let listener: Arc<dyn ReportListener> = data.clone();
-        data.adata
-            .add_report_listener(data.service, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
+        if data.ring.is_some() {
+            data.attach_device(AUDIO_DEV_LPAI, "lpai")?;
+            data.set_channel_control()?;
+            data.read_geometry()?;
+            let listener: Arc<dyn ReportListener> = data.clone();
+            data.adata
+                .add_report_listener(data.service, EPIC_SUBTYPE_PRODUCER_REPORT, listener)?;
+        }
 
         // SAFETY: FFI call with the live device and the module; `this.card` receives the new card.
         let ret = unsafe {
@@ -2980,7 +3098,9 @@ impl SndSocT8140AopDriver {
             return Err(e);
         }
 
-        this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
+        if data.ring.is_some() {
+            this.new_pcm(0, c"lpai", c"Low-Power Microphone", &Self::LPAI_OPS)?;
+        }
         this.new_pcm(1, c"hpai", c"High-Quality Microphone", &Self::HPAI_OPS)?;
 
         // Both microphones' jack: unplugged while a lid is closed.
@@ -3033,6 +3153,13 @@ impl SndSocT8140AopDriver {
             return Err(Error::from_errno(ret));
         }
         this.asoc_registered = true;
+        if data.j704_speakers {
+            // Its failure costs the speakers only.
+            match j704_spkr::SpeakerComponent::register(data.clone()) {
+                Ok(c) => this.spkr = Some(c),
+                Err(e) => dev_err!(data.dev, "speaker component not registered: {:?}\n", e),
+            }
+        }
         Ok(this)
     }
 
@@ -3198,7 +3325,10 @@ unsafe extern "C" fn hpai_pcm_hw_params(
 kernel::of_device_table!(
     OF_TABLE,
     <SndSocT8140AopDriver as platform::Driver>::IdInfo,
-    [(of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ())]
+    [
+        (of::DeviceId::new(c_str!("apple,t8142-aop-audio")), ()),
+        (of::DeviceId::new(c_str!("apple,t8140-aop-audio")), ()),
+    ]
 );
 
 impl platform::Driver for SndSocT8140AopDriver {
@@ -3229,11 +3359,22 @@ impl platform::Driver for SndSocT8140AopDriver {
         // owned by the AOP driver because the firmware binds it once per boot.
         // SAFETY: no DMA is in flight on this device yet.
         unsafe { pdev.dma_set_mask_and_coherent(DmaMask::new::<42>())? };
-        let ring = adata.source_ring(pdev.as_ref(), RING_BYTES)?;
+        let ring = match adata.source_ring(pdev.as_ref(), RING_BYTES) {
+            Ok(ring) => Some(ring),
+            Err(e) => {
+                dev_warn!(
+                    pdev.as_ref(),
+                    "low-power microphone ring not bound ({:?}); its PCM is left out\n",
+                    e
+                );
+                None
+            }
+        };
 
         // The serializer leaves.  A missing one only disables the paths that
         // need it; those fail to open with ENODEV.
         let mut pds: [Option<PowerDomain>; 5] = [None, None, None, None, None];
+        let mut pd_device_level = false;
         for (slot, (name, dt_name)) in pds.iter_mut().zip([
             ("mca1", c"mca1"),
             ("mca0", c"mca0"),
@@ -3244,12 +3385,16 @@ impl platform::Driver for SndSocT8140AopDriver {
             match PowerDomain::attach(&dev, name, dt_name) {
                 Ok(Some(pd)) => *slot = Some(pd),
                 Ok(None) => dev_warn!(dev, "no {} power domain\n", name),
+                Err(e) if e == EEXIST => pd_device_level = true,
                 Err(e) => dev_warn!(dev, "{} power domain attach failed: {:?}\n", name, e),
             }
         }
         let [pd_mca1, pd_mca0, pd_tx0, pd_leap_mca, pd_rx0] = pds;
 
         let fwnode = pdev.as_ref().fwnode().ok_or(ENOENT)?;
+        let j704_speakers = [c"spkr", c"sense"]
+            .iter()
+            .all(|name| fwnode.property_match_string(c"dma-names", name).is_ok());
         let data = Arc::pin_init(
             pin_init!(SndSocT8140AopData {
                 dev,
@@ -3273,6 +3418,8 @@ impl platform::Driver for SndSocT8140AopDriver {
                 pd_tx0,
                 pd_leap_mca,
                 pd_rx0,
+                pd_device_level,
+                j704_speakers,
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
