@@ -103,6 +103,7 @@ config DRM_APPLE_DISPLAY_KUNIT_TEST
 config DRM_APPLE_J704_EXT
 	tristate "Apple J704 external display processor"
 	depends on DRM_APPLE = m
+	depends on APPLE_J704_PMP_REPORT
 	help
 	  Build the independently tested J704 external DCP driver as
 	  appledrmext. Its source snapshot is kept separate from internal

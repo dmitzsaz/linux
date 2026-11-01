@@ -1394,7 +1394,11 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp) && !late_hpd) {
+	/* A Type-C borrower leaves this RemotePort's logical HPD low. The
+	 * J704 HDMI converter keeps its physical HPD high across the handover,
+	 * so returning to HDMI must assert logical HPD before waiting for the
+	 * firmware's link configuration too. */
+	if ((dcp_is_typec_output(dcp) || dcp_j704_hdmi(dcp)) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
@@ -4062,6 +4066,27 @@ static int dcp_ext_wait_pmp(struct apple_dcp *dcp)
 	return 0;
 }
 
+/*
+ * The fixed HDMI PHY is configured during probe, before component bind. Its
+ * PMP request must already be acknowledged: configuring it while the PMP is
+ * halted can leave software tracking a powered AUX block that never came up.
+ * Older runtime trees arrange this ordering themselves and have no phandle.
+ */
+static int dcp_j704_wait_pmp(struct device *dev)
+{
+	struct device_node *entry;
+	int ret;
+
+	if (!of_property_present(dev->of_node, "apple,pmp-report"))
+		return 0;
+	entry = of_parse_phandle(dev->of_node, "apple,pmp-report", 0);
+	if (!entry)
+		return -EINVAL;
+	ret = j704_pmp_report_wait_ready(entry, msecs_to_jiffies(30000));
+	of_node_put(entry);
+	return ret;
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -4580,6 +4605,13 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 
 	if (dcp_session_retained(dev))
 		return dev_err_probe(dev, -EBUSY, "Previous live DCP session requires a reboot\n");
+
+	/* Admit the HDMI PHY power request before any hardware setup. */
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcpext-v27")) {
+		ret = dcp_j704_wait_pmp(dev);
+		if (ret)
+			return dev_err_probe(dev, ret, "HDMI power request not ready\n");
+	}
 
 	/* Reject unsupported external firmware before replacing the boot display. */
 	if (of_device_is_compatible(dev->of_node, "apple,t8140-dcpext") &&

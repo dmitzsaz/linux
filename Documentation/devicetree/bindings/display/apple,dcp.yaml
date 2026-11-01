@@ -228,8 +228,9 @@ properties:
   apple,pmp-report:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      PMP report entry for this coprocessor's display request. The display
-      firmware runs only once the PMP has acknowledged it.
+      PMP report entry for this display path's power request, including a
+      fixed-output PHY. The path is configured only once the PMP has
+      acknowledged it.
 
   apple,typec-mux-indices:
     $ref: /schemas/types.yaml#/definitions/uint32-array
