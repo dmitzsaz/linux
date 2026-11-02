@@ -12,9 +12,11 @@
 #include <linux/rculist.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/thermal.h>
 #include <linux/soc/apple/pmp-telemetry.h>
 #include <linux/soc/apple/pmp-temps.h>
 #include <linux/soc/apple/pmp-power-policy.h>
+#include "pmp-t8142-temps.h"
 
 bool apple_pmp_telemetry_retained_board(void)
 {
@@ -35,6 +37,7 @@ struct apple_pmp_telemetry {
 	spinlock_t gpu_lock;
 	struct apple_pmp_gpu_lease gpu;
 	u64 generation;
+	struct apple_pmp_t8142_temps *t8142;
 };
 
 static bool apple_pmp_telemetry_online(const struct apple_pmp_telemetry *sensors)
@@ -58,7 +61,8 @@ int apple_pmp_telemetry_get_hotspot(const struct device_node *np, long *value)
 			ret = -ENODEV;
 			break;
 		}
-		ret = apple_pmp_temp_hotspot(sensors->sram, value);
+		ret = sensors->t8142 ? apple_pmp_t8142_hotspot(sensors->t8142, value) :
+			apple_pmp_temp_hotspot(sensors->sram, value);
 		/* A crash concurrent with the snapshot invalidates the result. */
 		if (!apple_pmp_telemetry_online(sensors))
 			ret = -ENODEV;
@@ -185,6 +189,12 @@ static int apple_pmp_sensor_read(void *cookie, unsigned int channel,
 	struct apple_pmp_telemetry *sensors = cookie;
 	int ret;
 
+	if (sensors->t8142) {
+		if (!apple_pmp_telemetry_online(sensors))
+			return -ENODEV;
+		ret = apple_pmp_t8142_sample(sensors->t8142, channel, value);
+		return apple_pmp_telemetry_online(sensors) ? ret : -ENODEV;
+	}
 	if (channel >= PMP_TEMP_CHANNELS)
 		return -EINVAL;
 	if (!apple_pmp_telemetry_online(sensors))
@@ -198,6 +208,13 @@ static umode_t apple_pmp_hwmon_visible(const void *data,
 				       enum hwmon_sensor_types type, u32 attr,
 				       int channel)
 {
+	const struct apple_pmp_telemetry *sensors = data;
+
+	if (sensors->t8142)
+		return type == hwmon_temp && channel >= 0 &&
+		       channel <= sensors->t8142->count &&
+		       (attr == hwmon_temp_input || attr == hwmon_temp_label ||
+			attr == hwmon_temp_fault) ? 0444 : 0;
 	return type == hwmon_temp && channel >= 0 &&
 			       channel < PMP_TEMP_CHANNELS &&
 			       (attr == hwmon_temp_input ||
@@ -211,7 +228,24 @@ static int apple_pmp_hwmon_read(struct device *dev,
 				int channel, long *value)
 {
 	struct apple_pmp_telemetry *sensors = dev_get_drvdata(dev);
+	long sample;
+	int ret;
 
+	if (sensors->t8142) {
+		if (type != hwmon_temp || channel < 0 ||
+		    channel > sensors->t8142->count ||
+		    (attr != hwmon_temp_input && attr != hwmon_temp_fault))
+			return -EOPNOTSUPP;
+		ret = channel ? apple_pmp_sensor_read(sensors, channel - 1, &sample) :
+			apple_pmp_telemetry_get_hotspot(sensors->dev->of_node, &sample);
+		if (attr == hwmon_temp_fault) {
+			*value = !!ret;
+			return 0;
+		}
+		if (!ret)
+			*value = sample;
+		return ret;
+	}
 	if (type != hwmon_temp || attr != hwmon_temp_input)
 		return -EOPNOTSUPP;
 	if (channel < 0 || channel >= PMP_TEMP_CHANNELS)
@@ -228,6 +262,15 @@ static int apple_pmp_hwmon_label(struct device *dev,
 				 enum hwmon_sensor_types type, u32 attr,
 				 int channel, const char **label)
 {
+	struct apple_pmp_telemetry *sensors = dev_get_drvdata(dev);
+
+	if (sensors->t8142) {
+		if (type != hwmon_temp || attr != hwmon_temp_label || channel < 0 ||
+		    channel > sensors->t8142->count)
+			return -EOPNOTSUPP;
+		*label = channel ? sensors->t8142->names[channel - 1] : "CPU die (PMP)";
+		return 0;
+	}
 	if (type != hwmon_temp || attr != hwmon_temp_label || channel < 0 ||
 	    channel >= PMP_TEMP_CHANNELS)
 		return -EOPNOTSUPP;
@@ -272,6 +315,27 @@ static void apple_pmp_telemetry_release(void *data)
 	synchronize_rcu();
 }
 
+static int apple_pmp_cpu_temperature(struct thermal_zone_device *zone, int *value)
+{
+	struct apple_pmp_telemetry *sensors = thermal_zone_device_priv(zone);
+	long sample;
+	int ret;
+
+	ret = apple_pmp_telemetry_get_hotspot(sensors->dev->of_node, &sample);
+	if (!ret)
+		*value = sample;
+	return ret;
+}
+
+static const struct thermal_zone_device_ops apple_pmp_cpu_thermal_ops = {
+	.get_temp = apple_pmp_cpu_temperature,
+};
+
+static void apple_pmp_cpu_thermal_unregister(void *data)
+{
+	thermal_zone_device_unregister(data);
+}
+
 int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 				 size_t size, void __iomem *asc)
 {
@@ -279,16 +343,54 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	struct apple_pmp_telemetry *sensors;
 	struct platform_device *child;
 	struct device *hwmon;
+	const struct hwmon_chip_info *chip = &apple_pmp_hwmon_chip;
+	bool t8142 = of_machine_is_compatible("apple,j704") &&
+		     of_device_is_compatible(dev->of_node, "apple,t8142-pmp-v2");
 	int ret;
 
-	if (!of_device_is_compatible(dev->of_node, "apple,t8132-pmp-v2"))
+	if (!t8142 && !of_device_is_compatible(dev->of_node, "apple,t8132-pmp-v2"))
 		return 0;
-	if (size < apple_pmp_temp_records[PMP_TEMP_CHANNELS - 1].offset +
+	if (!t8142 && size < apple_pmp_temp_records[PMP_TEMP_CHANNELS - 1].offset +
 			   PMP_TEMP_RECORD_SIZE)
 		return -EINVAL;
 	sensors = devm_kzalloc(dev, sizeof(*sensors), GFP_KERNEL);
 	if (!sensors)
 		return -ENOMEM;
+	if (t8142) {
+		struct hwmon_chip_info *dynamic_chip;
+		struct hwmon_channel_info *channel;
+		const struct hwmon_channel_info **info;
+		const u8 *dt;
+		u32 *config;
+		int dt_size;
+		unsigned int i;
+
+		sensors->t8142 = devm_kzalloc(dev, sizeof(*sensors->t8142), GFP_KERNEL);
+		if (!sensors->t8142)
+			return -ENOMEM;
+		sensors->t8142->sram = sram;
+		sensors->t8142->size = size;
+		dt = of_get_property(dev->of_node, "apple,tunable-temp-sensor", &dt_size);
+		ret = dt ? apple_pmp_t8142_prepare(sensors->t8142, dt, dt_size) : -ENOENT;
+		if (ret) {
+			dev_warn(dev, "PMP temperature layout not supported: %d\n", ret);
+			return 0;
+		}
+		dynamic_chip = devm_kzalloc(dev, sizeof(*dynamic_chip), GFP_KERNEL);
+		channel = devm_kzalloc(dev, sizeof(*channel), GFP_KERNEL);
+		info = devm_kcalloc(dev, 2, sizeof(*info), GFP_KERNEL);
+		config = devm_kcalloc(dev, sensors->t8142->count + 2, sizeof(*config), GFP_KERNEL);
+		if (!dynamic_chip || !channel || !info || !config)
+			return -ENOMEM;
+		for (i = 0; i <= sensors->t8142->count; i++)
+			config[i] = HWMON_T_INPUT | HWMON_T_LABEL | HWMON_T_FAULT;
+		channel->type = hwmon_temp;
+		channel->config = config;
+		info[0] = channel;
+		dynamic_chip->ops = &apple_pmp_hwmon_ops;
+		dynamic_chip->info = info;
+		chip = dynamic_chip;
+	}
 	sensors->dev = dev;
 	INIT_LIST_HEAD(&sensors->list);
 	ret = devm_add_action_or_reset(dev, apple_pmp_telemetry_release,
@@ -305,9 +407,23 @@ int apple_pmp_telemetry_register(struct device *dev, void __iomem *sram,
 	mutex_unlock(&apple_pmp_telemetry_lock);
 	if (IS_REACHABLE(CONFIG_HWMON)) {
 		hwmon = devm_hwmon_device_register_with_info(
-			dev, "apple_pmp", sensors, &apple_pmp_hwmon_chip, NULL);
+			dev, "apple_pmp", sensors, chip, NULL);
 		if (IS_ERR(hwmon))
 			return PTR_ERR(hwmon);
+	}
+	/* J704's temperature reader does not enable the T8132 control policy. */
+	if (t8142) {
+		struct thermal_zone_device *zone;
+
+		if (IS_REACHABLE(CONFIG_THERMAL)) {
+			zone = thermal_tripless_zone_device_register("cpu-thermal", sensors,
+						&apple_pmp_cpu_thermal_ops, NULL);
+			if (IS_ERR(zone))
+				return PTR_ERR(zone);
+			return devm_add_action_or_reset(dev, apple_pmp_cpu_thermal_unregister,
+						       zone);
+		}
+		return 0;
 	}
 	data.read = apple_pmp_sensor_read;
 	data.cookie = sensors;
