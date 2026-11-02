@@ -695,6 +695,35 @@ static void cd321x_dp_sid_event(struct cd321x *cd321x)
 	dev_dbg(cd321x->tps.dev, "DP status %#x\n", rx);
 }
 
+/*
+ * The router can bind after the port: a device tree overlay that adds it at
+ * runtime gives the router a device link to this controller, so the port
+ * probes first and continues without it. Look it up again once a USB4 or
+ * Thunderbolt link needs it.
+ */
+static void cd321x_tbt_switch_late(struct cd321x *cd321x)
+{
+	struct typec_thunderbolt_switch *sw;
+
+	if (cd321x->tbt_switch || !cd321x->tbt_fwnode)
+		return;
+
+	sw = fwnode_typec_thunderbolt_switch_get(cd321x->tbt_fwnode);
+	if (IS_ERR_OR_NULL(sw))
+		return;
+
+	/* The notifier was registered against no switch, which is a no-op. */
+	if (typec_thunderbolt_switch_register_notifier(sw, &cd321x->tbt_notifier)) {
+		typec_thunderbolt_switch_put(sw);
+		return;
+	}
+	cd321x->tbt_notifier_registered = true;
+	cd321x->tbt_switch = sw;
+	fwnode_handle_put(cd321x->tbt_fwnode);
+	cd321x->tbt_fwnode = NULL;
+	dev_info(cd321x->tps.dev, "USB4/Thunderbolt router found after probe\n");
+}
+
 static int cd321x_typec_update_mode(struct tps6598x *tps,
 				    struct cd321x_status *st, bool *display_busy,
 				    bool *held)
@@ -708,6 +737,9 @@ static int cd321x_typec_update_mode(struct tps6598x *tps,
 
 	*display_busy = false;
 	*held = false;
+	if (st->data_status & (CD321X_DATA_STATUS_USB4_CONNECTION |
+			       TPS_DATA_STATUS_TBT_CONNECTION))
+		cd321x_tbt_switch_late(cd321x);
 	if (!(st->data_status & TPS_DATA_STATUS_DATA_CONNECTION)) {
 		if (cd321x->state_valid && cd321x->state.mode == TYPEC_STATE_SAFE)
 			return 0;
@@ -2161,6 +2193,8 @@ cd321x_register_port(struct tps6598x *tps, struct fwnode_handle *fwnode)
 	if (ret)
 		goto err_put_switch;
 	cd321x->tbt_notifier_registered = true;
+	if (!cd321x->tbt_switch)
+		cd321x->tbt_fwnode = fwnode_handle_get(fwnode);
 
 	return 0;
 
@@ -2196,6 +2230,8 @@ cd321x_unregister_port(struct tps6598x *tps)
 	cd321x_stop_work(cd321x);
 	fwnode_handle_put(cd321x->connector_fwnode);
 	cd321x->connector_fwnode = NULL;
+	fwnode_handle_put(cd321x->tbt_fwnode);
+	cd321x->tbt_fwnode = NULL;
 	typec_thunderbolt_switch_put(cd321x->tbt_switch);
 	cd321x->tbt_switch = NULL;
 	typec_mux_put(cd321x->mux);

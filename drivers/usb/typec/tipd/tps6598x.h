@@ -431,6 +431,8 @@ struct cd321x {
 	/* SN201202x: the partner's DP status is current for this DP connection */
 	bool dp_sid_valid;
 	struct typec_thunderbolt_switch *tbt_switch;
+	/* Connector to look the router up from when it bound after the port. */
+	struct fwnode_handle *tbt_fwnode;
 	struct notifier_block tbt_notifier;
 	bool tbt_notifier_registered;
 	atomic_t link_event;
