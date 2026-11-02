@@ -156,6 +156,9 @@ const REPORT_MIN_LEN: usize = 0x68;
 /// ADMAC.
 const HPAI_RATE: u32 = 48000;
 const HPAI_CHANNELS: u32 = 2;
+/// T8142 (J704): the array has three microphones; the ADT stream format and
+/// the native consumer both take packed float32 frames of three channels.
+const HPAI_CHANNELS_T8142: u32 = 3;
 
 /// Firmware power requests carry a timestamp in the 24 MHz always-on
 /// timebase; the architected counter runs at a different rate (1 GHz on
@@ -601,6 +604,9 @@ struct SndSocT8140AopData {
     /// "sense"); they belong to the `j704_spkr` component, so the J700 LEAP speaker and tap
     /// paths of this component stay closed.
     j704_speakers: bool,
+    /// Channels of the microphone-array stream: [`HPAI_CHANNELS`], or
+    /// [`HPAI_CHANNELS_T8142`] on the J704.
+    hpai_channels: u32,
     /// A speaker stream has been triggered and not yet stopped.
     spkr_want_run: AtomicFlag,
     /// A microphone-array stream has been triggered and not yet stopped.
@@ -1738,8 +1744,8 @@ unsafe extern "C" fn hpai_pcm_open(substream: *mut bindings::snd_pcm_substream) 
     hw.rates = bindings::SNDRV_PCM_RATE_48000;
     hw.rate_min = HPAI_RATE;
     hw.rate_max = HPAI_RATE;
-    hw.channels_min = HPAI_CHANNELS;
-    hw.channels_max = HPAI_CHANNELS;
+    hw.channels_min = data.hpai_channels;
+    hw.channels_max = data.hpai_channels;
     let ret = pcm_open_dmaengine(
         substream,
         chan,
@@ -3311,8 +3317,15 @@ unsafe extern "C" fn hpai_pcm_hw_params(
     if rc < 0 {
         return rc;
     }
-    // One stereo frame per burst.
-    cfg.src_port_window_size = HPAI_CHANNELS;
+    // SAFETY: ALSA calls this op with a live substream of the HPAI PCM.
+    let data = unsafe { pcm_data(substream) };
+    // One frame per burst where the ADMAC can signal it: its frame-size field
+    // encodes 1, 2 or 4 words, so a three-microphone frame moves as single
+    // words (the stream starts on the first channel of a frame).
+    cfg.src_port_window_size = match data.hpai_channels {
+        n @ (2 | 4) => n,
+        _ => 1,
+    };
     // SAFETY: `chan` is the live channel behind this substream's dmaengine runtime.
     unsafe {
         match (*(*chan).device).device_config {
@@ -3395,6 +3408,14 @@ impl platform::Driver for SndSocT8140AopDriver {
         let j704_speakers = [c"spkr", c"sense"]
             .iter()
             .all(|name| fwnode.property_match_string(c"dma-names", name).is_ok());
+        let hpai_channels = if fwnode
+            .property_match_string(c"compatible", c"apple,t8142-aop-audio")
+            .is_ok()
+        {
+            HPAI_CHANNELS_T8142
+        } else {
+            HPAI_CHANNELS
+        };
         let data = Arc::pin_init(
             pin_init!(SndSocT8140AopData {
                 dev,
@@ -3420,6 +3441,7 @@ impl platform::Driver for SndSocT8140AopDriver {
                 pd_rx0,
                 pd_device_level,
                 j704_speakers,
+                hpai_channels,
                 spkr_want_run: AtomicFlag::new(false),
                 hpai_want_run: AtomicFlag::new(false),
                 spkr_volume: Atomic::new(SPKR_VOLUME_MAX),
