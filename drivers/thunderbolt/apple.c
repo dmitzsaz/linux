@@ -82,6 +82,7 @@
 #include <linux/delay.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iommu.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
@@ -1164,9 +1165,25 @@ static irqreturn_t apple_cio_ring_irq(int irq, void *data)
 	struct tb_ring *ring = data;
 	struct apple_nhi *anhi = nhi_to_anhi(ring->nhi);
 	unsigned int idx = apple_cio_ring_index(ring);
+	u32 status;
 
 	guard(spinlock)(&ring->nhi->lock);
 	guard(spinlock)(&ring->lock);
+
+	/*
+	 * Only this ring's status bit is acknowledged below. A line that
+	 * actually belongs to another ring would stay asserted for ever, so do
+	 * not claim it: the core then disables a line nobody handles instead
+	 * of the CPU spinning in this handler.
+	 */
+	status = readl(anhi->nhi_base + APPLE_CIO_NHI_IRQ_STATUS);
+	if (!(status & BIT(idx))) {
+		dev_warn_ratelimited(anhi->dev,
+				     "IRQ %d of ring %u%s %u fired without its status bit (status %#x)\n",
+				     irq, ring->hop, ring->is_tx ? " TX" : " RX", idx,
+				     status);
+		return IRQ_NONE;
+	}
 
 	writel(BIT(idx), anhi->nhi_base + APPLE_CIO_NHI_IRQ_STATUS);
 	if (!ring->running)
@@ -1994,11 +2011,22 @@ static int apple_nhi_probe(struct platform_device *pdev)
 	int cap_apple;
 	int ret = 0;
 
+	/* of_device_is_compatible() returns a match score, not a bool. */
 	if (acio->type7 !=
-	    of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
+	    !!of_device_is_compatible(pdev->dev.of_node, "apple,t8142-usb4-nhi")) {
 		ret = dev_err_probe(&pdev->dev, -EINVAL, "ACIO/NHI generation mismatch\n");
 		goto err;
 	}
+
+	/*
+	 * The rings must never run untranslated. The NHI and its DART are both
+	 * created when the ACIO starts; once the driver core has stopped waiting
+	 * for missing suppliers it would probe the NHI before its DART bound and
+	 * hand the hardware physical ring addresses. Wait for the DART instead.
+	 */
+	if (of_property_present(pdev->dev.of_node, "iommus") &&
+	    !device_iommu_mapped(&pdev->dev))
+		return -EPROBE_DEFER;
 
 	anhi = devm_kzalloc(&pdev->dev, sizeof(*anhi), GFP_KERNEL);
 	if (!anhi) {
