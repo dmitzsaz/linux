@@ -1691,6 +1691,33 @@ static int dcp_t8132_wait_teardown_answers(struct apple_dcp *dcp, u32 port,
 	return 0;
 }
 
+/* hpd_mutex protects the request until both withdrawal calls are acknowledged. */
+static int dcp_dptx_withdraw_locked(struct apple_dcp *dcp, u32 port)
+{
+	bool fixed = dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_is_typec_output(dcp);
+	int ret;
+
+	lockdep_assert_held(&dcp->hpd_mutex);
+	if (fixed)
+		WRITE_ONCE(dcp->fixed_link_held, true);
+	if (!dptx_service_available(&dcp->dptxport[port]))
+		return -ENODEV;
+	ret = (dcp_is_typec_output(dcp) || fixed) ?
+	      dptxport_set_hpd(dcp->dptxport[port].service, false) : 0;
+	if (!ret)
+		ret = dptxport_release_display(dcp->dptxport[port].service);
+	if (ret)
+		return ret;
+
+	dcp->dptxport[port].connected = false;
+	if (fixed) {
+		/* A withdrawn attempt cannot reserve a pipeline for the converter. */
+		WRITE_ONCE(dcp->fixed_link_held, false);
+		dcp_fixed_sink_hotplug(dcp, false);
+	}
+	return 0;
+}
+
 /*
  * Connect DPTX port @port. On failure, @retryable (if given) tells whether
  * the attempt left nothing outstanding in the firmware, so that a later
@@ -1930,6 +1957,7 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 
 out_withdraw:
 	mutex_lock(&dcp->hpd_mutex);
+out_withdraw_locked:
 	/*
 	 * A T8132 dcpext's release lowers only the HPD of a connected port, so
 	 * a withdrawn one lowers its HPD here.
@@ -1952,13 +1980,7 @@ out_withdraw:
 	 * both is nothing of this attempt outstanding; until then the port
 	 * stays held.
 	 */
-	err = -ENODEV;
-	if (dptx_service_available(&dcp->dptxport[port])) {
-		err = dcp_is_typec_output(dcp) ?
-		      dptxport_set_hpd(dcp->dptxport[port].service, false) : 0;
-		if (!err)
-			err = dptxport_release_display(dcp->dptxport[port].service);
-	}
+	err = dcp_dptx_withdraw_locked(dcp, port);
 	if (err) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: port %u not withdrawn, still held: %d\n",
@@ -1967,12 +1989,13 @@ out_withdraw:
 	}
 	dev_info(dcp->dev, "dcp_dptx_connect: port %u withdrawn, the next connection retries\n",
 		 port);
-	dcp->dptxport[port].connected = false;
 	if (retryable)
 		*retryable = true;
 	goto out_unlock;
 
 out_release:
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_is_typec_output(dcp))
+		goto out_withdraw_locked;
 	dptxport_release_display(dcp->dptxport[port].service);
 
 out_unlock:
@@ -6939,7 +6962,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_t8142_external = {
-	.num_dptx_ports = 1,
+	.num_dptx_ports = 2,
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
 	.adopt_live_session = true,
 	.sink_metadata_edid = true,

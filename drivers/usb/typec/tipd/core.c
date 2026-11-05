@@ -894,6 +894,8 @@ out:
 		/* A provider that is not ready yet asks for a retry. */
 		if (ret == -EAGAIN)
 			dev_dbg(tps->dev, "Type-C connection deferred\n");
+		else if (*display_busy)
+			dev_dbg(tps->dev, "display waits for a free pipeline\n");
 		else if (cd321x_mux_still_held(cd321x, *held))
 			dev_dbg(tps->dev, "Type-C connection still held up: %d\n", ret);
 		else
@@ -2891,6 +2893,10 @@ int tipd_init(struct tps6598x *tps)
 	u32 vid = 0;
 	int ret, cleanup_ret;
 	bool reset_allowed = true;
+
+	/* Needed on cold boot too: display capacity must not restart USB. */
+	tps->h17_display = of_machine_is_compatible("apple,t8140") ||
+			   of_machine_is_compatible("apple,t8142");
 
 	dev_dbg(tps->dev, "Type-C probe start\n");
 	tps->reset = devm_gpiod_get_optional(tps->dev, "reset", GPIOD_OUT_LOW);

@@ -1041,7 +1041,10 @@ static int dptxport_prepare(struct apple_epic_service *service, const char *name
 	    (!class || !class[0] || !strcmp(class, "AppleDCPDPTXRemotePort")))
 		port = unit >= 0 && unit < 2 ? unit : -EINVAL;
 	else
-		port = dptx_service_port(name, class, unit, service->ep->wire_v2,
+		/* Firmware 27 uses AFKv2 transport, but local EPICUnit 0/1. */
+		port = dptx_service_port(name, class, unit,
+					 service->ep->wire_v2 &&
+					 dcp->fw_compat != DCP_FIRMWARE_V_27_0,
 					 dcp->index, dcp->hw.num_dptx_ports);
 
 	if (port < 0)
