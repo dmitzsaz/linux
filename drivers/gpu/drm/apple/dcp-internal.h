@@ -409,6 +409,8 @@ struct apple_dcp {
 	bool early_complete_v27;
 	bool fixed_sink_known;
 	bool fixed_sink_present;
+	/* Failed fixed-link withdrawal: do not lend unacknowledged ownership. */
+	bool fixed_link_held;
 
 	struct apple_dcp_hw_data hw;
 	bool external_prepared;
