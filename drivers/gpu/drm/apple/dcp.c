@@ -4225,7 +4225,9 @@ void dcp_poweron(struct platform_device *pdev)
 						   DCP_BL_FALLBACK_DELAY);
 		}
 		ret = dcp_backlight_dpms(dcp, true);
-		if (ret)
+		if (ret == -ENODATA)
+			dev_dbg(dcp->dev, "backlight level not available yet\n");
+		else if (ret)
 			dev_warn(dcp->dev, "backlight restore unavailable: %d\n", ret);
 		return;
 	}
