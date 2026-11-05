@@ -820,7 +820,7 @@ static const struct apple_isp_hw apple_isp_hw_t8140 = {
 
 	.fw_iova_mask = GENMASK_ULL(35, 0),
 	.mbox2_offset = 0x410,
-	.mbox_irq_route = true,
+	.mbox_irq_route = ISP_MBOX_IRQ_ROUTE_T8140,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8140,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8140),
@@ -936,7 +936,7 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 
 	.fw_iova_mask = GENMASK_ULL(35, 0),
 	.mbox2_offset = 0x410,
-	.mbox_irq_route = true,
+	.mbox_irq_route = ISP_MBOX_IRQ_ROUTE_T8142,
 	.coproc_control = ISP_COPROC_CONTROL_T8140,
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
