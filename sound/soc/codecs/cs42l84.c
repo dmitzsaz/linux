@@ -489,7 +489,7 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	struct snd_soc_component *component = codec_dai->component;
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
 	unsigned int inv = fmt & SND_SOC_DAIFMT_INV_MASK;
-	unsigned int ch2_edge;
+	unsigned int ch1_edge, ch2_edge;
 	bool dsp_a;
 	int ret;
 
@@ -503,8 +503,9 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	/*
 	 * Both formats have the same bus polarities: data one bit clock after
 	 * the rising FSYNC edge, which ASoC calls IB_IF for I2S and IB_NF for
-	 * DSP_A. In I2S each channel follows its own FSYNC edge, so the frame
-	 * must be 50 %. DSP_A takes a pulse frame: in TDM mode both channels
+	 * DSP_A with a normal frame. An inverted DSP_A frame selects the
+	 * opposite edge of the pulse. In I2S each channel follows its own FSYNC
+	 * edge, so the frame must be 50 %. DSP_A takes a pulse frame: both channels
 	 * follow the frame-start edge, one slot apart (set in hw_params).
 	 */
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
@@ -514,7 +515,7 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		dsp_a = false;
 		break;
 	case SND_SOC_DAIFMT_DSP_A:
-		if (inv != SND_SOC_DAIFMT_IB_NF)
+		if (inv != SND_SOC_DAIFMT_IB_NF && inv != SND_SOC_DAIFMT_IB_IF)
 			return -EINVAL;
 		dsp_a = true;
 		break;
@@ -522,10 +523,20 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 		return -EINVAL;
 	}
 
-	ch2_edge = dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	ch1_edge = dsp_a && inv == SND_SOC_DAIFMT_IB_IF ?
+		CS42L84_ASP_RX_CHx_CTL1_EDGE : 0;
+	ch2_edge = dsp_a ? ch1_edge : CS42L84_ASP_RX_CHx_CTL1_EDGE;
 	ret = snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
 			CS42L84_ASP_CTL_TDM_MODE,
 			dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH1_CTL1,
+			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch1_edge);
 	if (ret < 0)
 		return ret;
 	ret = snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
