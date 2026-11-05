@@ -809,6 +809,9 @@ struct apple_dcp {
 	struct apple_connector *fixed_connector;
 	struct apple_connector *typec_connector;
 	int hdmi_hpd_irq;
+	/* Connect retries of an HDMI display found at start, see dcp.c. */
+	struct delayed_work hdmi_start_wq;
+	unsigned int hdmi_start_tries;
 
 	/* H17P policy shared by backlight, commit, and reply workers. */
 	struct {
