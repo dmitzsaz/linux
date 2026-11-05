@@ -1460,6 +1460,8 @@ static int apple_drm_init(struct device *dev)
 	if (ret)
 		goto err_unbind;
 
+	/* Forced-status probes defer their hotplug event through this work. */
+	drmm_kms_helper_poll_init(&apple->drm);
 	drm_mode_config_reset(&apple->drm);
 	if (IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)) {
 		drm_for_each_crtc(crtc, &apple->drm) {
@@ -1561,6 +1563,7 @@ err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
 err_unbind:
+	drm_kms_helper_poll_disable(&apple->drm);
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
@@ -1579,6 +1582,7 @@ static void apple_drm_uninit(struct device *dev)
 		return;
 
 	/* Before anything of the DRM device is torn down. */
+	drm_kms_helper_poll_disable(&apple->drm);
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	drm_dev_unplug(&apple->drm);
