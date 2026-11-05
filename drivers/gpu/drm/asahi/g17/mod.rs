@@ -1829,6 +1829,7 @@ impl gpu::Gpu for Gpu {
             usc_exec_base,
             self.geometry.user_usable_range(),
             self.shared.variant,
+            self.shared.active_cores,
         )?;
         let policy = scheduling_policy(priority)?;
         let admission_started = now_ns();

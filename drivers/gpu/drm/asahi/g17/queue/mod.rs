@@ -57,6 +57,7 @@ pub(crate) struct Frontend {
     range: Range<u64>,
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
+    active_cores: u32,
 }
 
 impl Frontend {
@@ -65,6 +66,7 @@ impl Frontend {
         usc_base: u64,
         range: Range<u64>,
         variant: &'static crate::g17::fw::Variant,
+        active_cores: u32,
     ) -> Result<Self> {
         if priority > 3 {
             return Err(EINVAL);
@@ -78,6 +80,7 @@ impl Frontend {
             range,
             window,
             variant,
+            active_cores,
         })
     }
 }
@@ -94,6 +97,7 @@ pub(crate) struct Queue<B: Backend> {
     range: Range<u64>,
     window: UscWindow,
     variant: &'static crate::g17::fw::Variant,
+    active_cores: u32,
     proof: Proof,
     sequence: [u64; 2],
     frontiers: [KVec<(u64, Fences)>; 2],
@@ -126,6 +130,7 @@ impl<B: Backend> Queue<B> {
             range,
             window,
             variant,
+            active_cores,
         } = frontend;
         let render = Some(Scheduler::new(dev, backend.clone(), Engine::Render)?);
         Ok(Self {
@@ -140,6 +145,7 @@ impl<B: Backend> Queue<B> {
             range,
             window,
             variant,
+            active_cores,
             proof: Proof::new(),
             sequence: [0; 2],
             frontiers: core::array::from_fn(|_| KVec::new()),
@@ -412,7 +418,7 @@ impl<B: Backend> Queue<B> {
         objects: Pin<&xarray::XArray<KBox<file::Object>>>,
     ) -> Result<ValidatedBatch> {
         let parse_guard = self.context.vm().retain_first_job()?;
-        let mut parser = Parser::new(bytes);
+        let mut parser = Parser::new(bytes, self.active_cores, self.variant.compute);
         // All historical ordinals use the same entry counters; publication
         // starts only after the entire ioctl has been validated and pinned.
         let base = self.sequence;
