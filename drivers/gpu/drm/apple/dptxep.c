@@ -615,7 +615,9 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 			}
 		} else if (dptx->atcphy) {
 			/* No clocked crossbar output across a PHY rate change. */
-			dcp_direct_crossbar_link(service->ep->dcp, false);
+			ret = dcp_direct_crossbar_link(service->ep->dcp, false);
+			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				return ret;
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
@@ -751,8 +753,11 @@ dptxport_call_activate(struct apple_epic_service *service,
 	 * (DPTX_INACTIVE=0) from here; waking it earlier hangs the machine.
 	 * Activate always replies success to DCP.
 	 */
-	if (dptx->atcphy && !dcp->phy_managed_by_typec)
-		phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+	if (dptx->atcphy && !dcp->phy_managed_by_typec) {
+		ret = phy_set_mode_ext(dptx->atcphy, PHY_MODE_DP, dcp->index);
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return ret;
+	}
 	if (dcp->dptx_tunnel) {
 		ret = dcp_tunnel_dpin_activate(dcp, dptx->unit, true);
 		/* T6030 14.7: report a failed tunnel activation to DCP. */
@@ -853,8 +858,12 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		/* A re-link takes an established tunnel's crossbar down first. */
 		if (service->ep->dcp->dptx_tunnel && dptx->link_rate)
 			dcp_tunnel_crossbar_down(service->ep->dcp, dptx->unit);
-		else if (dptx->link_rate)
-			dcp_direct_crossbar_link(service->ep->dcp, false);
+		else if (dptx->link_rate) {
+			int ret = dcp_direct_crossbar_link(service->ep->dcp, false);
+
+			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				return ret;
+		}
 		return dptxport_call_will_change_link_config(service);
 	case DPTX_APCALL_DID_CHANGE_LINK_CONFIG: {
 		int ret = dptxport_call_did_change_link_config(service);
@@ -866,7 +875,10 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 				ret = xret;
 		} else if (!ret && dptx->link_rate) {
-			dcp_direct_crossbar_link(service->ep->dcp, true);
+			int xret = dcp_direct_crossbar_link(service->ep->dcp, true);
+
+			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				ret = xret;
 		}
 		if (!ret)
 			dcp_hdmi_link_configured(service->ep->dcp, dptx->link_rate);
