@@ -1,0 +1,80 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/sound/apple,t8142-aop-audio.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Apple T8142 AOP audio
+
+maintainers:
+  - Ryan Murray <ryan@aurorasilicon.org>
+
+description:
+  Audio services of the T8142 Always-On Processor. The firmware runs the
+  speaker and headset serializers on base-ns ADMAC and a three-channel
+  floating-point microphone array on leap-s ADMAC. There is no low-power
+  microphone ring exposed to the host.
+
+allOf:
+  - $ref: dai-common.yaml#
+
+properties:
+  compatible:
+    const: apple,t8142-aop-audio
+
+  dmas:
+    items:
+      - description: Headset jack output
+      - description: Headset microphone input
+      - description: Internal speaker output
+      - description: Speaker voltage and current sense input
+      - description: High-quality microphone array input
+
+  dma-names:
+    items:
+      - const: cout
+      - const: cin
+      - const: spkr
+      - const: sense
+      - const: hpai
+
+  power-domains:
+    items:
+      - description: Speaker serializer
+      - description: Headset serializer
+      - description: LEAP secure ADMAC
+      - description: LEAP serializer
+      - description: LEAP microphone receive channel
+
+  power-domain-names:
+    items:
+      - const: mca0
+      - const: mca2
+      - const: leap_s_a
+      - const: leap_mca
+      - const: leap_rx0
+
+  "#sound-dai-cells":
+    const: 1
+    description:
+      The speaker back-end is 3 and the headset back-end is 4.
+
+  apple,chassis-name:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Chassis identifier used to name the microphone sound card.
+
+  apple,machine-kind:
+    $ref: /schemas/types.yaml#/definitions/string
+    description: Human-readable machine name used in the card description.
+
+required:
+  - compatible
+  - dmas
+  - dma-names
+  - power-domains
+  - power-domain-names
+  - "#sound-dai-cells"
+  - apple,chassis-name
+  - apple,machine-kind
+
+unevaluatedProperties: false

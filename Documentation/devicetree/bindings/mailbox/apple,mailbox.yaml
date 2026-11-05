@@ -68,6 +68,10 @@ properties:
           AOP setup-port mailbox with a separate register layout.
         const: apple,t8140-aop-setup-mailbox
 
+      - items:
+          - const: apple,t8142-aop-setup-mailbox
+          - const: apple,t8140-aop-setup-mailbox
+
       - description:
           An older ASC mailbox interface found on T2 and A11 that is also
           used for the NVMe coprocessor and the system management
