@@ -878,8 +878,9 @@ enum drm_asahi_cmd_type {
 	DRM_ASAHI_SET_RENDER_RESOURCES = 5,
 
 	/**
-	 * @DRM_ASAHI_SET_COMPUTE_RESOURCES: Reserved for the M5 runtime
-	 * (DRM_ASAHI_FEATURE_COMPUTE_RESOURCES). This kernel rejects it.
+	 * @DRM_ASAHI_SET_COMPUTE_RESOURCES: Replace the compute resource list
+	 * with an array of drm_asahi_compute_program records. Requires
+	 * DRM_ASAHI_FEATURE_COMPUTE_RESOURCES.
 	 */
 	DRM_ASAHI_SET_COMPUTE_RESOURCES = 6,
 
