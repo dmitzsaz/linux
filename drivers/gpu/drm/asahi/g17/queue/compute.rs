@@ -1002,9 +1002,11 @@ impl Queue {
                 if recovery_state != 0 {
                     return Err(EAGAIN);
                 }
-                let recordless = if epoch != ticket.epoch {
+                let recordless = if epoch != ticket.epoch
+                    && self.graph.program != ComputeProgram::G17G
+                {
                     Recordless::CrossedRecovery
-                } else if masks.is_none() || (finished_before && oldest) {
+                } else if epoch != ticket.epoch || masks.is_none() || (finished_before && oldest) {
                     Recordless::Allowed
                 } else {
                     Recordless::NotYet

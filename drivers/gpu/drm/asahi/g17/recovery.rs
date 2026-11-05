@@ -40,6 +40,8 @@ pub(super) const RECOVERY_RECORDS: usize = 256;
 pub(super) struct Entries {
     guilty: u128,
     cancelled: u128,
+    recorded: u128,
+    ta: u128,
     /// Valid records, each naming one command that was in flight at the restart.
     pub(super) listed: u32,
     /// Listed commands found by their exact stamp, and by the oldest-work fallback.
@@ -56,6 +58,8 @@ impl Entries {
         }
         let qid = (flags >> 4) & 0x7f;
         let bit = 1u128 << qid;
+        self.recorded |= bit;
+        if flags & (1 << 3) != 0 { self.ta |= bit; }
         if flags & u32::from(GUILTY) != 0 {
             self.guilty |= bit;
         }
@@ -109,13 +113,17 @@ pub(super) trait Queues {
     fn settle_cancelled_renders(&mut self, qids: u128);
     fn rescan_compute(&mut self) -> Result;
     fn release_retired_compute(&mut self);
+    fn fail_all_in_flight(&mut self, _error: Error) {}
+    fn fail_qid_owners(&mut self, _qids: u128, _error: Error) -> usize { 0 }
+    fn render_qids(&self) -> u128 { 0 }
+    fn scrub_render_tpc(&mut self, _qids: u128) -> usize { 0 }
 }
 
 /// Live shared-memory operations. The handshake word uses aligned 32-bit accesses; transitions
 /// check the expected value, issue a full barrier, store the next value, then another barrier.
 pub(super) trait Memory {
     /// HAL300 recovery keeps firmware-owned producer and timestamp state.
-    fn fail_all_policy(&self) -> bool { false }
+    fn native_recovery(&self) -> bool { false }
     fn recovery_state(&self) -> Result<u32>;
     fn host_recovery(&self) -> Result<u32>;
     fn fault_sources(&self) -> Result<Sources>;
@@ -241,7 +249,7 @@ pub(super) fn service<H: Host>(
         return Err(EIO);
     }
     host.recovery_mut().accepted = host.recovery().accepted.wrapping_add(1);
-    if request.generation == 0 && !host.render_scheduler_active() {
+    if !host.native_recovery() && request.generation == 0 && !host.render_scheduler_active() {
         host.clear_timestamps()?;
     }
     let mut sources = host.fault_sources()?;
@@ -254,7 +262,8 @@ pub(super) fn service<H: Host>(
     // acknowledged; sampling them during classification can blame a bystander.
     let attribution = sources.attribute(request.blamed,
         |qid, stamp| host.render_pass_started(qid, stamp));
-    let target_error = host.publish_recovery_targets();
+    // HAL300 reconstructs firmware-initiated recoveries from its own queue cursors.
+    let target_error = if host.native_recovery() { None } else { host.publish_recovery_targets() };
     host.transition(1, 2)?;
     let mut recovered = false;
     for _ in 0..RECOVERY_POLLS {
@@ -277,11 +286,37 @@ pub(super) fn service<H: Host>(
     // still retire it with stamps and records that look like success, so it is
     // marked before firmware resumes and never reports success.
     let entries = read_entries(host);
+    if host.native_recovery() { host.scrub_render_tpc(entries.ta); }
     host.transition(3, 0)?;
     if host.recovery_state()? != 0 {
         return Err(EIO);
     }
     host.recovery_mut().pending = None;
+
+    if host.native_recovery() {
+        let guilty = entries.guilty | request.blamed.map_or(0, |qid| 1u128 << qid);
+        let cancelled = entries.recorded & !guilty;
+        let cancelled_render = cancelled & host.render_qids();
+        let owners = guilty | (cancelled & !cancelled_render);
+        let failed = host.fail_qid_owners(owners, EIO);
+        if (owners != 0 && failed == 0) || (owners == 0 && cancelled_render == 0) {
+            host.fail_all_in_flight(EIO);
+        } else {
+            host.classify_work(&|status| {
+                if status.get() != 0 {
+                    Class::Guilty
+                } else {
+                    Class::Spared
+                }
+            });
+            if cancelled_render != 0 { host.settle_cancelled_renders(cancelled_render); }
+        }
+        // Every listed kick was marked interrupted before state 3 was acknowledged.
+        // Successful-looking records cannot turn a cancelled command into a success.
+        let scan_error = host.rescan_compute().err();
+        host.release_retired_compute();
+        return Ok(ServiceResult { scan_error, target_error });
+    }
 
     let (listed, exact, fallback) = (entries.listed, entries.exact, entries.fallback);
     let (cancelled, blame) = classify(host, entries, request.blamed, attribution);

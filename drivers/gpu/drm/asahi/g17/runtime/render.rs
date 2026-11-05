@@ -908,6 +908,31 @@ impl Registry {
                 pair.note_interrupted(stamp)
             })
     }
+    pub(in crate::g17) fn scrub_render_tpc(&mut self, qids: u128) -> usize {
+        let mut scrubbed = 0;
+        for pair in self
+            .render
+            .entries
+            .iter_mut()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_mut())
+        {
+            if qids & (1u128 << (pair.qids()[0] & 0x7f)) != 0 {
+                pair.scrub_tpc();
+                scrubbed += 1;
+            }
+        }
+        scrubbed
+    }
+    pub(in crate::g17) fn render_qids_mask(&self) -> u128 {
+        let mut qids = 0u128;
+        for pair in self.render.entries.iter().flatten().filter_map(|entry| entry.pair.as_ref()) {
+            for qid in pair.qids() {
+                qids |= 1u128 << (qid & 0x7f);
+            }
+        }
+        qids
+    }
     pub(in crate::g17) fn visit_render_owners(
         &self,
         qid: u8,
