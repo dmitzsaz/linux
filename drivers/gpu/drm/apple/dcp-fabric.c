@@ -186,6 +186,10 @@ bool dcp_hdmi_port_attached(struct apple_dcp *dcp)
 {
 	KUNIT_STATIC_STUB_REDIRECT(dcp_hdmi_port_attached, dcp);
 
+	/* The converter's GPIO HPD does not describe its downstream HDMI sink. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return !READ_ONCE(dcp->active_typec_route) &&
+		       READ_ONCE(dcp->fixed_sink_present);
 	return dcp->hdmi_hpd && !READ_ONCE(dcp->active_typec_route) &&
 	       gpiod_get_value_cansleep(dcp->hdmi_hpd) > 0;
 }
@@ -231,7 +235,7 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 	struct apple_dcp *dcp = route->dcp;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->fixed_phy)
-		return !READ_ONCE(dcp->fixed_sink_known) || READ_ONCE(dcp->fixed_sink_present);
+		return READ_ONCE(dcp->fixed_sink_present) || READ_ONCE(dcp->fixed_link_held);
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
 		return false;
 	/* Its HDMI display gave the pipeline to a Type-C display. */
@@ -861,7 +865,7 @@ static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)
 	unsigned long flags;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-		if (!READ_ONCE(dcp->fixed_sink_known))
+		if (READ_ONCE(dcp->fixed_link_held))
 			return DCP_FABRIC_SETTLING;
 		return READ_ONCE(dcp->fixed_sink_present) ?
 			DCP_FABRIC_PRESENT : DCP_FABRIC_ABSENT;
@@ -1110,7 +1114,7 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		if (!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->active_typec_route) &&
-		    READ_ONCE(dcp->fixed_sink_known) && !READ_ONCE(dcp->fixed_sink_present))
+		    !READ_ONCE(dcp->fixed_link_held) && !READ_ONCE(dcp->fixed_sink_present))
 			dcp_typec_pipeline_freed();
 		return;
 	}

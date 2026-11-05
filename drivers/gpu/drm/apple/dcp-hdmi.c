@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 /*
- * HDMI port of the T6030 (M3 Pro) MacBook Pros.
+ * HDMI converter service requests on T6030 and T8142 MacBook Pros.
  *
- * The port hangs off the first external display coprocessor: it drives
- * ATC3 as a four-lane DisplayPort PHY into an on-board DP-to-HDMI
+ * T6030 uses its first external coprocessor and ATC3; T8142 uses DCPEXT1
+ * and ATC2. Both drive a four-lane DisplayPort PHY into an on-board DP-to-HDMI
  * converter. Power, hotplug and the fixed route work as for the M1/M2 Pro
  * MacBook Pro HDMI port (hdmi-hpd, hdmi-pwren and dp2hdmi-pwren GPIOs, see
  * dcp.c and dcp-fabric.c).
@@ -19,7 +19,7 @@
  *    the rate those modes use, because not every request of the converter
  *    shows up as a pulse on the GPIO.
  *
- * Only the T6030 external coprocessor with a fixed HDMI route uses this.
+ * T6030 and T8142 external coprocessors with a fixed HDMI route use this.
  */
 
 #include <linux/atomic.h>
@@ -212,7 +212,8 @@ int dcp_hdmi_init(struct apple_dcp *dcp)
 
 	if (!dcp->hdmi_hpd ||
 	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA ||
-	    !of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext"))
+	    (!of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext") &&
+	     !of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext")))
 		return 0;
 
 	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);

@@ -734,6 +734,13 @@ int main(void)
     clock = 'static unsigned jiffies_to_msecs(unsigned long t) { return t; }\n'
     if clock in unit:
         firmware = firmware.replace(clock, '')
+    if 'static int dcp_dptx_withdraw_locked(' in dcp:
+        unit = '#define DCP_FIRMWARE_V_27_0 27\n' + unit
+        unit = unit.replace(' bool external, external_link_ready, crashed;',
+                            ' bool external, external_link_ready, crashed, fixed_link_held;')
+        firmware += ('static void dcp_fixed_sink_hotplug(struct apple_dcp *d, bool connected)\n'
+                     '{ (void)d;(void)connected;assert(!"firmware-27 fixed output in H17P scenario"); }\n')
+        raw = block(dcp, 'static int dcp_dptx_withdraw_locked(') + '\n' + raw
     return unit + firmware + raw + '\n' + tests
 
 

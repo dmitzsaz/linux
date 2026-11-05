@@ -1494,6 +1494,10 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 		if (ep->wire_v2 && ep == ep->dcp->systemep &&
 		    !strcmp(name, "powerlog-service"))
 			fallback_name = name;
+		/* Firmware 27's iBoot service has only interface-id/desc-mgr. */
+		if (ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		    ep == ep->dcp->ibootep && !strcmp(name, "disp0-service"))
+			fallback_name = name;
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
 					     ep->dcp->fw_compat == DCP_FIRMWARE_H17P ||
 					     ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0,

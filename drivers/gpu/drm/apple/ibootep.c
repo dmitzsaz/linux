@@ -749,7 +749,8 @@ int ibootep_init(struct apple_dcp *dcp)
 	/* The T6030 external start path may race a second start. */
 	if (dcp->ibootep && dcp->fw_compat == DCP_FIRMWARE_V_14_7)
 		return -EBUSY;
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		ops = external_ibootep_ops;
 	dcp->ibootep = afk_init(dcp, DISP0_ENDPOINT, ops);
 	if (IS_ERR(dcp->ibootep)) {

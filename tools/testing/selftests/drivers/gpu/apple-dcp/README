@@ -10,7 +10,7 @@ Or keep translation units, commands, failure logs and source hashes:
   tools/testing/selftests/drivers/gpu/apple-dcp/run.sh --output /tmp/apple-dcp-results
 
 An installed copy needs --source /path/to/kernel. --group edid, rate, phy or
-lifecycle or boot selects one group. HOSTCC selects the host compiler (default clang).
+lifecycle, boot or fw27 selects one group. HOSTCC selects the host compiler (default clang).
 Python 3 and a compiler supporting AddressSanitizer/UndefinedBehaviorSanitizer
 are required. The usb-kconfig producer also needs GNU Make 4 or newer. The
 runner uses MAKE when set, otherwise gmake if available, then make. On macOS,
@@ -24,6 +24,9 @@ configuration is required.
 One TAP entry point uses shared production extraction and compiler handling.
 The modules contain public synthetic host boundaries and retained assertions:
 
+* fw27: converter HPD versus downstream sink ownership, acknowledged and failed
+  link withdrawal, capacity wakeup, local RemotePort units 0/1, and cold
+  Type-C probe on T8140/T8142.
 * edid: actual AFK admission and OPEN/CLOSE handling; native/HDMI providers
   alternating over 64 epochs; foreign owners, stale replies, reader/command
   pins, ordered receive progress and legacy service behavior.

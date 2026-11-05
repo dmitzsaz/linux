@@ -345,7 +345,12 @@ def probe(root):
     unit = quiesce.make_unit(root)
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
     unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
-    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool dbma_at_probe,wakeup; u32 status; bool (*sleep_event)(struct tps6598x *);')
+    unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool h17_display,dbma_at_probe,wakeup; u32 status; bool (*sleep_event)(struct tps6598x *);')
+    # The common SAFE fixture does not enter firmware-27 non-SAFE mode.
+    unit = unit.replace('struct apple_dcp { int external_lock,external_error;',
+                        'struct apple_dcp { int fw_compat; bool fixed_route_selected; void *fixed_phy; int external_lock,external_error;', 1)
+    unit = unit.replace('static int dcp_typec_route_finish(',
+                        '#define DCP_FIRMWARE_V_27_0 27\nstatic int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;(void)s;assert(!"non-SAFE firmware-27 path");return -EINVAL; }\nstatic int dcp_typec_route_finish(', 1)
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
@@ -398,7 +403,7 @@ static int register_port(struct tps6598x *t,struct fwnode_handle *f) { (void)t;(
 static bool read_data_status(struct tps6598x *t) { (void)t;return true; }
 static int connect(struct tps6598x *t,u32 status) { (void)t;(void)status;return connect_error; }
 """
-    helpers += '\n#define of_machine_is_compatible(name) (!strcmp((name), \"apple,t8140\"))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
+    helpers += '\nstatic const char *machine=\"apple,t8140\";\n#define of_machine_is_compatible(name) (!strcmp((name), machine))\n#define BIT_ULL(n) (1ULL << (n))\n#define SN201202X_INT_DP_SID_UPDATE BIT_ULL(37)\n'
     helpers += block(core, 'static bool cd321x_uses_dp_sid(') + '\n' + block(core, 'static u64 cd321x_irq_mask(') + '\n'
     unit += helpers + block(core, 'int tipd_init(') + r"""
 static void probe_initial(struct cd321x *c) {
@@ -421,6 +426,11 @@ int main(void) {
  assert(tipd_init(&c.tps)==-ENODEV&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0&&node_puts==1);
  probe_initial(&c);register_error=-EIO;
  assert(tipd_init(&c.tps)==-EIO&&reset_calls==0&&stops==0&&phy_calls==0&&unregisters==0);
+ assert(c.tps.h17_display);
+ probe_initial(&c);machine="apple,t8142";register_error=-EIO;
+ assert(tipd_init(&c.tps)==-EIO && c.tps.h17_display);
+ probe_initial(&c);machine="apple,t6020";register_error=-EIO;
+ assert(tipd_init(&c.tps)==-EIO && !c.tps.h17_display);
  puts("PASS actual probe rollback preserves primary errors, blocks reset after SAFE/role/registration errors and resets only a patched controller");
 }
 """
