@@ -1762,7 +1762,8 @@ int parse_panel_metadata(struct dcp_parse_ctx *handle, struct dcp_display_metada
 }
 
 int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
-			    const char **class, s64 *unit, bool h17p_keys)
+			    const char **class, s64 *unit, bool h17p_keys,
+			    const char *fallback_name)
 {
 	int ret = 0;
 	struct iterator it;
@@ -1830,7 +1831,24 @@ int parse_epic_service_init(struct dcp_parse_ctx *handle, const char **name,
 			break;
 	}
 
-	if (!parsed_unit || !parsed_name || !parsed_class)
+	/*
+	 * Firmware 27 powerlog announcements carry only interface-id and
+	 * ep-has-desc-mgr. The caller may supply their fixed header name, but
+	 * only a valid dictionary with both identity strings absent qualifies.
+	 */
+	if (!ret && h17p_keys && fallback_name && parsed_unit &&
+	    !parsed_name && !parsed_class) {
+		*name = kstrdup(fallback_name, GFP_KERNEL);
+		*class = kstrdup(fallback_name, GFP_KERNEL);
+		if (!*name || !*class) {
+			ret = -ENOMEM;
+		} else {
+			parsed_name = true;
+			parsed_class = true;
+		}
+	}
+
+	if (!ret && (!parsed_unit || !parsed_name || !parsed_class))
 		ret = -ENOENT;
 
 	if (ret) {

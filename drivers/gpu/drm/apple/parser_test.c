@@ -62,7 +62,47 @@ static int parse_service(struct kunit *test, const struct blob *b, bool h17p,
 	struct dcp_parse_ctx ctx;
 
 	KUNIT_ASSERT_EQ(test, parse(b->data, b->len, &ctx), 0);
-	return parse_epic_service_init(&ctx, name, class, unit, h17p);
+	return parse_epic_service_init(&ctx, name, class, unit, h17p, NULL);
+}
+
+static void parser_service_init_powerlog_test(struct kunit *test)
+{
+	/* Captured firmware 27 announcement from the system endpoint. */
+	static const u8 props[] = {
+		0xd3, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x81,
+		0x0f, 0x00, 0x00, 0x09, 0x65, 0x70, 0x2d, 0x68,
+		0x61, 0x73, 0x2d, 0x64, 0x65, 0x73, 0x63, 0x2d,
+		0x6d, 0x67, 0x72, 0x03, 0x01, 0x00, 0x00, 0x0b,
+		0x0c, 0x00, 0x00, 0x09, 0x69, 0x6e, 0x74, 0x65,
+		0x72, 0x66, 0x61, 0x63, 0x65, 0x2d, 0x69, 0x64,
+		0x40, 0x00, 0x00, 0x84, 0x01, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00,
+	};
+	struct dcp_parse_ctx ctx;
+	const char *name, *class;
+	s64 unit = -1;
+	int ret;
+
+	KUNIT_ASSERT_EQ(test, parse(props, sizeof(props), &ctx), 0);
+	ret = parse_epic_service_init(&ctx, &name, &class, &unit, true, NULL);
+	KUNIT_EXPECT_EQ(test, ret, -ENOENT);
+	KUNIT_ASSERT_EQ(test, parse(props, sizeof(props), &ctx), 0);
+	ret = parse_epic_service_init(&ctx, &name, &class, &unit,
+				      true, "powerlog-service");
+	KUNIT_ASSERT_EQ(test, ret, 0);
+	KUNIT_EXPECT_STREQ(test, name, "powerlog-service");
+	KUNIT_EXPECT_STREQ(test, class, "powerlog-service");
+	KUNIT_EXPECT_EQ(test, unit, 1);
+	kfree(name);
+	kfree(class);
+
+	/* A truncated interface-id must not become a name-only service. */
+	KUNIT_ASSERT_EQ(test, parse(props, sizeof(props) - 1, &ctx), 0);
+	ret = parse_epic_service_init(&ctx, &name, &class, &unit,
+				      true, "powerlog-service");
+	KUNIT_EXPECT_EQ(test, ret, -EINVAL);
+	KUNIT_EXPECT_TRUE(test, IS_ERR(name));
+	KUNIT_EXPECT_TRUE(test, IS_ERR(class));
 }
 
 static void parser_service_init_test(struct kunit *test)
@@ -271,6 +311,7 @@ static void parser_property_complete_test(struct kunit *test)
 static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_service_init_test),
 	KUNIT_CASE(parser_service_init_h17p_keys_test),
+	KUNIT_CASE(parser_service_init_powerlog_test),
 	KUNIT_CASE(parser_service_init_truncated_test),
 	KUNIT_CASE(parser_nesting_test),
 	KUNIT_CASE(parser_bad_header_test),
