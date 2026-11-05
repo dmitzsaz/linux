@@ -5589,8 +5589,14 @@ VISIBLE_IF_KUNIT void dcp_comp_unbind(struct device *dev, struct device *main, v
 
 	if (dcp->retain_dma) {
 		/* No firmware stop is acknowledged: detach host users, never DMA. */
+		if (dcp->hdmi_hpd_irq)
+			disable_irq(dcp->hdmi_hpd_irq);
 		scoped_guard(mutex, &dcp->iomfb.lock)
 			WRITE_ONCE(dcp->quiescing, true);
+		/* Quiesce producers before cancelling consumers or releasing KMS state. */
+		dcp_disable_typec_work(dcp, true);
+		disable_delayed_work_sync(&dcp->swap_watchdog_wq);
+		disable_work_sync(&dcp->vblank_wq);
 		cancel_work_sync(&dcp->external_stop_work);
 		cancel_delayed_work_sync(&dcp->external_stop_retry_wq);
 		if (dcp->crtc && !dcp->drm_retained) {
