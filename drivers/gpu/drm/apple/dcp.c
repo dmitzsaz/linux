@@ -6791,6 +6791,9 @@ static int dcp_platform_suspend(struct device *dev)
 			dcp_enable_typec_work(dcp);
 			return ret;
 		}
+		/* Resume enables HPD for this path as well as the generic one. */
+		if (dcp->hdmi_hpd_irq)
+			disable_irq(dcp->hdmi_hpd_irq);
 		device_set_wakeup_path(dev);
 		return 0;
 	}
