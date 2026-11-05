@@ -1133,3 +1133,5 @@
 #include "t8142-display.dtsi"
 #include "t8142-audio.dtsi"
 #include "t8142-gpu.dtsi"
+
+#include "t8142-isp.dtsi"
