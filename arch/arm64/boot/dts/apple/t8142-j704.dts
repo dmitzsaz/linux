@@ -434,3 +434,4 @@
 
 #include "t8142-j704-display.dtsi"
 #include "t8142-j704-audio.dtsi"
+#include "t8142-j704-gpu.dtsi"

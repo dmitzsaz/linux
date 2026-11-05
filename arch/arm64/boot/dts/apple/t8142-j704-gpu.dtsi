@@ -9,3 +9,11 @@
 	/* Enabled only after the loader publishes a supported firmware profile. */
 	status = "disabled";
 };
+
+/* Firmware-owned regions must never be allocated or mapped by the linear map. */
+&gfx_data { no-map; };
+&gfx1_data { no-map; };
+&uat_handoff { no-map; };
+&uat_l2_pagetables { no-map; };
+&uat_pagetables { no-map; };
+&uat_ttbs { no-map; };
