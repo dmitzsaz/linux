@@ -319,11 +319,11 @@ static int isp_reset_coproc_t8140(struct apple_isp *isp)
 }
 
 /*
- * The T6040 firmware is started as the bootloader left it, without a reset:
+ * Resident T6040 and T8142 firmware starts as the bootloader left it:
  * the coprocessor must never have run, and its reset vector must be the
  * entry of the firmware text at the base of the heap region.
  */
-static int isp_check_coproc_t6040(struct apple_isp *isp)
+static int isp_check_coproc_stopped(struct apple_isp *isp)
 {
 	u32 control = isp_coproc_read32(isp, isp_coproc_control(isp));
 	u64 rvbar = readq(isp->coproc + ISP_COPROC_RVBAR);
@@ -334,7 +334,7 @@ static int isp_check_coproc_t6040(struct apple_isp *isp)
 		return -EBUSY;
 	}
 
-	if (rvbar != (isp->fw.heap_base | 1)) {
+	if (isp_fw_iova(isp, rvbar) != (isp_fw_iova(isp, isp->fw.heap_base) | 1)) {
 		isp_err(isp, "reset vector 0x%llx is not the firmware at 0x%llx\n",
 			rvbar, isp->fw.heap_base);
 		return -ENODEV;
@@ -351,8 +351,8 @@ static int isp_reset_coproc(struct apple_isp *isp)
 
 	if (isp->hw->gen == ISP_GEN_T8140)
 		return isp_reset_coproc_t8140(isp);
-	if (isp->hw->gen == ISP_GEN_T6040)
-		return isp_check_coproc_t6040(isp);
+	if (isp->hw->gen == ISP_GEN_T6040 || isp->hw->gen == ISP_GEN_T8142)
+		return isp_check_coproc_stopped(isp);
 
 	isp_coproc_write32(isp, ISP_COPROC_EDPRCR, 0x2);
 
@@ -408,7 +408,8 @@ static int isp_firmware_boot_stage1(struct apple_isp *isp)
 		return err;
 
 	/* ISP17a and T6040 have no clock enable word */
-	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040)
+	if (isp->hw->gen != ISP_GEN_T8140 && isp->hw->gen != ISP_GEN_T6040 &&
+	    isp->hw->gen != ISP_GEN_T8142)
 		isp_gpio_write32(isp, ISP_GPIO_CLOCK_EN, 0x1);
 
 #if 0
