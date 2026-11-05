@@ -272,7 +272,7 @@ static int isp_enable_irq(struct apple_isp *isp)
 				 ISP_MBOX_IRQ_ENABLE1_T8140_VAL);
 		isp_mbox_write32(isp, ISP_MBOX_IRQ_ENABLE2_T8140,
 				 ISP_MBOX_IRQ_ENABLE2_T8140_VAL);
-		isp_mbox_write32(isp, ISP_MBOX_IRQ_ROUTE_T8140,
+		isp_mbox_write32(isp, isp->hw->mbox_irq_route,
 				 ISP_MBOX_IRQ_ROUTE_T8140_VAL);
 	}
 
