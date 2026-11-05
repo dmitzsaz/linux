@@ -58,10 +58,10 @@
 	};
 };
 
-#include "t8142-j813-display.dtsi"
 #include "t8142-j813-gpu.dtsi"
 #include "t8142-j813-peripherals.dtsi"
 #include "t8142-j813-usb.dtsi"
+#include "t8142-j813-display.dtsi"
 #include "t8142-j813-isp.dtsi"
 #include "t8142-j813-psci-idle.dtsi"
 #include "t8142-j813-n1.dtsi"
