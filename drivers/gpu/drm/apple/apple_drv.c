@@ -1176,6 +1176,7 @@ static const struct of_device_id apple_dcp_id_tbl[] = {
 #if IS_ENABLED(CONFIG_DRM_APPLE_DCP_T8132)
 	{ .compatible = "apple,t8132-dcp" },
 #endif
+	{ .compatible = "apple,t8142-dcpext" },
 	{},
 };
 
@@ -1190,7 +1191,8 @@ static bool apple_dcp_usable(struct device_node *np)
 	return of_device_is_available(np) &&
 	       (!of_device_is_compatible(np, "apple,t6030-dcpext") ||
 		dcp_t6030_ext_native(np)) &&
-	       (!of_device_is_compatible(np, "apple,t8140-dcpext") ||
+	       (!(of_device_is_compatible(np, "apple,t8140-dcpext") ||
+		  of_device_is_compatible(np, "apple,t8142-dcpext")) ||
 		dcp_h17p_external_supported(np)) &&
 	       /* t6041_dcpext=0 keeps the T6041 external processors out. */
 	       (!of_device_is_compatible(np, "apple,t6041-dcpext") ||
@@ -1618,7 +1620,8 @@ static int add_dcp_components(struct device *dev,
 				 * ignore it here.
 				 */
 				if (of_device_is_compatible(port, "apple,t8103-atcphy") ||
-				    of_device_is_compatible(port, "apple,t8122-atcphy")) {
+				    of_device_is_compatible(port, "apple,t8122-atcphy") ||
+				    of_device_is_compatible(port, "apple,t8142-atcphy")) {
 					of_node_put(port);
 					continue;
 				}

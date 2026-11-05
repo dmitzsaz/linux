@@ -164,6 +164,14 @@ bool dcp_h17p_external_supported(struct device_node *np)
 	u32 firmware[DCP_EXTERNAL_FW_CELLS], compat[DCP_EXTERNAL_FW_CELLS];
 	int firmware_cells, compat_cells;
 
+	if (of_device_is_compatible(np, "apple,t8142-dcpext")) {
+		static const u32 sdk27[] = { 27, 0, 0 };
+
+		return of_property_read_u32_array(np, "apple,firmware-version", firmware, 3) == 0 &&
+		       of_property_read_u32_array(np, "apple,firmware-compat", compat, 3) == 0 &&
+		       !memcmp(firmware, sdk27, sizeof(sdk27)) &&
+		       !memcmp(compat, sdk27, sizeof(sdk27));
+	}
 	if (!of_machine_is_compatible("apple,j700") ||
 	    !of_device_is_compatible(np, "apple,t8140-dcpext"))
 		return false;
@@ -3831,7 +3839,8 @@ int dcp_start(struct platform_device *pdev)
 	if (ret)
 		dev_warn(dcp->dev, "Failed to start system endpoint: %d\n", ret);
 
-	if (unstable_edid && !dcp_has_panel(dcp)) {
+	if (unstable_edid && !dcp_has_panel(dcp) &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0) {
 		ret = dpavservep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start DPAVSERV endpoint: %d",
@@ -5268,6 +5277,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
 	    !dcp_external_is_idle(dcp))
 		return dev_err_probe(dev, -EBUSY,
 				     "External DCP is not in the inherited idle state\n");
@@ -5400,6 +5410,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
 	    (!dcp->clk_194 || !clk_get_rate(dcp->clk) ||
 	     !clk_get_rate(dcp->clk_194))) {
 		ret = dev_err_probe(dev, -EINVAL,
@@ -5417,7 +5428,7 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		ret = dcp_pin_live_session(dcp);
 		if (ret)
 			goto err_piodma;
-		if (!dcp_external_is_idle(dcp)) {
+		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 && !dcp_external_is_idle(dcp)) {
 			ret = dev_err_probe(dev, -EBUSY,
 					    "External DCP changed state before startup\n");
 			goto err_piodma;
@@ -5909,7 +5920,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 				       (get_random_u64() & GENMASK_ULL(47, 4));
 	}
 	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") ||
-			    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext");
+			    of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") ||
+			    of_device_is_compatible(dev->of_node, "apple,t8142-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp_external_audio_init(dcp);
@@ -5941,10 +5953,11 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		dcp_desktop_metadata_new_sink(dcp);
 	if (dcp->hw.iomfb_method_profile ==
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
-		if (!dcp->hw.firmware_clock ||
-		    !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
+		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+		    (!dcp->hw.firmware_clock ||
+		     !apple_dcp_external_bw_valid(resource_size(dcp->hw.firmware_clock),
 					 dcp->hw.firmware_scratch,
-					 dcp->hw.firmware_request))
+					 dcp->hw.firmware_request)))
 			return dev_err_probe(dev, -EINVAL,
 					     "Invalid external profile bandwidth resources\n");
 		iomfb_pause_presentation(dcp, true);
@@ -6194,6 +6207,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 				return ret;
 			dcp->fixed_xbar = dcp->xbar;
 			ret = mux_control_select(dcp->fixed_xbar, mux_index);
+			if (ret && fw_compat == DCP_FIRMWARE_V_27_0)
+				return ret;
 			if (ret)
 				dev_warn(dev, "mux_control_select failed: %d\n", ret);
 			else
@@ -6213,10 +6228,14 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 					.mode = TYPEC_DP_STATE_C,
 				};
 				int ret = typec_mux_set(dcp->typec_mux, &state);
+				if (ret && fw_compat == DCP_FIRMWARE_V_27_0)
+					return ret;
 				dev_info(dev, "typec_mux_set() returned: %d\n", ret);
 				if (!ret)
 					dcp->phy_managed_by_typec = true;
 			} else {
+				if (fw_compat == DCP_FIRMWARE_V_27_0)
+					return PTR_ERR_OR_ZERO(dcp->typec_mux) ?: -ENODEV;
 				dev_info(dev, "fwnode_typec_mux_get() returned: %ld\n",
 						IS_ERR(dcp->typec_mux) ? PTR_ERR(dcp->typec_mux) : 0);
 				dcp->typec_mux = NULL;
@@ -6388,7 +6407,8 @@ static int dcp_platform_probe(struct platform_device *pdev)
 	if (of_device_is_compatible(dev->of_node, "apple,t8132-dcpext"))
 		return dcp_platform_probe_t8132_ext(pdev);
 	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext") &&
-	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcpext"))
+	    !of_device_is_compatible(dev->of_node, "apple,t6041-dcpext") &&
+	    !of_device_is_compatible(dev->of_node, "apple,t8142-dcpext"))
 		return dcp_platform_probe_pipe(pdev);
 
 	ret = dcp_ext_route_suppliers(dev);
@@ -6887,6 +6907,13 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142 = {
 	.firmware_compat = DCP_FIRMWARE_H17P,
 };
 
+static const struct apple_dcp_hw_data apple_dcp_hw_t8142_external = {
+	.num_dptx_ports = 1,
+	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
+	.adopt_live_session = true,
+	.sink_metadata_edid = true,
+};
+
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {
 	.num_dptx_ports = 0,
 };
@@ -6942,6 +6969,7 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t6041_dcpext = {
 };
 
 static const struct of_device_id of_match[] = {
+	{ .compatible = "apple,t8142-dcpext", .data = &apple_dcp_hw_t8142_external },
 	{ .compatible = "apple,t6041-dcp", .data = &apple_dcp_hw_t6041, },
 	{ .compatible = "apple,t6041-dcpext", .data = &apple_dcp_hw_t6041_dcpext, },
 	{ .compatible = "apple,t6020-dcp", .data = &apple_dcp_hw_t6020,  },
