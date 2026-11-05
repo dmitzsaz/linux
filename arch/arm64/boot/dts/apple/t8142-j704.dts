@@ -1,0 +1,336 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/*
+ * Apple MacBook Pro (14-inch, M5, 2025)
+ *
+ * target-type: J704
+ *
+ * Copyright The Asahi Linux Contributors
+ */
+
+/dts-v1/;
+
+#include "t8142.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/leds/common.h>
+#include <dt-bindings/spmi/spmi.h>
+
+/ {
+	compatible = "apple,j704", "apple,t8142", "apple,arm-platform";
+	model = "Apple MacBook Pro (14-inch, M5, 2025)";
+	chassis-type = "laptop";
+
+	aliases {
+		serial0 = &serial0;
+		serial1 = &dockchannel;
+		nvram = &nvram;
+		nvme = &nvme;
+		pmp = &pmp;
+		mtp = &mtp;
+		keyboard = &keyboard;
+		atcphy0 = &atcphy0;
+		atcphy1 = &atcphy1;
+		atcphy2 = &atcphy2;
+		atcphy3 = &atcphy3;
+		usb0 = &dwc3_0;
+		usb1 = &dwc3_1;
+		usb3 = &dwc3_3;
+	};
+
+	chosen {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		stdout-path = "serial0:115200n8";
+
+		framebuffer0: framebuffer@0 {
+			compatible = "apple,simple-framebuffer", "simple-framebuffer";
+			reg = <0 0 0 0>; /* Filled by the loader. */
+			/* Format properties are added by the loader. */
+			status = "disabled";
+		};
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+		/* Filled by the loader. */
+	};
+
+	memory@10000000000 {
+		device_type = "memory";
+		reg = <0x100 0 0x4 0>; /* Filled by the loader. */
+	};
+
+	led-controller {
+		compatible = "pwm-leds";
+
+		led-0 {
+			pwms = <&fpwm0 0 40000>;
+			label = "kbd_backlight";
+			function = LED_FUNCTION_KBD_BACKLIGHT;
+			color = <LED_COLOR_ID_WHITE>;
+			max-brightness = <255>;
+			default-state = "keep";
+		};
+	};
+};
+
+/* ADT voltage-states1-sram level 9 and voltage-states5-sram levels 19-20. */
+&ecluster_opp {
+	opp-3048000000 {
+		opp-hz = /bits/ 64 <3048000000>;
+		opp-level = <9>;
+	};
+};
+
+&pcluster_opp {
+	opp-4512000000 {
+		opp-hz = /bits/ 64 <4512000000>;
+		opp-level = <19>;
+	};
+
+	opp-4608000000 {
+		opp-hz = /bits/ 64 <4608000000>;
+		opp-level = <20>;
+	};
+};
+
+&serial0 {
+	status = "okay";
+};
+
+&pinctrl_ap {
+	/* Pins the firmware lists as no-restore (ADT gpio0) */
+	gpio-reserved-ranges = <78 1>, <136 2>, <163 1>, <203 1>;
+};
+
+&mtp_hid {
+	/* ADT dockchannel-mtp/mtp-transport/multi-touch function-afe-reset */
+	apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+
+	stm { };
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j704.bin";
+		apple,power-method = <2>;
+	};
+
+	/* Layout is filled by the loader using this machine's own data. */
+	keyboard: keyboard { };
+};
+
+/*
+ * Type-C ports: left-front (ATC0) and left-rear (ATC1) on nub SPMI A0,
+ * right (ATC3) on nub SPMI A1. ATC2 has no connector: it drives the HDMI
+ * port through a DisplayPort to HDMI converter.
+ */
+&nub_spmi_a0 {
+	hpm0: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		typec0: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-front";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec0_hs: endpoint {
+						remote-endpoint = <&dwc3_0_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec0_ss: endpoint {
+						remote-endpoint = <&atcphy0_typec>;
+					};
+				};
+			};
+		};
+	};
+
+	hpm1: usb-pd@a {
+		compatible = "apple,sn201202x";
+		reg = <0xa SPMI_USID>;
+
+		typec1: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Left-rear";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec1_hs: endpoint {
+						remote-endpoint = <&dwc3_1_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec1_ss: endpoint {
+						remote-endpoint = <&atcphy1_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&ps_nub_spmi_a1 {
+	status = "okay";
+};
+
+&nub_spmi_a1 {
+	status = "okay";
+
+	hpm3: usb-pd@c {
+		compatible = "apple,sn201202x";
+		reg = <0xc SPMI_USID>;
+
+		typec3: connector {
+			compatible = "usb-c-connector";
+			label = "USB-C Right";
+			power-role = "dual";
+			data-role = "host";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@0 {
+					reg = <0>;
+					typec3_hs: endpoint {
+						remote-endpoint = <&dwc3_3_hs>;
+					};
+				};
+
+				port@1 {
+					reg = <1>;
+					typec3_ss: endpoint {
+						remote-endpoint = <&atcphy3_typec>;
+					};
+				};
+			};
+		};
+	};
+};
+
+&dwc3_0 {
+	ports {
+		port@0 {
+			reg = <0>;
+			dwc3_0_hs: endpoint {
+				remote-endpoint = <&typec0_hs>;
+			};
+		};
+	};
+};
+
+&atcphy0 {
+	ports {
+		port@0 {
+			reg = <0>;
+			atcphy0_typec: endpoint {
+				remote-endpoint = <&typec0_ss>;
+			};
+		};
+	};
+};
+
+&dwc3_1 {
+	ports {
+		port@0 {
+			reg = <0>;
+			dwc3_1_hs: endpoint {
+				remote-endpoint = <&typec1_hs>;
+			};
+		};
+	};
+};
+
+&atcphy1 {
+	ports {
+		port@0 {
+			reg = <0>;
+			atcphy1_typec: endpoint {
+				remote-endpoint = <&typec1_ss>;
+			};
+		};
+	};
+};
+
+&ps_atc3_common {
+	status = "okay";
+};
+
+&ps_atc3_usb_aon {
+	status = "okay";
+};
+
+&ps_atc3_usb {
+	status = "okay";
+};
+
+&dwc3_3_dart_0 {
+	status = "okay";
+};
+
+&dwc3_3_dart_1 {
+	status = "okay";
+};
+
+&dwc3_3 {
+	status = "okay";
+
+	ports {
+		port@0 {
+			reg = <0>;
+			dwc3_3_hs: endpoint {
+				remote-endpoint = <&typec3_hs>;
+			};
+		};
+	};
+};
+
+&atcphy3 {
+	status = "okay";
+
+	ports {
+		port@0 {
+			reg = <0>;
+			atcphy3_typec: endpoint {
+				remote-endpoint = <&typec3_ss>;
+			};
+		};
+	};
+};
+
+/*
+ * Temperatures come from apple,discover-temperatures (t8142.dtsi), which
+ * rules out the fixed temperature lists of hwmon-common/hwmon-laptop.
+ */
+#include "hwmon-fan.dtsi"
+
+&smc_hwmon {
+	fan-F0Ac {
+		/* This SMC names the fan mode key in lower case. */
+		apple,fan-mode = "F0md";
+	};
+};
+
+#include "t8142-j704-usb4.dtsi"
