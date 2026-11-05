@@ -3842,6 +3842,8 @@ int dcp_start(struct platform_device *pdev)
 			  dcp->hw.num_dptx_ports)) &&
 	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return ret;
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
 				 ret);
@@ -3855,6 +3857,8 @@ int dcp_start(struct platform_device *pdev)
 		}
 
 		ret = dptxep_init(dcp);
+		if (ret && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return ret;
 		if (ret) {
 			dev_warn(dcp->dev, "Failed to start DPTX endpoint: %d\n",
 				 ret);

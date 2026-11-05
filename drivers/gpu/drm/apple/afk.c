@@ -106,6 +106,7 @@ struct apple_dcp_afkep *afk_init(struct apple_dcp *dcp, u32 endpoint,
 
 	afkep->ops = ops;
 	afkep->dcp = dcp;
+	afkep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0;
 	afkep->endpoint = endpoint;
 	afkep->wq = alloc_ordered_workqueue("apple-dcp-afkep%02x",
 					    WQ_MEM_RECLAIM, endpoint);
@@ -1490,7 +1491,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 			return;
 		}
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
-					      ep->dcp->fw_compat == DCP_FIRMWARE_H17P);
+					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P || ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0));
 		if (ret) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: failed to extract init props: %d\n",
@@ -2129,7 +2130,8 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		hdr_len = sizeof(*ehdr) + sizeof(*c);
 		if (data_size < hdr_len)
 			goto too_small;
-		if (ep->dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
+		if (ep->dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		    ep->dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		    !afk_validate_h17p_header(data, data_size)) {
 			dev_err(ep->dcp->dev,
 				"AFK[ep:%02x]: invalid compact message length\n",
@@ -2147,7 +2149,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 		 * queue channel at face value binds "system" to 0 and makes
 		 * every later announce and report look like a duplicate.
 		 */
-		channel = le16_to_cpup((__le16 *)(data + 2));
+		channel = get_unaligned_le16(data + 2);
 
 		/*
 		 * Normalise into the wide sub-header the rest of this file
@@ -2513,7 +2515,7 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	}
 
 	spin_lock_irqsave(&ep->lock, flags);
-	if (ep->stopping) {
+	if (ep->stopping || !ep->txbfr.ready) {
 		ret = -ESHUTDOWN;
 		goto out;
 	}
@@ -2527,6 +2529,12 @@ static int afk_send_epic_token(struct apple_dcp_afkep *ep, u32 channel, u16 tag,
 	dma_rmb();
 	rptr = le32_to_cpu(*ep->txbfr.rptr);
 	wptr = le32_to_cpu(*ep->txbfr.wptr);
+	if (rptr >= ep->txbfr.bufsz || wptr >= ep->txbfr.bufsz ||
+	    !IS_ALIGNED(rptr, ep->txbfr.stride) ||
+	    !IS_ALIGNED(wptr, ep->txbfr.stride)) {
+		ret = -EPROTO;
+		goto out;
+	}
 	trace_afk_send_rwptr_pre(ep, rptr, wptr);
 	total_epic_size = sizeof(*ehdr) +
 		(ep->wire_v2 ? sizeof(struct epic_sub_hdr_h17p) : sizeof(*eshdr)) +

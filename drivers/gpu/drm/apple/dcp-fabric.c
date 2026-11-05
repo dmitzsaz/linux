@@ -2290,6 +2290,24 @@ int dcp_direct_crossbar_link(struct apple_dcp *dcp, bool up)
 	struct mux_control *xbar = NULL;
 	int ret;
 
+	if (of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext")) {
+		typeof(&apple_dpxbar_link_configure) configure;
+
+		guard(mutex)(&dcp->tb_lock);
+		xbar = dcp->active_typec_route ?
+			dcp->active_typec_route->active_xbar : dcp->fixed_xbar;
+		if (dcp->dptx_tunnel || !xbar)
+			return -EOPNOTSUPP;
+		if (!up)
+			return dcp_dpxbar_link(xbar, false);
+		configure = symbol_get(apple_dpxbar_link_configure);
+		if (!configure)
+			return -ENODEV;
+		/* T8122-generation PHYs drive PCLK1 with 8b/10b coding. */
+		ret = configure(xbar, 1, false);
+		symbol_put(apple_dpxbar_link_configure);
+		return ret ? ret : dcp_dpxbar_link(xbar, true);
+	}
 	if (!of_machine_is_compatible("apple,t6030"))
 		return 0;
 	guard(mutex)(&dcp->tb_lock);

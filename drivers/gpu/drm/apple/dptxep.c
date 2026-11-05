@@ -87,6 +87,8 @@ struct dptxport_apcall_set_tiled {
 	__le32 retcode;
 };
 
+#include "dptx-drive-v27.inc"
+
 /*
  * SetTiledDisplayHints payload, as DCP sends it for an LG UltraFine 5K
  * (offsets in bytes): tile location (column, row) at 0x08/0x0c, tiles
@@ -284,6 +286,11 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* Protocol-27 drive settings: type, voltage, pre-emphasis. */
+		reply->max_drive_settings[0] = cpu_to_le32(0);
+		memcpy(reply->_unk1, &reply->max_drive_settings[1], sizeof(__le32));
+	}
 
 	return 0;
 }
@@ -444,7 +451,8 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 		dptx->phy_ops.dp.lanes = lane_count;
 		/* USB4 DP IN has no ATC PHY; still accept the lane count. */
 		dptx->phy_ops.dp.set_lanes =
-			service->ep->wire_v2 || dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
+			(service->ep->wire_v2 && dcp->fw_compat != DCP_FIRMWARE_V_27_0) ||
+			dcp_is_usb4_output(dcp) || (dcp->dptx_phy > 3);
 		break;
 	default:
 		dev_err(dcp->dev, "set_active_lane_count: invalid lane count:%llu\n", lane_count);
@@ -469,6 +477,9 @@ static int dptxport_call_set_active_lane_count(struct apple_epic_service *servic
 
 	reply->retcode = cpu_to_le32(retcode);
 	reply->lane_count = cpu_to_le64(lane_count);
+
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		dptx->lane_count = lane_count;
 
 	if (lane_count > 0) {
 		dev_dbg(dcp->dev, "USB4/DPTX: SET_ACTIVE_LANE_COUNT %llu\n",
@@ -655,7 +666,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	 * DEVICE_NOT_STARTED (~5.5s). Advertise HPD so firmware uses
 	 * that path instead of waiting for a PHY start.
 	 */
-	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) &&
+	reply->supported = cpu_to_le32((dcp_is_typec_output(dcp) ||
+					dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 				       !dcp_ext_dptx_607(dcp) &&
 				       !READ_ONCE(service->ep->compact) ? 1 : 0);
 	dev_dbg(dcp->dev, "DPTXPort: GET_SUPPORTS_HPD %u usb4=%d\n",
@@ -946,9 +958,15 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 		return ret;
 	}
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, false, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
 	case DPTX_APCALL_SET_DRIVE_SETTINGS:
+		if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+			return dptxport_call_drive_v27(service, true, data, data_size,
+						     reply, reply_size);
 		return dptxport_call_set_drive_settings(service, data, data_size,
 							reply, reply_size);
         case DPTX_APCALL_ACTIVATE:
@@ -1055,6 +1073,50 @@ static void dptxport_init(struct apple_epic_service *service, const char *name,
 static int dptxport_v2_group_call(struct apple_epic_service *service, u16 group, u32 command,
 			       const void *data, size_t size, void *reply, size_t room)
 {
+	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* SetResourceAvailable is a group-4 callback, not a group-0 command. */
+		if (group == 4 && command == 25) {
+			if (size != 0x20 || room != 0x20 ||
+			    get_unaligned_le64((const u8 *)data + 0x10) > 1)
+				return -EINVAL;
+			memcpy(reply, data, size);
+			put_unaligned_le32(0, reply);
+			return 0;
+		}
+		if (!group && (command == DPTX_APCALL_SET_DRIVE_SETTINGS ||
+			       command == DPTX_APCALL_GET_DRIVE_SETTINGS))
+			return dptxport_call_drive_v27(service,
+				command == DPTX_APCALL_SET_DRIVE_SETTINGS,
+				data, size, reply, room);
+		if (!group && command == DPTX_APCALL_GET_SUPPORTS_DOWN_SPREAD) {
+			if (size != 0x30 || room != 0x30)
+				return -EINVAL;
+			memcpy(reply, data, size);
+			put_unaligned_le32(0, (u8 *)reply + 0x10);
+			memset((u8 *)reply + 0x20, 0, 0x10);
+			return 0;
+		}
+		if (!group && command == DPTX_APCALL_SET_TILED_DISPLAY_HINTS) {
+			if (size != 0xa0 || room != 0xa0)
+				return -EINVAL;
+			memcpy(reply, data, size);
+			/* One pipe; paired/tiled allocations have no admitted ABI here. */
+			memset((u8 *)reply + 0x70, 0, 0x18);
+			put_unaligned_le32(0, (u8 *)reply + 0x90);
+			return 0;
+		}
+		/* Fault callbacks use the common mode invalidation and recovery path. */
+		if (!group && command >= DPTX_APCALL_DEVICE_NOT_RESPONDING &&
+		    command <= DPTX_APCALL_DEVICE_NOT_STARTED) {
+			if (size < 4 || room < 4)
+				return -EINVAL;
+			dcp_external_link_fault(service->ep->dcp);
+			memcpy(reply, data, min(size, room));
+			put_unaligned_le32(0, reply);
+			return 0;
+		}
+	}
+
 	if (group == 1 && command == DPTX_APCALL_SET_DRIVE_SETTINGS)
 		return dptx_j700_training(service, true, data, size, reply, room);
 	if (group == 1 && command == DPTX_APCALL_GET_DRIVE_SETTINGS)
@@ -1301,7 +1363,8 @@ int dptx_controller_init(struct apple_dcp *dcp)
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	/* Controller interfaces require the same OPEN handshake as the port. */
-	ep->wire_v2 = dcp->hw.iomfb_method_profile ==
+	ep->wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	dcp->dptx_controller_ep = ep;
 
@@ -1318,7 +1381,8 @@ int dptx_controller_init(struct apple_dcp *dcp)
 int dptxep_init(struct apple_dcp *dcp)
 {
 	struct apple_dcp_afkep *ep;
-	bool wire_v2 = dcp->hw.iomfb_method_profile ==
+	bool wire_v2 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
+		dcp->hw.iomfb_method_profile ==
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	int ret;
 	u32 port;
@@ -1329,7 +1393,8 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[0].linkcfg_completion);
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
-	ep = afk_init(dcp, wire_v2 ? DPTX_ENDPOINT_V2 : DPTX_ENDPOINT, dptxep_ops);
+	ep = afk_init(dcp, wire_v2 && dcp->fw_compat != DCP_FIRMWARE_V_27_0 ?
+		      DPTX_ENDPOINT_V2 : DPTX_ENDPOINT, dptxep_ops);
 	if (IS_ERR(ep))
 		return PTR_ERR(ep);
 	ep->wire_v2 = wire_v2;

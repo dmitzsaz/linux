@@ -63,6 +63,7 @@ struct dptx_port {
 	u32 link_rate, pending_link_rate;
 	u32 drive_settings[2];
 	u32 trained_voltage[4], trained_pre[4];
+	u32 drive_voltage[4], drive_pre[4];
 	/*
 	 * The sink's tile topology as DCP reports it in SetTiledDisplayHints:
 	 * tiles across and down, and this stream's tile. Valid once
