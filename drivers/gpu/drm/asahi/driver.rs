@@ -154,6 +154,10 @@ macro_rules! asahi_of_device_table {
             <AsahiPlatformDriver as platform::Driver>::IdInfo,
             [
                 (
+                    of::DeviceId::new(c"apple,agx-t8142"),
+                    ProbeConfig::G17(&hw::t8142::CONFIG)
+                ),
+                (
                     of::DeviceId::new(c"apple,agx-t8140"),
                     ProbeConfig::G17(&hw::t8140::CONFIG)
                 ),

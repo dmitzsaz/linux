@@ -1055,6 +1055,10 @@ impl Queue {
                         let start = self.graph.support.dword(at)?.load(Ordering::Acquire);
                         let end = self.graph.support.dword(at + 8)?.load(Ordering::Acquire);
                         if start != 0 && end >= start { return Ok(Some([start, end])); }
+                        if front.packet.completion.has_timestamps()
+                            && (fallback[0] == 0 || fallback[1] < fallback[0]) {
+                            return Err(EIO);
+                        }
                         return Ok(Some(fallback));
                     }
                 }

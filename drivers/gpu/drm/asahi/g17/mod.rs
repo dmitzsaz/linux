@@ -1738,6 +1738,10 @@ impl gpu::Gpu for Gpu {
                 | u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_BOUNDED_AS_BUILD)
                 | sync_output::FEATURE_CUMULATIVE_SIGNALS;
         let variant = self.shared.variant;
+        if variant.compute == fw::compute::ComputeProgram::G17G {
+            params.features |=
+                u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_COMPUTE_RESOURCES);
+        }
         if variant.few_primitives {
             params.features |= u64::from(uapi::drm_asahi_feature_DRM_ASAHI_FEATURE_FEW_PRIMITIVES);
         }
@@ -1832,6 +1836,11 @@ impl gpu::Gpu for Gpu {
             self.shared.variant,
             self.shared.active_cores,
         )?;
+        // 26A434 has one supported scheduling profile. Reject unimplemented priority
+        // classes rather than promising preemption with untested scheduler records.
+        if self.shared.variant.compute == fw::compute::ComputeProgram::G17G && priority != 2 {
+            return Err(EINVAL);
+        }
         let policy = scheduling_policy(priority)?;
         let admission_started = now_ns();
         let (backend, slot) = loop {
