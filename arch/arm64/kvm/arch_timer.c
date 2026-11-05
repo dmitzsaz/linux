@@ -31,6 +31,7 @@ static u32 host_ptimer_irq_flags;
 
 static DEFINE_STATIC_KEY_FALSE(has_gic_active_state);
 DEFINE_STATIC_KEY_FALSE(broken_cntvoff_key);
+DEFINE_STATIC_KEY_FALSE(emulate_guest_timers);
 
 static const u8 default_ppi[] = {
 	[TIMER_PTIMER]  = 30,
@@ -50,6 +51,13 @@ static u64 kvm_arm_timer_read(struct kvm_vcpu *vcpu,
 			      struct arch_timer_context *timer,
 			      enum kvm_arch_timer_regs treg);
 static bool kvm_arch_timer_get_input_level(int vintid);
+
+static bool timer_is_emulated(struct arch_timer_context *ctx,
+			      struct timer_map *map)
+{
+	return static_branch_unlikely(&emulate_guest_timers) ||
+		ctx == map->emul_vtimer || ctx == map->emul_ptimer;
+}
 
 static unsigned long kvm_arch_timer_get_irq_flags(void)
 {
@@ -798,6 +806,13 @@ static void timer_set_traps(struct kvm_vcpu *vcpu, struct timer_map *map)
 	tvt = tpt = tvc = tpc = false;
 	tvt02 = tpt02 = false;
 
+	if (static_branch_unlikely(&emulate_guest_timers)) {
+		/* ECV traps the timers without trapping the counters. */
+		tvt = tpt = true;
+		if (is_hyp_ctxt(vcpu))
+			tvt02 = tpt02 = true;
+	}
+
 	/*
 	 * NV2 badly breaks the timer semantics by redirecting accesses to
 	 * the EL1 timer state to memory, so let's call ECV to the rescue if
@@ -896,6 +911,17 @@ void kvm_timer_vcpu_load(struct kvm_vcpu *vcpu)
 
 	get_timer_map(vcpu, &map);
 
+	if (static_branch_unlikely(&emulate_guest_timers)) {
+		kvm_timer_unblocking(vcpu);
+		/* The map still selects the counter offsets for EL1 or vEL2. */
+		set_cntvoff(timer_get_offset(map.direct_vtimer));
+		set_cntpoff(timer_get_offset(map.direct_ptimer));
+		for (int i = 0; i < nr_timers(vcpu); i++)
+			timer_emulate(vcpu_get_timer(vcpu, i));
+		timer_set_traps(vcpu, &map);
+		return;
+	}
+
 	if (static_branch_likely(&has_gic_active_state)) {
 		/* We don't do NV on GICv5, yet */
 		if (vcpu_has_nv(vcpu) && !vgic_is_v5(vcpu->kvm))
@@ -928,6 +954,16 @@ void kvm_timer_vcpu_put(struct kvm_vcpu *vcpu)
 
 	if (unlikely(!timer->enabled))
 		return;
+
+	if (static_branch_unlikely(&emulate_guest_timers)) {
+		for (int i = 0; i < nr_timers(vcpu); i++)
+			soft_timer_cancel(&vcpu_get_timer(vcpu, i)->hrtimer);
+		set_cntvoff(0);
+		set_cntpoff(0);
+		if (kvm_vcpu_is_blocking(vcpu))
+			kvm_timer_blocking(vcpu);
+		return;
+	}
 
 	get_timer_map(vcpu, &map);
 
@@ -1022,7 +1058,8 @@ void kvm_timer_sync_user(struct kvm_vcpu *vcpu)
 	if (unlikely(!timer->enabled))
 		return;
 
-	if (unlikely(!irqchip_in_kernel(vcpu->kvm)))
+	if (!static_branch_unlikely(&emulate_guest_timers) &&
+	    unlikely(!irqchip_in_kernel(vcpu->kvm)))
 		unmask_vtimer_irq_user(vcpu);
 }
 
@@ -1059,17 +1096,16 @@ void kvm_timer_vcpu_reset(struct kvm_vcpu *vcpu)
 			kvm_timer_update_irq(vcpu, false,
 					     vcpu_get_timer(vcpu, i));
 
-		if (irqchip_in_kernel(vcpu->kvm)) {
+		if (irqchip_in_kernel(vcpu->kvm) &&
+		    !static_branch_unlikely(&emulate_guest_timers)) {
 			kvm_vgic_reset_mapped_irq(vcpu, timer_irq(map.direct_vtimer));
 			if (map.direct_ptimer)
 				kvm_vgic_reset_mapped_irq(vcpu, timer_irq(map.direct_ptimer));
 		}
 	}
 
-	if (map.emul_vtimer)
-		soft_timer_cancel(&map.emul_vtimer->hrtimer);
-	if (map.emul_ptimer)
-		soft_timer_cancel(&map.emul_ptimer->hrtimer);
+	for (int i = 0; i < nr_timers(vcpu); i++)
+		soft_timer_cancel(&vcpu_get_timer(vcpu, i)->hrtimer);
 }
 
 static void timer_context_init(struct kvm_vcpu *vcpu, int timerid)
@@ -1137,6 +1173,13 @@ void kvm_timer_init_vm(struct kvm *kvm)
 
 void kvm_timer_cpu_up(void)
 {
+	if (static_branch_unlikely(&emulate_guest_timers)) {
+		write_sysreg_el0(0, SYS_CNTV_CTL);
+		write_sysreg_el0(0, SYS_CNTP_CTL);
+		isb();
+		return;
+	}
+
 	enable_percpu_irq(host_vtimer_irq, host_vtimer_irq_flags);
 	if (host_ptimer_irq)
 		enable_percpu_irq(host_ptimer_irq, host_ptimer_irq_flags);
@@ -1144,6 +1187,9 @@ void kvm_timer_cpu_up(void)
 
 void kvm_timer_cpu_down(void)
 {
+	if (static_branch_unlikely(&emulate_guest_timers))
+		return;
+
 	disable_percpu_irq(host_vtimer_irq);
 	if (host_ptimer_irq)
 		disable_percpu_irq(host_ptimer_irq);
@@ -1211,7 +1257,7 @@ u64 kvm_arm_timer_read_sysreg(struct kvm_vcpu *vcpu,
 	get_timer_map(vcpu, &map);
 	timer = vcpu_get_timer(vcpu, tmr);
 
-	if (timer == map.emul_vtimer || timer == map.emul_ptimer)
+	if (timer_is_emulated(timer, &map))
 		return kvm_arm_timer_read(vcpu, timer, treg);
 
 	preempt_disable();
@@ -1262,7 +1308,7 @@ void kvm_arm_timer_write_sysreg(struct kvm_vcpu *vcpu,
 
 	get_timer_map(vcpu, &map);
 	timer = vcpu_get_timer(vcpu, tmr);
-	if (timer == map.emul_vtimer || timer == map.emul_ptimer) {
+	if (timer_is_emulated(timer, &map)) {
 		soft_timer_cancel(&timer->hrtimer);
 		kvm_arm_timer_write(vcpu, timer, treg, val);
 		timer_emulate(timer);
@@ -1449,6 +1495,24 @@ int __init kvm_timer_hyp_init(bool has_gic)
 		return -ENODEV;
 	}
 
+	if (kvm_vgic_global_state.timer_irqs_use_imask) {
+		/*
+		 * There is no independent host IRQ mask. Leaving IMASK set
+		 * would change guest reads and lose guest writes, while clearing
+		 * it would reassert the host FIQ. Keep all timer state in memory
+		 * and use ECV to trap timer registers independently of counters.
+		 * Disabling the hardware timers on CPU startup uses EL02
+		 * accessors, so this path requires a host running at EL2.
+		 */
+		if (!has_vhe() || !cpus_have_final_cap(ARM64_HAS_ECV)) {
+			kvm_err("Guest timer IRQ masking requires VHE and ECV\n");
+			return -ENODEV;
+		}
+		static_branch_enable(&emulate_guest_timers);
+		kvm_info("Emulating guest timers without an independent IRQ mask\n");
+		return 0;
+	}
+
 	err = kvm_irq_init(info);
 	if (err)
 		return err;
@@ -1614,6 +1678,9 @@ int kvm_timer_enable(struct kvm_vcpu *vcpu)
 
 	for (int i = 0; i < nr_timers(vcpu); i++)
 		kvm_vgic_set_irq_ops(vcpu, timer_irq(vcpu_get_timer(vcpu, i)), ops);
+
+	if (static_branch_unlikely(&emulate_guest_timers))
+		goto no_vgic;
 
 	ret = kvm_vgic_map_phys_irq(vcpu,
 				    map.direct_vtimer->host_timer_irq,
