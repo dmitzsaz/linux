@@ -341,7 +341,7 @@ impl Registry {
             .flatten()
             .filter_map(|entry| entry.queue.as_deref())
             .any(|queue| {
-                (queue.reusable() || queue.shareable() || queue.can_rearm())
+                (queue.reusable() || (!self.hal300 && queue.shareable()) || queue.can_rearm())
                     && !queue.context().is_some_and(|bound| teardown.releasing(bound))
             });
         if available || self.qids.compute_fits(self.admission.queues() as usize) {
