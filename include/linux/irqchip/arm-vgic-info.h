@@ -38,6 +38,8 @@ struct gic_kvm_info {
 	bool		has_v4_1;
 	/* Deactivation impared, subpar stuff */
 	bool		no_hw_deactivation;
+	/* Masking a guest timer interrupt changes CNT{P,V}_CTL_EL0.IMASK */
+	bool		timer_irqs_use_imask;
 };
 
 #ifdef CONFIG_KVM
