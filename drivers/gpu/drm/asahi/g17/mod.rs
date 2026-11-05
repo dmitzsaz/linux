@@ -540,7 +540,17 @@ impl Coprocessor {
         state: &Arc<RoleState>,
     ) -> Result<rtkit::RtKit<RoleOps>> {
         for attempt in 0..RECEIVER_ATTEMPTS {
-            match rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone()) {
+            let receiver = if state.shared.variant.graph == fw::variant::InitGraph::Hal300 {
+                // HAL300 places its crash log just beyond __DATA in a separate
+                // loader reservation. RTKit must acknowledge that firmware-owned
+                // address without trying to map it inside the data segment.
+                rtkit::RtKit::<RoleOps>::new_with_firmware_crashlog(
+                    dev.as_ref().as_ref(), None, index, state.clone(),
+                )
+            } else {
+                rtkit::RtKit::<RoleOps>::new(dev.as_ref().as_ref(), None, index, state.clone())
+            };
+            match receiver {
                 Ok(receiver) => return Ok(receiver),
                 Err(error) if error == EINVAL || error == ETIMEDOUT => {
                     if attempt + 1 < RECEIVER_ATTEMPTS {
