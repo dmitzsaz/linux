@@ -1634,6 +1634,33 @@ struct drm_asahi_cmd_render {
 };
 
 /**
+ * struct drm_asahi_compute_program - Per-dispatch storage declaration
+ * @primary_bytes: Per-thread primary storage in bytes.
+ * @secondary_bytes: Per-thread secondary storage in bytes.
+ * @linked_bytes: Additional primary storage after linking, in bytes.
+ * @minimum_primary_bytes: Minimum primary storage across variants, in bytes.
+ * @threadgroup_bytes: Storage shared by one workgroup, in bytes.
+ * @threads: Number of invocations in one workgroup; zero uses one clique.
+ * @flags: Reserved, must be zero.
+ *
+ * DRM_ASAHI_SET_COMPUTE_RESOURCES carries an array of these 28-byte records.
+ * It replaces the preceding declarations without advancing either command
+ * index and requires both barriers to be DRM_ASAHI_BARRIER_NONE. The demand
+ * is evaluated for each record before taking componentwise maxima. An empty
+ * array clears the declaration. Available only with
+ * DRM_ASAHI_FEATURE_COMPUTE_RESOURCES.
+ */
+struct drm_asahi_compute_program {
+	__u32 primary_bytes;
+	__u32 secondary_bytes;
+	__u32 linked_bytes;
+	__u32 minimum_primary_bytes;
+	__u32 threadgroup_bytes;
+	__u32 threads;
+	__u32 flags;
+};
+
+/**
  * struct drm_asahi_cmd_compute - Command to submit compute
  *
  * This command submits a control stream consisting of compute dispatches. There
