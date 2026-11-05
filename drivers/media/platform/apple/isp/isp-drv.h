@@ -446,7 +446,7 @@ enum {
 
 static inline bool isp_supports_p010(struct apple_isp *isp)
 {
-	return isp->hw->gen == ISP_GEN_T6040 &&
+	return isp->hw->fw_abi == ISP_FW_ABI_H17 &&
 	       isp_get_current_format(isp)->version == 0x958;
 }
 
