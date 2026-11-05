@@ -31,7 +31,7 @@ struct dropped_present {
 	struct dropped_test *t;
 	struct iomfb_scanout_h17p *scanout;
 	u32 swap_id;
-	bool started, released;
+	bool started, released, defer_reply;
 };
 
 struct dropped_test {
@@ -187,7 +187,8 @@ static struct dropped_test *dropped_test_init(struct kunit *test,
 
 static struct dropped_test *dropped_test_external(struct kunit *test)
 {
-	return dropped_test_init(test, DCP_FIRMWARE_H17P, DCP_IOMFB_METHODS_H17P_EXTERNAL);
+	return dropped_test_init(test, test->priv ? DCP_FIRMWARE_V_27_0 :
+				 DCP_FIRMWARE_H17P, DCP_IOMFB_METHODS_H17P_EXTERNAL);
 }
 
 /* Queue present @i and let the queue send it; the firmware accepts it. */
@@ -219,6 +220,8 @@ static bool dropped_test_complete(struct dropped_test *t, u32 swap_id)
 static int dropped_test_deliver(struct dropped_test *t, u32 swap_id)
 {
 	guard(mutex)(&t->dcp.iomfb.lock);
+	if (t->dcp.fw_compat == DCP_FIRMWARE_V_27_0)
+		return iomfb_v27_deliver_completion(&t->dcp, swap_id, false);
 	return iomfb_h17p_deliver_swap_complete(&t->dcp, swap_id);
 }
 
@@ -518,7 +521,75 @@ static void desktop_present_completion_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_desktop_present_complete(dcp, 43));
 }
 
+static void sdk27_dropped_buffers_test(struct kunit *test)
+{
+	test->priv = (void *)1;
+	dropped_present_buffers_test(test);
+}
+
+static void sdk27_late_completion_test(struct kunit *test)
+{
+	test->priv = (void *)1;
+	retired_completion_in_flight_test(test);
+}
+
+static void sdk27_nested_batch_completion_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_init(test, DCP_FIRMWARE_V_27_0,
+						 DCP_IOMFB_METHODS_H17P_EXTERNAL);
+	struct apple_dcp *dcp = &t->dcp;
+
+	t->present[0].defer_reply = true;
+	dropped_test_present(test, t, 0, &t->fb[1]);
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		KUNIT_ASSERT_EQ(test, iomfb_v27_deliver_completion(dcp, DROPPED_SWAP_ID, true), 0);
+		KUNIT_EXPECT_TRUE(test, dcp->early_complete_v27);
+		KUNIT_EXPECT_TRUE(test, dcp->present_state_h17p.pending);
+		KUNIT_EXPECT_FALSE(test, t->present[0].transaction.completed);
+		KUNIT_EXPECT_EQ(test, dropped_test_refs(&t->fb[0]), 2);
+		/* Only A408's successful reply lets the nested D595 retire scanout. */
+		iomfb_v27_deliver_submit_reply(dcp, DROPPED_SWAP_ID, 0);
+		KUNIT_EXPECT_FALSE(test, dcp->early_complete_v27);
+		KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
+		KUNIT_EXPECT_TRUE(test, t->present[0].transaction.completed);
+		KUNIT_EXPECT_PTR_EQ(test, dcp->iomfb.scanout, t->present[0].scanout);
+	}
+	KUNIT_EXPECT_EQ(test, dropped_test_refs(&t->fb[0]), 1);
+}
+
+static void sdk27_rejected_nested_completion_test(struct kunit *test)
+{
+	struct dropped_test *t = dropped_test_init(test, DCP_FIRMWARE_V_27_0,
+						 DCP_IOMFB_METHODS_H17P_EXTERNAL);
+	struct apple_dcp *dcp = &t->dcp;
+
+	t->present[0].defer_reply = true;
+	dropped_test_present(test, t, 0, &t->fb[1]);
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		KUNIT_ASSERT_EQ(test, iomfb_v27_deliver_completion(dcp, DROPPED_SWAP_ID, false), 0);
+		iomfb_v27_deliver_submit_reply(dcp, DROPPED_SWAP_ID, 1);
+		KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
+		KUNIT_EXPECT_FALSE(test, t->present[0].transaction.completed);
+		KUNIT_EXPECT_EQ(test, dropped_test_refs(&t->fb[0]), 2);
+		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+	}
+}
+
+static void sdk27_callback_shapes_test(struct kunit *test)
+{
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_callback_size_valid(594, 0x730, 0));
+	KUNIT_EXPECT_TRUE(test, iomfb_v27_callback_size_valid(595, 0x2708, 0x400));
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_callback_size_valid(595, 0x2707, 0x400));
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_callback_size_valid(595, 0x2708, 0x401));
+	KUNIT_EXPECT_FALSE(test, iomfb_v27_callback_size_valid(604, 0, 0));
+}
+
 static struct kunit_case dropped_swap_cases[] = {
+	KUNIT_CASE(sdk27_dropped_buffers_test),
+	KUNIT_CASE(sdk27_late_completion_test),
+	KUNIT_CASE(sdk27_callback_shapes_test),
+	KUNIT_CASE(sdk27_nested_batch_completion_test),
+	KUNIT_CASE(sdk27_rejected_nested_completion_test),
 	KUNIT_CASE(desktop_present_completion_test),
 	KUNIT_CASE(dropped_present_retired_test),
 	KUNIT_CASE(dropped_present_buffers_test),

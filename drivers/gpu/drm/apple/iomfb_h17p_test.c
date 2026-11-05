@@ -6,6 +6,7 @@
 #include <linux/unaligned.h>
 
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 
 static void h17p_surface_wire_test(struct kunit *test)
 {
@@ -66,6 +67,41 @@ static void h17p_surface_wire_test(struct kunit *test)
 	iomfb_serialize_present_h17p(wire, request);
 	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59b], (u8)DCP_XFER_FUNC_SDR);
 	KUNIT_EXPECT_EQ(test, ((u8 *)wire)[0x59c], (u8)DCP_COLORSPACE_BG_SRGB);
+}
+
+static void sdk27_backlight_wire_test(struct kunit *test)
+{
+	struct dcp_swap_submit_req_h17p *request;
+	struct dcp_present_h17p *present;
+	struct dcp_swap_submit_req_v27 *wire;
+	u8 *swap;
+
+	request = kunit_kzalloc(test, sizeof(*request), GFP_KERNEL);
+	present = kunit_kzalloc(test, sizeof(*present), GFP_KERNEL);
+	wire = kunit_kmalloc(test, sizeof(*wire), GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, request);
+	KUNIT_ASSERT_NOT_NULL(test, present);
+	KUNIT_ASSERT_NOT_NULL(test, wire);
+	swap = (u8 *)&wire->swap;
+
+	/* The activation flags, ceilings and gain words accompany the level. */
+	iomfb_encode_backlight_h17p(present, 100, 600, true);
+	iomfb_serialize_present_v27(wire, request, present);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(swap + 0x354), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(swap + 0x358), 0x00010101U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le16(swap + 0x35c), 1U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x35e), 0x4059000000000000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x36e), 0x4082c00000000000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x376), 0x4082c00000000000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x37e), 0x3ff0000000000000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x3e6), 0x3ff0000000000000ULL);
+
+	/* An idle frame carries the ceilings without replaying an old update. */
+	iomfb_encode_backlight_h17p(present, 0, 600, false);
+	iomfb_serialize_present_v27(wire, request, present);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le32(swap + 0x354), 0U);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x36e), 0x4082c00000000000ULL);
+	KUNIT_EXPECT_EQ(test, get_unaligned_le64(swap + 0x35e), 0ULL);
 }
 
 static void h17p_opaque_x_parameter_test(struct kunit *test)
@@ -206,6 +242,7 @@ static void h17p_present_retire_test(struct kunit *test)
 
 static struct kunit_case h17p_present_cases[] = {
 	KUNIT_CASE(h17p_surface_wire_test),
+	KUNIT_CASE(sdk27_backlight_wire_test),
 	KUNIT_CASE(h17p_opaque_x_parameter_test),
 	KUNIT_CASE(h17p_callback_bounds_test),
 	KUNIT_CASE(h17p_present_abort_test),

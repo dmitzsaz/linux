@@ -30,6 +30,7 @@
 #include "dcp-180hz.h"
 #include "iomfb.h"
 #include "iomfb_h17p.h"
+#include "iomfb_v27.h"
 #include "iomfb-state.h"
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
@@ -142,6 +143,8 @@ struct dcp_mem_descriptor {
 typedef void (*dcp_callback_t)(struct apple_dcp *, void *, void *);
 
 struct dcp_channel {
+	u64 request[DCP_MAX_CALL_DEPTH];
+	bool command[DCP_MAX_CALL_DEPTH];
 	dcp_callback_t callbacks[DCP_MAX_CALL_DEPTH];
 	void *cookies[DCP_MAX_CALL_DEPTH];
 	void *output[DCP_MAX_CALL_DEPTH];
@@ -403,6 +406,8 @@ struct apple_dcp {
 	struct apple_crtc *crtc;
 	struct apple_connector *connector;
 
+	bool early_complete_v27;
+
 	struct apple_dcp_hw_data hw;
 	bool external_prepared;
 	/* Serializes external connection, power, and CRTC generation changes. */
@@ -501,6 +506,12 @@ struct apple_dcp {
 	/* clock rate request by dcp in */
 	struct clk *clk;
 	struct clk *clk_194;
+	struct clk_bulk_data *firmware_clocks;
+	unsigned int num_firmware_clocks;
+	struct list_head iomfb_boolean_properties;
+	u32 iomfb_boolean_property_count;
+	u32 external_pipes_v27, external_displays_v27, external_suppression_v27;
+	struct dcp_swap_submit_req_v27 present_v27;
 
 	/* DCP shared memory */
 	void *shmem;
@@ -874,7 +885,8 @@ static inline bool iomfb_is_m4(const struct apple_dcp *dcp)
 /* Presents carry nits; one serialized IOMFB owner. */
 static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
 {
-	return (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	return ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		 dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G) ||
 	       iomfb_is_m4(dcp);
 }
@@ -883,6 +895,7 @@ static inline bool dcp_presents_nits(const struct apple_dcp *dcp)
 static inline bool dcp_fail_stop(const struct apple_dcp *dcp)
 {
 	return dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_27_0 ||
 	       iomfb_is_m4(dcp);
 }
 

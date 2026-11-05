@@ -16,6 +16,7 @@
 #include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/kernel.h>
+#include <linux/kref.h>
 #include <linux/module.h>
 #include <linux/mux/driver.h>
 #include <linux/soc/apple/dp-tunnel.h>
@@ -3825,6 +3826,8 @@ int dcp_start(struct platform_device *pdev)
 
 	/* start RTKit endpoints */
 	ret = systemep_init(dcp);
+	if (ret && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		return ret;
 	if (ret)
 		dev_warn(dcp->dev, "Failed to start system endpoint: %d\n", ret);
 
@@ -3835,7 +3838,9 @@ int dcp_start(struct platform_device *pdev)
 				 ret);
 	}
 
-	if (dcp->phy && dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
+	if ((dcp->phy || (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			  dcp->hw.num_dptx_ports)) &&
+	    dcp->fw_compat >= DCP_FIRMWARE_V_13_5) {
 		ret = ibootep_init(dcp);
 		if (ret)
 			dev_warn(dcp->dev, "Failed to start IBOOT endpoint: %d\n",
@@ -3976,6 +3981,9 @@ static void _dcp_poweroff(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweroff_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweroff_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -4073,6 +4081,9 @@ static void __maybe_unused dcp_sleep(struct apple_dcp *dcp)
 	case DCP_FIRMWARE_H17P:
 		iomfb_sleep_h17p(dcp);
 		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_sleep_v27(dcp);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -4086,7 +4097,7 @@ static bool dcp_uses_soft_dpms(struct apple_dcp *dcp)
 	/* The 14.7 panel has its own known-level blank and restore hooks. */
 	return (!iomfb_v14_7_panel_nits(dcp) &&
 		dcp_backlight_active(dcp) && dcp_has_panel(dcp)) ||
-	       (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	       ((dcp->fw_compat == DCP_FIRMWARE_H17P || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		dcp->connector_type == DRM_MODE_CONNECTOR_eDP);
 }
@@ -4150,10 +4161,14 @@ void dcp_poweron(struct platform_device *pdev)
 	}
 
 	if (dcp_uses_soft_dpms(dcp)) {
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+		if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 		    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17G &&
 		    !READ_ONCE(dcp->pipe_enabled_h17p)) {
-			iomfb_poweron_h17p(dcp);
+			if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				iomfb_poweron_v27(dcp);
+			else
+				iomfb_poweron_h17p(dcp);
 			if (!READ_ONCE(dcp->pipe_enabled_h17p)) {
 				dev_err(dcp->dev, "initial display pipe enable failed\n");
 				WRITE_ONCE(dcp->crashed, true);
@@ -4244,6 +4259,9 @@ void dcp_poweron(struct platform_device *pdev)
 		break;
 	case DCP_FIRMWARE_H17P:
 		iomfb_poweron_h17p(dcp);
+		break;
+	case DCP_FIRMWARE_V_27_0:
+		iomfb_poweron_v27(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -4834,6 +4852,19 @@ static enum dcp_firmware_version dcp_check_firmware_version(struct device *dev)
 	char fw_str[DCP_FW_VERSION_STR_LEN];
 	int ret;
 
+	if (of_device_is_compatible(dev->of_node, "apple,t8142-dcp") ||
+	    of_device_is_compatible(dev->of_node, "apple,t8142-dcpext")) {
+		ret = dcp_read_fw_version(dev, "apple,firmware-compat", compat_str);
+		if (ret >= 0 && !strcmp(compat_str, "27.0.0")) {
+			ret = dcp_read_fw_version(dev, "apple,firmware-version", fw_str);
+			return ret >= 0 && !strcmp(fw_str, "27.0.0") ?
+				DCP_FIRMWARE_V_27_0 : DCP_FIRMWARE_UNKNOWN;
+		}
+		/* An external processor has no qualified pre-27 profile. */
+		if (of_device_is_compatible(dev->of_node, "apple,t8142-dcpext"))
+			return DCP_FIRMWARE_UNKNOWN;
+	}
+
 	/*
 	 * SoCs introduced with H17-generation firmware pin its interface; the
 	 * loader may not recognise their boot firmware version.
@@ -5034,6 +5065,18 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 		    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
 			schedule_work(&con->hotplug_wq);
 	}
+}
+
+static int dcp_get_firmware_clocks_v27(struct apple_dcp *dcp)
+{
+	int clocks = devm_clk_bulk_get_all(dcp->dev, &dcp->firmware_clocks);
+
+	if (clocks < 0)
+		return clocks;
+	if (clocks < 2 || clocks > 64)
+		return -EINVAL;
+	dcp->num_firmware_clocks = clocks;
+	return 0;
 }
 
 static bool dcp_external_is_idle(struct apple_dcp *dcp)
@@ -5302,6 +5345,11 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 		goto err_piodma;
 	}
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		ret = dcp_get_firmware_clocks_v27(dcp);
+		if (ret)
+			goto err_piodma;
+	}
 	/*
 	 * T6041: the device tree carries no DCP clock, and the boot loader
 	 * left the coprocessor clocked; D408 then reports 0 Hz, as the
@@ -5814,6 +5862,12 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	iomfb_queue_init(dcp);
 
 	dcp->fw_compat = fw_compat;
+	if (fw_compat == DCP_FIRMWARE_V_27_0) {
+		INIT_LIST_HEAD(&dcp->iomfb_boolean_properties);
+		ret = devm_add_action_or_reset(dev, iomfb_firmware_state_cleanup_v27, dcp);
+		if (ret)
+			return ret;
+	}
 	if (fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
 		dcp->desktop = devm_kzalloc(dev, sizeof(*dcp->desktop), GFP_KERNEL);
 		if (!dcp->desktop)
@@ -5853,6 +5907,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	mutex_init(&dcp->dcpavserv.lock);
 	INIT_WORK(&dcp->dcpavserv.close_wq, dcpavserv_close_work);
 	dcp->hw = *(struct apple_dcp_hw_data *)of_device_get_match_data(dev);
+	if (fw_compat == DCP_FIRMWARE_V_27_0 && !dcp->hw.num_dptx_ports)
+		dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_DEFAULT;
 	/* The display such a processor finds at boot is its first sink. */
 	if (dcp_sink_metadata(dcp))
 		dcp_desktop_metadata_new_sink(dcp);

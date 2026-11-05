@@ -136,8 +136,49 @@ static void iomfb_callback_size_test(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, get_unaligned_le32((u8 *)(record + 1) + 0x1044), 0x12345678U);
 }
 
+static void sdk27_null_callback_slot_test(struct kunit *test)
+{
+	struct apple_dcp *dcp = test->priv;
+	const struct dcp_method_entry method = {
+		.name = "slot-test",
+		.tag = { '0', '0', '0', 'A' },
+	};
+	u8 outer[0x40];
+	u32 value = 0x12345678;
+
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->shmem = kunit_kzalloc(test, 0x80000, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->shmem);
+	/* Suppress only the mailbox send; exercise the real storage and decoder. */
+	dcp->quiescing = true;
+	dcp_push_context(dcp, DCP_CONTEXT_CMD, &method, sizeof(value), sizeof(value),
+			 &value, NULL, NULL);
+	KUNIT_ASSERT_EQ(test, dcp->ch_cmd.depth, 1);
+	memcpy(outer, dcp->shmem, sizeof(outer));
+
+	/* DCP nests a callback inside the outer command; its AP call has no cb. */
+	dcp->ch_cb.depth = 1;
+	dcp->ch_cb.end[0] = sizeof(outer);
+	dcp_push_context(dcp, DCP_CONTEXT_CB, &method, sizeof(value), sizeof(value),
+			 &value, NULL, NULL);
+	KUNIT_EXPECT_MEMEQ(test, dcp->shmem, outer, sizeof(outer));
+	KUNIT_ASSERT_EQ(test, dcp->ch_cb.depth, 2);
+	KUNIT_EXPECT_TRUE(test, dcp->ch_cb.command[1]);
+
+	dcpep_got_msg(dcp, apple_dcp_link_rpc_reply(0));
+	KUNIT_EXPECT_FALSE(test, dcp->crashed);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 1);
+	KUNIT_EXPECT_MEMEQ(test, dcp->shmem, outer, sizeof(outer));
+	/* The outstanding outer command is still owned until its own reply. */
+	dcpep_got_msg(dcp, apple_dcp_link_rpc_reply(0));
+	KUNIT_EXPECT_EQ(test, dcp->ch_cmd.depth, 0);
+	KUNIT_EXPECT_EQ(test, dcp->ch_cb.depth, 1);
+}
+
 static struct kunit_case iomfb_parser_cases[] = {
 	KUNIT_CASE(iomfb_tag_test),
+	KUNIT_CASE(sdk27_null_callback_slot_test),
 	KUNIT_CASE(iomfb_short_callback_test),
 	KUNIT_CASE(iomfb_callback_envelope_test),
 	KUNIT_CASE(iomfb_callback_lengths_test),
