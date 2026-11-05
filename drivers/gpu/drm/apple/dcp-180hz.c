@@ -228,6 +228,12 @@ bool dcp_external_modes_ready(struct apple_dcp *dcp)
 	unsigned int i;
 
 	lockdep_assert_held(&dcp->hpd_mutex);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* SDK27 is admitted by its complete, current firmware catalogue. */
+		guard(spinlock_irqsave)(&dcp->metadata.lock);
+		return dcp_catalog_current(dcp) && dcp->metadata.epoch.connected &&
+		       dcp->metadata.hpd_seen;
+	}
 	guard(mutex)(&dcp->dcpavserv.lock);
 	if (!dcpavserv_edid_current(dcp, dcp->typec_generation) ||
 	    !dcpavserv_edid_service_current(dcp, dcp->dcpavserv.epoch))
