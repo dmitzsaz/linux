@@ -558,7 +558,7 @@ static const struct drm_mode_config_funcs apple_mode_config_funcs = {
 	.atomic_state_free	= apple_atomic_state_free,
 	.atomic_check		= drm_atomic_helper_check,
 	.atomic_commit		= drm_atomic_helper_commit,
-	.fb_create		= drm_gem_fb_create,
+	.fb_create		= drm_gem_fb_create_with_dirty,
 };
 
 static void apple_atomic_commit_tail(struct drm_atomic_commit *state)
