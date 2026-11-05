@@ -417,18 +417,7 @@
 	};
 };
 
-/*
- * Temperatures come from apple,discover-temperatures (t8142.dtsi), which
- * rules out the fixed temperature lists of hwmon-common/hwmon-laptop.
- */
-#include "hwmon-fan.dtsi"
-
-&smc_hwmon {
-	fan-F0Ac {
-		/* This SMC names the fan mode key in lower case. */
-		apple,fan-mode = "F0md";
-	};
-};
+#include "t8142-j704-hwmon.dtsi"
 
 #include "t8142-j704-usb4.dtsi"
 
