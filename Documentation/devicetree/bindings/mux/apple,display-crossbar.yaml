@@ -11,8 +11,9 @@ maintainers:
 
 description:
   Routes display pipelines to the DisplayPort transmitters and inputs
-  of an Apple Type-C PHY. Each crossbar exposes three mux controls,
-  selected by the consumer's mux specifier.
+  of an Apple Type-C PHY. Older crossbars expose three mux controls; T8142 exposes five outputs
+  with four independently selected pixel clocks. The consumer selects an
+  output using its mux specifier.
 
 allOf:
   - $ref: mux-controller.yaml#
@@ -26,6 +27,7 @@ properties:
       - apple,t6020-display-crossbar
       - apple,t6041-display-crossbar
       - apple,t8132-display-crossbar
+      - apple,t8142-display-crossbar
 
   reg:
     maxItems: 1
