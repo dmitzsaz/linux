@@ -784,6 +784,7 @@ int kvm_vgic_hyp_init(void)
 		return -ENODEV;
 
 	has_mask = !gic_kvm_info->no_maint_irq_mask;
+	kvm_vgic_global_state.timer_irqs_use_imask = gic_kvm_info->timer_irqs_use_imask;
 
 	if (has_mask && !gic_kvm_info->maint_irq) {
 		kvm_err("No vgic maintenance irq\n");

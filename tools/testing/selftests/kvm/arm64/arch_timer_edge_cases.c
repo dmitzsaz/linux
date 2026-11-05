@@ -79,6 +79,7 @@ enum sync_cmd {
 	USERSPACE_USLEEP,
 	USERSPACE_SCHED_YIELD,
 	USERSPACE_MIGRATE_SELF,
+	USERSPACE_CHECK_TIMER_CTL,
 	NO_USERSPACE_CMD,
 };
 
@@ -422,6 +423,27 @@ static void test_timer_control_masks(enum arch_timer timer)
 
 	assert_irqs_handled(0);
 	timer_set_ctl(timer, CTL_IMASK);
+}
+
+/* Preserve both guest IMASK values across exits and userspace state transfer. */
+static void test_timer_control_state(enum arch_timer timer)
+{
+	u32 ctl;
+
+	local_irq_disable();
+	reset_timer_state(timer, DEF_CNT);
+	set_tval_irq(timer, -1, CTL_ENABLE);
+
+	for (ctl = 0; ctl <= (CTL_ENABLE | CTL_IMASK); ctl++) {
+		timer_set_ctl(timer, ctl);
+		GUEST_SYNC_ARGS(USERSPACE_CHECK_TIMER_CTL, ctl, timer, 0, 0);
+		GUEST_ASSERT_EQ(timer_get_ctl(timer) & (CTL_ENABLE | CTL_IMASK), ctl);
+	}
+
+	timer_set_ctl(timer, CTL_ENABLE);
+	wait_for_non_spurious_irq();
+	assert_irqs_handled(1);
+	local_irq_enable();
 }
 
 static void test_fire_a_timer_multiple_times(enum arch_timer timer,
@@ -817,6 +839,7 @@ static void guest_run_iteration(enum arch_timer timer)
 
 	test_timer_control_mask_then_unmask(timer);
 	test_timer_control_masks(timer);
+	test_timer_control_state(timer);
 }
 
 static void guest_code(enum arch_timer timer)
@@ -889,6 +912,17 @@ static void handle_sync(struct kvm_vcpu *vcpu, struct ucall *uc)
 	case USERSPACE_MIGRATE_SELF:
 		pin_self_to_cpu(next_pcpu());
 		break;
+	case USERSPACE_CHECK_TIMER_CTL: {
+		u64 reg = timer == PHYSICAL ? KVM_REG_ARM_PTIMER_CTL : KVM_REG_ARM_TIMER_CTL;
+		u64 ctl = vcpu_get_reg(vcpu, reg);
+
+		TEST_ASSERT_EQ(ctl & (CTL_ENABLE | CTL_IMASK), val);
+		/* ISTATUS is read-only, including when restoring userspace state. */
+		vcpu_set_reg(vcpu, reg, val | CTL_ISTATUS);
+		TEST_ASSERT_EQ(vcpu_get_reg(vcpu, reg), val);
+		pin_self_to_cpu(next_pcpu());
+		break;
+	}
 	default:
 		break;
 	}

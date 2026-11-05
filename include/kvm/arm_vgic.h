@@ -171,6 +171,8 @@ struct vgic_global {
 
 	/* Pseudo GICv3 from outer space */
 	bool			no_hw_deactivation;
+	/* No interrupt mask independent of the guest timer control */
+	bool			timer_irqs_use_imask;
 
 	/* GICv3 system register CPU interface */
 	struct static_key_false gicv3_cpuif;
