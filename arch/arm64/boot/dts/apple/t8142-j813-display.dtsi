@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/phy/phy.h>
 
 &dcp {
 
@@ -14,4 +15,72 @@
 		adj-height-mm = <181>;
 		apple,max-brightness = <500>;
 	};
+};
+
+/* Both Type-C connectors can borrow DCPEXT1's source 4. */
+&dcpext1 {
+	apple,connector-type = "USB-C";
+	apple,typec-dptx-phys = <0 1>;
+	apple,typec-mux-indices = <4 4>;
+	mux-controls = <&dpxbar0 0>, <&dpxbar1 0>;
+	mux-control-names = "typec0", "typec1";
+	phys = <&atcphy0 PHY_TYPE_DP>, <&atcphy1 PHY_TYPE_DP>;
+	phy-names = "typec0", "typec1";
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+			port {
+				dcpext1_typec0: endpoint {
+					remote-endpoint = <&typec0_display>;
+				};
+			};
+		};
+
+		route@1 {
+			reg = <1>;
+			mode-switch;
+			status = "disabled";
+			port {
+				dcpext1_typec1: endpoint {
+					remote-endpoint = <&typec1_display>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_display: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_display: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&dpxbar0 {
+	status = "okay";
+};
+
+&dpxbar1 {
+	status = "okay";
 };
