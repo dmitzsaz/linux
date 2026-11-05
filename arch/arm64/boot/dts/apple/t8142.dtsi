@@ -1131,3 +1131,4 @@
 #include "t8142-usb4.dtsi"
 
 #include "t8142-display.dtsi"
+#include "t8142-audio.dtsi"
