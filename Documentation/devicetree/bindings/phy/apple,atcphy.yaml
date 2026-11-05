@@ -77,23 +77,23 @@ allOf:
     else:
       properties:
         reg:
-          minItems: 5
+          minItems: 4
           items:
             - description: Common controls for all PHYs (USB2/3/4, DisplayPort, TBT)
             - description: DisplayPort Alternate Mode PHY specific controls
             - description: Type-C PHY AXI to Apple Fabric interconnect controls
-            - description: USB2 PHY specific controls
+            - description: USB2 PHY controls or T8142 fixed-output LIOA
             - description: USB3 PIPE interface controls
-            - description: Secondary eUSB2 PHY register bank (T8140)
+            - description: Secondary eUSB2 PHY (T8140) or LIOA controls (T8142)
         reg-names:
-          minItems: 5
+          minItems: 4
           items:
             - const: core
             - const: lpdptx
             - const: axi2af
-            - const: usb2phy
+            - enum: [ usb2phy, lioa ]
             - const: pipehandler
-            - const: usb2phy-reg
+            - enum: [ usb2phy-reg, lioa ]
       required:
         - power-domains
   - if:
@@ -123,6 +123,7 @@ allOf:
               enum:
                 - apple,t8132-atcphy
                 - apple,t8140-atcphy
+                - apple,t8142-atcphy
     then:
       properties:
         reg:
@@ -154,6 +155,40 @@ allOf:
         apple,tunable-cio-lane1: false
         apple,tunable-cio-lane1-eq: false
         apple,tunable-cio-post: false
+
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-atcphy
+    then:
+      oneOf:
+        - properties:
+            reg:
+              minItems: 6
+              maxItems: 6
+            reg-names:
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: usb2phy
+                - const: pipehandler
+                - const: lioa
+        - properties:
+            reg:
+              minItems: 4
+              maxItems: 4
+            reg-names:
+              items:
+                - const: core
+                - const: lpdptx
+                - const: axi2af
+                - const: lioa
+    else:
+      properties:
+        apple,tunable-dp-lioa: false
+        apple,tunable-dp-common-config: false
 
 $defs:
   apple,tunable:
@@ -346,6 +381,18 @@ properties:
 
       Note that lane here refers to a USB RX and TX pair re-used for DisplayPort
       and not to an individual DisplayPort differential lane.
+
+  apple,tunable-dp-lioa:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 LIOA setup in the lioa register region, applied after common
+      calibration and before AUX is enabled.
+
+  apple,tunable-dp-common-config:
+    $ref: "#/$defs/apple,tunable"
+    description: >
+      T8142 common configuration in the lpdptx register region, applied
+      after the LIOA list and before AUX is enabled.
 
   apple,tunable-dp-common-pre:
     $ref: "#/$defs/apple,tunable"
