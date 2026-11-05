@@ -1532,7 +1532,7 @@ static int apple_drm_init(struct device *dev)
 				drm_modeset_unlock_all(&apple->drm);
 				t8132_ext_drm_fini(&apple->drm);
 				drm_dev_unregister(&apple->drm);
-				goto err_unbind;
+				goto err_poll;
 			}
 		}
 	}
@@ -1554,7 +1554,7 @@ static int apple_drm_init(struct device *dev)
 	if (ret) {
 		t8132_ext_drm_fini(&apple->drm);
 		drm_dev_unregister(&apple->drm);
-		goto err_unbind;
+		goto err_poll;
 	}
 
 	return 0;
@@ -1562,8 +1562,9 @@ static int apple_drm_init(struct device *dev)
 err_unlock:
 	if (retained_modeset)
 		drm_modeset_unlock_all(&apple->drm);
-err_unbind:
+err_poll:
 	drm_kms_helper_poll_disable(&apple->drm);
+err_unbind:
 	t8132_ext_drm_fini(&apple->drm);
 	apple_drm_quiesce_connectors(&apple->drm);
 	component_unbind_all(dev, NULL);
