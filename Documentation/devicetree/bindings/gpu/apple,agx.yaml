@@ -90,6 +90,7 @@ properties:
       core mask and power sample period in milliseconds. The remaining 496
       bytes are the 103 typed calibration fields of struct Calibration in
       drivers/gpu/drm/asahi/g17/fw/initdata/hal300.rs, in declaration order.
+      Documentation/gpu/asahi-t8142.rst fixes the byte positions for version 1.
       These fields carry per-device power coefficients whose firmware meaning
       is not fully known; they are not object offsets or write commands.
       The maximum pstate and maximum frequency must agree with available OPPs.
