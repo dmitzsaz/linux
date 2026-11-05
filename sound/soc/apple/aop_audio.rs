@@ -11,7 +11,9 @@
 //!   speaker and headphone jack streams (`aop_spkr`);
 //! * the T8140 services (`aop_t8140`): a card with the low-power and the
 //!   high-quality microphones, and the back-end DAIs of the headphone jack
-//!   and the speakers that macaudio links into its card.
+//!   and the speakers that macaudio links into its card;
+//! * the T8142 services (`aop_t8142`): T6041's speaker and jack streams, and
+//!   a microphone array whose PDM part the firmware runs itself.
 //!
 //! Closing the lid of a MacBook disconnects its internal microphones in
 //! hardware.  Every microphone card has an "Internal Mic" jack that reads
@@ -48,11 +50,17 @@ use kernel::{
         aref::ARef,
         atomic::{
             Atomic,
+            AtomicFlag,
             Relaxed, //
         },
         Arc, //
     },
-    types::{ForeignOwnable, ScopeGuard}, //
+    types::{ForeignOwnable, ScopeGuard},
+    workqueue::{
+        impl_has_work,
+        new_work,
+        Work, //
+    }, //
 };
 
 use pin_init::Zeroable;
@@ -60,6 +68,7 @@ use pin_init::Zeroable;
 mod aop_lid;
 mod aop_spkr;
 mod aop_t8140;
+mod aop_t8142;
 
 /// An unaligned u32 type.
 ///
@@ -439,23 +448,12 @@ unsafe impl Zeroable for DecimatorConfigHf {}
 struct PowerSetting {
     dev_id: u32,
     cookie: u32,
-    _unk0: u32,
-    _zero0: [u8; 8],
+    /// The request's time in the AOP's 24 MHz timebase, where the firmware takes it.
+    timestamp: u64,
+    _zero0: u32,
     target_pstate: u32,
     unk1: u32,
     _zero1: [u8; 20],
-}
-
-impl PowerSetting {
-    fn new(dev_id: u32, cookie: u32, target_pstate: u32, unk1: u32) -> PowerSetting {
-        PowerSetting {
-            dev_id,
-            cookie,
-            target_pstate,
-            unk1,
-            ..PowerSetting::default()
-        }
-    }
 }
 
 #[repr(C)]
@@ -541,8 +539,15 @@ struct SndSocAopHwConfig {
     // read-only stream description; the channel masks are property 300 (12 bytes). A refusal of
     // any of the configuration steps is logged and not fatal, so the next step's answer is seen.
     t6040_flow: bool,
+    /// The firmware takes each power request with its time (T8140's firmware family).
+    power_timestamp: bool,
+    /// DMA name of the high-power microphone stream.
+    mic_dma: &'static CStr,
+    /// Host-controlled leaves, attached once for the lifetime of this service device.
+    power_domains: &'static [&'static CStr],
 }
 
+#[pin_data]
 struct SndSocAopData {
     dev: ARef<device::Device>,
     adata: Arc<dyn AOP>,
@@ -550,6 +555,25 @@ struct SndSocAopData {
     pstate_cookie: Atomic<u32>,
     fwnode: ARef<FwNode>,
     hwdata: &'static SndSocAopHwConfig,
+    power_domains: KVec<aop_t8142::PowerDomain>,
+    /// T8142: the microphone array's capture is triggered.
+    hpai_want_run: AtomicFlag,
+    /// T8142: the firmware runs the microphone array (`pwrd`).
+    hpai_running: AtomicFlag,
+    /// T8142: the microphone array's `pwrd`, queued by the capture trigger.
+    #[pin]
+    hpai_start: Work<SndSocAopData>,
+}
+
+// SAFETY: the firmware node is held by reference and only read after probe.
+// Firmware calls and power domains serialize their own state; the microphone
+// work shares only atomics with PCM callbacks and is flushed before teardown.
+unsafe impl Send for SndSocAopData {}
+// SAFETY: as for Send; the remaining fields are immutable after construction.
+unsafe impl Sync for SndSocAopData {}
+
+impl_has_work! {
+    impl HasWork<SndSocAopData> for SndSocAopData { self.hpai_start }
 }
 
 impl SndSocAopData {
@@ -560,17 +584,47 @@ impl SndSocAopData {
         fwnode: ARef<FwNode>,
         hwdata: &'static SndSocAopHwConfig,
     ) -> Result<Arc<SndSocAopData>> {
-        Ok(Arc::new(
-            SndSocAopData {
+        let mut power_domains = KVec::new();
+        for name in hwdata.power_domains {
+            power_domains.push(aop_t8142::PowerDomain::attach(&dev, name)?, GFP_KERNEL)?;
+        }
+        Arc::pin_init(
+            pin_init!(SndSocAopData {
                 dev,
                 adata,
                 service,
                 fwnode,
                 hwdata,
+                power_domains,
                 pstate_cookie: Atomic::new(1),
-            },
+                hpai_want_run: AtomicFlag::new(false),
+                hpai_running: AtomicFlag::new(false),
+                hpai_start <- new_work!("SndSocAopData::hpai_start"),
+            }),
             GFP_KERNEL,
-        )?)
+        )
+    }
+    /// A power request for `dev_id`, stamped with the AOP time where the firmware takes it.
+    fn power_setting(
+        &self,
+        dev_id: u32,
+        cookie: u32,
+        target_pstate: u32,
+        unk1: u32,
+    ) -> Result<PowerSetting> {
+        let timestamp = if self.hwdata.power_timestamp {
+            aop_t8140::aop_timestamp()?
+        } else {
+            0
+        };
+        Ok(PowerSetting {
+            dev_id,
+            cookie,
+            timestamp,
+            target_pstate,
+            unk1,
+            ..PowerSetting::default()
+        })
     }
     fn build_decimator_config(&self, decim: &mut DecimatorConfig) {
         decim.latency = DECIM_LATENCY;
@@ -720,12 +774,12 @@ impl SndSocAopData {
         }
     }
     fn set_audio_power(&self, pstate: u32, unk1: u32) -> Result<()> {
-        let set_pstate = PowerSetting::new(
+        let set_pstate = self.power_setting(
             AUDIO_DEV_HPAI,
             self.pstate_cookie.fetch_add(1, Relaxed),
             pstate,
             unk1,
-        );
+        )?;
         let msg = AudioSetDeviceProp::new(AUDIO_DEV_HPAI, 202, set_pstate);
         let ret = self.epic_wrapped_call(&msg)?;
         if ret != 0 {
@@ -750,7 +804,7 @@ impl SndSocAopData {
         let res = unsafe {
             from_err_ptr(bindings::dma_request_chan(
                 self.dev.as_raw(),
-                c_str!("dma").as_ptr() as _,
+                self.hwdata.mic_dma.as_char_ptr(),
             ))
         };
         if res.is_err() {
@@ -810,10 +864,7 @@ unsafe extern "C" fn aop_hw_params(
 /// # Safety
 ///
 /// Called from a PCM open op with a live substream whose private data is the driver's `Arc`.
-unsafe fn pcm_open_dma(
-    data: &SndSocAopData,
-    substream: *mut bindings::snd_pcm_substream,
-) -> i32 {
+unsafe fn pcm_open_dma(data: &SndSocAopData, substream: *mut bindings::snd_pcm_substream) -> i32 {
     let mut hwparams = bindings::snd_pcm_hardware {
         info: bindings::SNDRV_PCM_INFO_MMAP
             | bindings::SNDRV_PCM_INFO_MMAP_VALID
@@ -1059,18 +1110,27 @@ const HW_CFG_T8013: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 2,
     hf_decimator: false,
     t6040_flow: false,
+    power_timestamp: false,
+    mic_dma: c_str!("dma"),
+    power_domains: &[],
 };
 
 const HW_CFG_T6030: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 3,
     hf_decimator: true,
     t6040_flow: false,
+    power_timestamp: false,
+    mic_dma: c_str!("dma"),
+    power_domains: &[],
 };
 
 const HW_CFG_T6040: SndSocAopHwConfig = SndSocAopHwConfig {
     bytes_per_sample: 3,
     hf_decimator: true,
     t6040_flow: true,
+    power_timestamp: false,
+    mic_dma: c_str!("dma"),
+    power_domains: &[],
 };
 
 /// What a compatible selects.
@@ -1079,12 +1139,15 @@ enum AopVariant {
     Pdm(SndSocAopHwConfig),
     /// The T8140 AOP audio services.
     T8140,
+    /// The T8142 AOP audio services.
+    T8142,
 }
 
 static VARIANT_T8013: AopVariant = AopVariant::Pdm(HW_CFG_T8013);
 static VARIANT_T6030: AopVariant = AopVariant::Pdm(HW_CFG_T6030);
 static VARIANT_T6040: AopVariant = AopVariant::Pdm(HW_CFG_T6040);
 static VARIANT_T8140: AopVariant = AopVariant::T8140;
+static VARIANT_T8142: AopVariant = AopVariant::T8142;
 
 kernel::of_device_table!(
     OF_TABLE,
@@ -1103,13 +1166,19 @@ kernel::of_device_table!(
             of::DeviceId::new(c_str!("apple,t8140-aop-audio")),
             &VARIANT_T8140
         ),
+        (
+            of::DeviceId::new(c_str!("apple,t8142-aop-audio")),
+            &VARIANT_T8142
+        ),
     ]
 );
 
 /// The bound driver, as the variant set it up.
 enum AopAudio {
     /// Held for its `Drop`, which frees the card.
-    Pdm { _driver: SndSocAopDriver },
+    Pdm {
+        _driver: SndSocAopDriver,
+    },
     T8140(aop_t8140::SndSocT8140AopDriver),
 }
 
@@ -1129,6 +1198,9 @@ impl platform::Driver for AopAudio {
                 _driver: SndSocAopDriver::probe(pdev, hw)?,
             },
             AopVariant::T8140 => AopAudio::T8140(aop_t8140::SndSocT8140AopDriver::probe(pdev)?),
+            AopVariant::T8142 => AopAudio::Pdm {
+                _driver: aop_t8142::probe(pdev)?,
+            },
         })
     }
 
@@ -1172,10 +1244,7 @@ impl SndSocAopData {
 }
 
 impl SndSocAopDriver {
-    fn probe(
-        pdev: &platform::Device<Core<'_>>,
-        info: &'static SndSocAopHwConfig,
-    ) -> Result<Self> {
+    fn probe(pdev: &platform::Device<Core<'_>>, info: &'static SndSocAopHwConfig) -> Result<Self> {
         let data = SndSocAopData::probe(pdev, info)?;
         for dev in [AUDIO_DEV_PDM0, AUDIO_DEV_HPAI, AUDIO_DEV_LPAI] {
             data.audio_attach_device(dev)?;
@@ -1223,7 +1292,7 @@ impl SndSocAopDriver {
 module_platform_driver! {
     type: AopAudio,
     name: "snd_soc_apple_aop",
-    description: "Apple AOP audio: microphones, and on T8140 the headphone jack and speakers",
+    description: "Apple AOP audio: microphones, headphone jack and speakers",
     license: "Dual MIT/GPL",
     alias: ["platform:snd_soc_apple_aop"],
     params: {

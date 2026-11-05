@@ -76,8 +76,7 @@ use kernel::{
 };
 
 use super::{
-    AudioAttachDevice, AudioSetDeviceProp, PowerSetting, SndSocAopData, AUDIO_RET_BUSY,
-    EPIC_SUBTYPE_WRAPPED_CALL,
+    AudioAttachDevice, AudioSetDeviceProp, SndSocAopData, AUDIO_RET_BUSY, EPIC_SUBTYPE_WRAPPED_CALL,
 };
 
 const CALLTYPE_AUDIO_GET_PROP: u32 = 0xc3000004;
@@ -220,7 +219,8 @@ impl Service {
         let msg = AudioSetDeviceProp::new(
             self.dev_id,
             PROP_POWER_REQUEST,
-            PowerSetting::new(self.dev_id, st.sequence, state, param),
+            self.aop
+                .power_setting(self.dev_id, st.sequence, state, param)?,
         );
         let ret = self.aop.epic_wrapped_call(&msg)?;
         if ret != 0 {
@@ -241,6 +241,14 @@ impl Service {
 
     /// A user of the service: the first one attaches it (once per firmware lifetime) and raises
     /// `pw1 `.
+    fn domains(&self) -> core::ops::Range<usize> {
+        if self.dev_id == AUDIO_DEV_SPKR {
+            0..1
+        } else {
+            1..2
+        }
+    }
+
     fn get(&self) -> Result<()> {
         let mut st = self.state.lock();
         if st.users == 0 {
@@ -275,6 +283,10 @@ impl Service {
                 st.attached = true;
             }
             self.set_power(&mut st, STATE_PW1, 0)?;
+            if let Err(e) = self.aop.power_up(self.domains()) {
+                let _ = self.set_power(&mut st, STATE_IDLE, 0);
+                return Err(e);
+            }
         }
         st.users += 1;
         Ok(())
@@ -306,6 +318,7 @@ impl Service {
         if let Some(ring) = &self.ring {
             ring.release();
         }
+        self.aop.power_down(self.domains());
         if let Err(e) = self.set_power(&mut st, STATE_IDLE, 0) {
             dev_err!(self.aop.dev, "{} idle failed: {:?}\n", self.tag, e);
         }
