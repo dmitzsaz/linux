@@ -130,37 +130,33 @@
 
 		dai-link@0 {
 			reg = <0>;
-			link-name = "Headphone Jack";
-
-			cpu {
-				sound-dai = <&aop_audio 0>;
-			};
-
-			codec {
-				sound-dai = <&jack_codec>;
-			};
-		};
-
-		dai-link@1 {
-			reg = <1>;
-			link-name = "Speaker";
-			/*
-			 * Codecs in ADT speaker-config order, so that macaudio
-			 * gives them playback slots 0-3 as macOS does (left
-			 * channels in slots 0 and 2, right in 1 and 3).
-			 */
-			dai-tdm-idle-mode-0 = "zero";
-			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
-			dai-tdm-idle-mode-1 = "zero";
-			dai-tdm-slot-tx-idle-mask-1 = <0xff0f0f0f>;
+			link-name = "Speakers";
 
 			cpu {
 				sound-dai = <&aop_audio 3>;
 			};
-
 			codec {
 				sound-dai = <&speaker_left_woofer>, <&speaker_right_woofer>,
 					    <&speaker_left_tweeter>, <&speaker_right_tweeter>;
+			};
+		};
+	};
+
+	sound-jack {
+		compatible = "apple,j813-macaudio-jack", "apple,macaudio";
+		model = "MacBook Air J813 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
 			};
 		};
 	};
