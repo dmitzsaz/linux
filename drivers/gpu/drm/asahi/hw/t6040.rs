@@ -45,6 +45,7 @@ pub(crate) const CONFIG: Config = Config {
     // rest is the policy the M4 Pro has run with; none of it was tested otherwise.
     uat_quirks: UatQuirks {
         reserved_tables: true,
+        reserved_write_combined: false,
         clean_tables: true,
         page_tlbi: true,
         handoff_lock: false,

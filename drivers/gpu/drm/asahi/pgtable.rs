@@ -145,16 +145,24 @@ impl ReservedTables {
         }
     }
 
-    /// Adds a reserved region, mapped write-back.
+    /// Adds a reserved region using the SoC's table cache policy.
     ///
     /// # Safety
     ///
     /// `res` must be a bootloader-reserved region outside System RAM that stays reserved.
-    pub(crate) unsafe fn add(&mut self, res: kernel::io::resource::Resource) -> Result {
+    pub(crate) unsafe fn add_with_cache(
+        &mut self,
+        res: kernel::io::resource::Resource,
+        wc: bool,
+    ) -> Result {
         let start = res.start();
-        // SAFETY: The caller guarantees the region; write-back matches how the firmware maps it.
-        let map =
-            unsafe { kernel::io::mem::Mem::try_new(res, kernel::io::mem::MemFlag::WB.into())? };
+        let flag = if wc {
+            kernel::io::mem::MemFlag::WC
+        } else {
+            kernel::io::mem::MemFlag::WB
+        };
+        // SAFETY: The caller guarantees a reserved region, kept for this owner's lifetime.
+        let map = unsafe { kernel::io::mem::Mem::try_new(res, flag.into())? };
         self.starts.push(start, GFP_KERNEL)?;
         self.regions.push(map, GFP_KERNEL)?;
         Ok(())

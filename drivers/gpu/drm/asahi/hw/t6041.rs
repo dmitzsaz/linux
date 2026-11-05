@@ -34,6 +34,7 @@ pub(crate) const CONFIG: Config = Config {
     opps: OPPS,
     uat_quirks: UatQuirks {
         reserved_tables: true,
+        reserved_write_combined: false,
         clean_tables: true,
         page_tlbi: true,
         handoff_lock: false,

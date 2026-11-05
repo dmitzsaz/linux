@@ -125,12 +125,48 @@ pub(crate) fn identify(
     data_size: u64,
     builds: &'static [FirmwareBuild],
 ) -> Result<&'static FirmwareBuild> {
+    identify_normalized(dev, text, data_size, builds, None)
+}
+
+/// Identify a loaded image whose TEXT contains a relocated DATA pointer.
+/// Check that pointer against the loader reservation before normalizing it.
+pub(crate) fn identify_relocated(
+    dev: &device::Device,
+    text: Range<u64>,
+    data: Range<u64>,
+    builds: &'static [FirmwareBuild],
+    pointer_offset: usize,
+) -> Result<&'static FirmwareBuild> {
+    identify_normalized(
+        dev,
+        text,
+        data.end - data.start,
+        builds,
+        Some((pointer_offset, data.start)),
+    )
+}
+
+fn identify_normalized(
+    dev: &device::Device,
+    text: Range<u64>,
+    data_size: u64,
+    builds: &'static [FirmwareBuild],
+    relocation: Option<(usize, u64)>,
+) -> Result<&'static FirmwareBuild> {
     let size = usize::try_from(text.end - text.start)?;
     let mut copy = copy_physical(text.start, size)?;
     let again = copy_physical(text.start, size)?;
     if copy.as_slice() != again.as_slice() {
         dev_err!(dev, "GPU firmware TEXT changed while it was measured\n");
         return Err(EAGAIN);
+    }
+    if let Some((offset, expected)) = relocation {
+        let end = offset.checked_add(8).ok_or(EINVAL)?;
+        let pointer = copy.get_mut(offset..end).ok_or(EINVAL)?;
+        if pointer != expected.to_le_bytes() {
+            return Err(EINVAL);
+        }
+        pointer.fill(0);
     }
     if let Some(build) = lookup(builds, size as u64, data_size, |at| {
         digest_at(&mut copy, at)
