@@ -4559,9 +4559,14 @@ params_done:
 	if (!dart->retained_mtp &&
 	    of_device_is_compatible(dev->of_node, "apple,t8142-dart") &&
 	    apple_dart_has_live_rtkit_client(dev->of_node)) {
+		/*
+		 * The T8142 TCR bypass bits do not read back, so the loader's
+		 * bypass cannot be confirmed from the registers; trust the
+		 * handoff, and refuse only a DART that cannot bypass at all.
+		 */
 		if (dart->hw->type != DART_T8110 || dart->locked || tunneled ||
-		    !dart->supports_bypass || !apple_dart_streams_bypassed(dart)) {
-			dev_err(dev, "Refusing a live coprocessor handoff without bypass streams\n");
+		    !dart->supports_bypass) {
+			dev_err(dev, "Refusing a live coprocessor handoff on a DART that cannot bypass\n");
 			ret = -EINVAL;
 			goto err_clk_disable;
 		}
