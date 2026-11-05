@@ -235,7 +235,8 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 	struct apple_dcp *dcp = route->dcp;
 
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->fixed_phy)
-		return READ_ONCE(dcp->fixed_sink_present) || READ_ONCE(dcp->fixed_link_held);
+		return !READ_ONCE(dcp->hdmi_yielded) &&
+		       (READ_ONCE(dcp->fixed_sink_present) || READ_ONCE(dcp->fixed_link_held));
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
 		return false;
 	/* Its HDMI display gave the pipeline to a Type-C display. */
@@ -1768,10 +1769,46 @@ static void dcp_typec_route_commit(struct typec_mux_dev *mux,
 	port->applied_status = 0;
 	port->applied_conf = 0;
 	port->applied_valid = true;
-	if (released && released->fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    released->fixed_route_selected && released->fixed_phy && released->active)
-		dcp_dptx_connect(released, 0);
+	if (released && released->fw_compat == DCP_FIRMWARE_V_27_0) {
+		/* The Type-C display is gone: the HDMI display it took over gets it back. */
+		WRITE_ONCE(released->hdmi_yielded, false);
+		if (released->fixed_route_selected && released->fixed_phy && released->active)
+			dcp_dptx_connect(released, 0);
+	}
 	dcp_typec_pipeline_freed();
+}
+
+/*
+ * T8142 firmware 27 has one external pipeline for its HDMI port and its
+ * Type-C ports. A Type-C display that attaches while an HDMI display holds
+ * that pipeline takes it over: the HDMI display yields and its link is
+ * released. It gets the pipeline back when the Type-C display goes, see
+ * dcp_typec_route_commit() and the release paths of dcp_typec_route_apply().
+ */
+static struct apple_dcp_typec_route *
+dcp_typec_take_hdmi_pipeline_locked(struct apple_dcp_typec_port *port)
+{
+	struct apple_dcp_typec_route *route;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	list_for_each_entry(route, &port->routes, port_link) {
+		struct apple_dcp *dcp = route->dcp;
+
+		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->fixed_phy ||
+		    !dcp->hdmi_hpd || route->tunnel || READ_ONCE(dcp->hdmi_yielded) ||
+		    READ_ONCE(dcp->active_typec_route) ||
+		    !dcp_typec_route_fixed_output_busy(route))
+			continue;
+		dev_info(dcp->dev, "the Type-C display on %pOF takes the pipeline over from the HDMI display\n",
+			 port->connector_np);
+		WRITE_ONCE(dcp->hdmi_yielded, true);
+		cancel_delayed_work(&dcp->hdmi_start_wq);
+		dcp_hdmi_yield_link(dcp);
+		WRITE_ONCE(dcp->fixed_link_held, false);
+		WRITE_ONCE(dcp->fixed_sink_present, false);
+		return dcp_typec_free_route(port);
+	}
+	return NULL;
 }
 
 /*
@@ -1883,6 +1920,9 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 				return ret;
 			port->owner = NULL;
 
+			/* A Type-C display that took over from HDMI has gone. */
+			if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+				WRITE_ONCE(dcp->hdmi_yielded, false);
 			/* The hybrid went back to a live HDMI display. */
 			if (dcp->hdmi_hpd && dcp->active && !READ_ONCE(dcp->hdmi_yielded) &&
 			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
@@ -2009,6 +2049,8 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
+		if (!best && hpd)
+			best = dcp_typec_take_hdmi_pipeline_locked(port);
 		/* Every pipeline is driving another port's display. */
 		if (!best)
 			return hpd ? dcp_typec_port_busy(port, route->dcp) : -ENOSPC;
