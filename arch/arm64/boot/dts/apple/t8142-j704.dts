@@ -75,7 +75,8 @@
 			function = LED_FUNCTION_KBD_BACKLIGHT;
 			color = <LED_COLOR_ID_WHITE>;
 			max-brightness = <255>;
-			default-state = "keep";
+			default-brightness = <127>;
+			default-state = "on";
 		};
 	};
 };
