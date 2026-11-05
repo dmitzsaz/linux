@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0+ OR MIT
 /*
- * T8142 internal display pipeline: the DCP coprocessor and its DARTs.
+ * T8142 display coprocessors, their DARTs and the ATC display crossbars.
  *
  * The bootloader leaves DCP running with its firmware mapped through
  * locked DART tables. The loader reserves those mappings and enables the
@@ -13,14 +13,58 @@
 		dcp = &dcp;
 		disp0 = &display;
 		disp0_piodma = &disp0_piodma;
+		dcpext1 = &dcpext1;
+		dispext1 = &display;
+		dispext1_piodma = &dispext1_piodma;
 	};
 
 	display: display-subsystem {
 		compatible = "apple,t8142-display-subsystem", "apple,display-subsystem";
 		/* disp0_dart must be first since it is locked */
-		iommus = <&disp0_dart 0>;
+		iommus = <&disp0_dart 0>, <&dispext1_dart 0>;
 		/* generate phandle explicitly for use in loader */
 		phandle = <&display>;
+	};
+};
+
+/* These islands stay owned by the firmware session inherited from iBoot. */
+&pmgr {
+	ps_dispext1_sys: power-controller@2b8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2b8 4>;
+		#power-domain-cells = <0>;
+		apple,firmware-owned;
+		label = "dispext1-sys";
+		status = "disabled";
+	};
+
+	ps_dispext1_fe: power-controller@3a8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3a8 4>;
+		#power-domain-cells = <0>;
+		power-domains = <&ps_dispext1_sys>;
+		apple,firmware-owned;
+		label = "dispext1-fe";
+		status = "disabled";
+	};
+
+	ps_dispext1_cpu: power-controller@3b8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b8 4>;
+		#power-domain-cells = <0>;
+		power-domains = <&ps_dispext1_fe>;
+		apple,firmware-owned;
+		label = "dispext1-cpu";
+		status = "disabled";
+	};
+
+	ps_dispext1_adma: power-controller@3b0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x3b0 4>;
+		#power-domain-cells = <0>;
+		power-domains = <&ps_dispext1_sys>;
+		label = "dispext1-adma";
+		status = "disabled";
 	};
 };
 
@@ -93,6 +137,164 @@
 		};
 
 	};
+	pmgr_dcpext1: power-management@382730000 {
+		reg = <3 0x82730000 0 8>, <3 0x827b4000 0 4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	dcpext1_mbox: mailbox@3aae08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0xaae08000 0 0x4000>;
+		interrupts = <AIC_IRQ 925 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 926 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 927 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 928 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dispext1_dart: iommu@3aa300000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0xaa300000 0 0xc000>;
+		interrupts = <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dcpext1_dart: iommu@3aa340000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0xaa340000 0 0x20000>;
+		interrupts = <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		power-domains = <&ps_dispext1_cpu>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@3aae00000 {
+		compatible = "apple,t8142-dcpext", "apple,dcpext";
+		reg = <3 0xaae00000 0 0x4000>,
+		      <3 0xa8000000 0 0xb1c000>,
+		      <3 0xaa240000 0 0x10000>,
+		      <3 0xaa3ac000 0 0x4000>,
+		      <3 0xaa800000 0 0x800000>,
+		      <3 0x82700000 0 0x114000>,
+		      <3 0xaa850000 0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 23>;
+		power-domains = <&ps_dispext1_cpu>;
+		clocks = <&clkref>;
+		apple,bw-scratch = <&pmgr_dcpext1 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcpext1 1 6>;
+		apple,iomfb-surfaces = <0 0 1 0>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		phandle = <&dcpext1>;
+		/* Enabled only after the loader validates this boot's retained mappings. */
+		status = "disabled";
+
+		dispext1_piodma: piodma {
+			iommus = <&dispext1_dart 16>;
+			phandle = <&dispext1_piodma>;
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dcpext1_audio: endpoint {
+					remote-endpoint = <&dpaudio2_dcp>;
+				};
+			};
+		};
+	};
+
+	/*
+	 * ADT dp-audio2 -> admac-dispext1 channel 0, through ISOC SID30.
+	 * Keep the audio chain disabled until the firmware-27 AV audio protocol
+	 * and the display ADMAC handoff are supported. Video does not need it.
+	 */
+	dispext1_isoc_dart: iommu@3aa180000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0xaa180000 0 0x20000>;
+		interrupts = <AIC_IRQ 970 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		power-domains = <&ps_dispext1_adma>;
+		status = "disabled";
+	};
+
+	admac_dispext1: dma-controller@3aa140000 {
+		compatible = "apple,t8142-admac", "apple,t8140-admac";
+		reg = <3 0xaa140000 0 0x24000>;
+		dma-channels = <1>;
+		interrupts-extended = <&aic AIC_IRQ 969 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&dispext1_isoc_dart 30>;
+		power-domains = <&ps_dispext1_adma>;
+		status = "disabled";
+	};
+
+	dpaudio2: audio-controller-2 {
+		compatible = "apple,t8142-dpaudio", "apple,dpaudio";
+		dmas = <&admac_dispext1 0>;
+		dma-names = "tx";
+		power-domains = <&ps_dispext1_adma>;
+		status = "disabled";
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@0 {
+				reg = <0>;
+				dpaudio2_dcp: endpoint {
+					remote-endpoint = <&dcpext1_audio>;
+				};
+			};
+		};
+	};
+
+	dpxbar0: mux-controller@40304c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0304c000 0 0x4000>;
+		status = "disabled";
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+	};
+
+	dpxbar1: mux-controller@40b04c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0b04c000 0 0x4000>;
+		status = "disabled";
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+	};
+
+	dpxbar2: mux-controller@41304c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x1304c000 0 0x4000>;
+		status = "disabled";
+		#mux-control-cells = <1>;
+		power-domains = <&pmp_report_atc2>;
+	};
+
+	dpxbar3: mux-controller@41b04c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x1b04c000 0 0x4000>;
+		status = "disabled";
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+	};
 };
 
 &atcphy0 {
@@ -115,14 +317,14 @@
 	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
 };
 
+/* ATC2 has no USB controller: only claim its DisplayPort banks. */
 &atcphy2 {
+	power-domains = <&pmp_report_atc2>;
 	reg = <4 0x13000000 0 0x4c000>,
 	      <4 0x13050000 0 0x8000>,
 	      <4 0x10000000 0 0x8000>,
-	      <4 0x12a90000 0 0x4000>,
-	      <4 0x12a84000 0 0x4000>,
 	      <4 0x10020000 0 0x4000>;
-	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+	reg-names = "core", "lpdptx", "axi2af", "lioa";
 };
 
 &atcphy3 {
