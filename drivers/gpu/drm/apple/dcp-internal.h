@@ -407,6 +407,8 @@ struct apple_dcp {
 	struct apple_connector *connector;
 
 	bool early_complete_v27;
+	bool fixed_sink_known;
+	bool fixed_sink_present;
 
 	struct apple_dcp_hw_data hw;
 	bool external_prepared;

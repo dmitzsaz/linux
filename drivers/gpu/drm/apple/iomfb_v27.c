@@ -11,6 +11,7 @@
 #include "iomfb_v13_3.h"
 #include "version_utils.h"
 #include "dcp-internal.h"
+#include "dcp-fabric.h"
 
 void iomfb_serialize_present_v27(struct dcp_swap_submit_req_v27 *wire,
 				const struct dcp_swap_submit_req_h17p *request,
@@ -169,6 +170,9 @@ static bool trampoline_hotplug_h17p(struct apple_dcp *dcp, int tag,
 				    void *out, void *in)
 {
 	const struct dcp_h17p_hotplug_request *request = in;
+
+	if (dcp_is_external_h17p(dcp))
+		dcp_fixed_sink_hotplug(dcp, !!le64_to_cpu(request->connected));
 
 	if (!(request->tiled_display_null & 1))
 		memcpy(out, request->tiled_display,
