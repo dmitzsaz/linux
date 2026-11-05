@@ -152,6 +152,11 @@ impl Host for Service<'_> {
         // Retain it before Pending removes its reference under the device lock.
         self.reclaim.context(context)
     }
+    fn retain_closed(&mut self, context: &Arc<Context>) -> Result {
+        self.reclaim.context(context)?;
+        self.render.park_closed_pool(context);
+        Ok(())
+    }
     fn report(&mut self, context: &Arc<Context>, failure: Failure) {
         let dev = self.primary.state.shared.dev.as_ref();
         match failure {
@@ -176,6 +181,7 @@ impl Firmware {
     /// pending controls. Recovery blocks new releases, never an observed ack.
     pub(in crate::g17) fn service_teardown(&mut self, reclaim: &mut ReclaimBatch) -> Result {
         self.queues.render.collect_reclaimable(reclaim)?;
+        self.queues.render.collect_closed_retired(&mut self.queues.buffers, reclaim)?;
         if self.queues.teardown.is_empty() {
             return Ok(());
         }
