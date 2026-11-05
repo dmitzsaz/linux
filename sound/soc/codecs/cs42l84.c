@@ -488,6 +488,8 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	struct cs42l84_private *cs42l84 = snd_soc_component_get_drvdata(component);
 	unsigned int inv = fmt & SND_SOC_DAIFMT_INV_MASK;
 	unsigned int ch2_edge;
+	bool dsp_a;
+	int ret;
 
 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
 	case SND_SOC_DAIFMT_BC_FC:
@@ -507,26 +509,33 @@ static int cs42l84_set_dai_fmt(struct snd_soc_dai *codec_dai, unsigned int fmt)
 	case SND_SOC_DAIFMT_I2S:
 		if (inv != SND_SOC_DAIFMT_IB_IF)
 			return -EINVAL;
-		cs42l84->dsp_a = false;
+		dsp_a = false;
 		break;
 	case SND_SOC_DAIFMT_DSP_A:
 		if (inv != SND_SOC_DAIFMT_IB_NF)
 			return -EINVAL;
-		cs42l84->dsp_a = true;
+		dsp_a = true;
 		break;
 	default:
 		return -EINVAL;
 	}
 
-	ch2_edge = cs42l84->dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
-	snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
-			CS42L84_ASP_CTL_TDM_MODE,
-			cs42l84->dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
-	snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
-			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
-	snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
-			CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	ch2_edge = dsp_a ? 0 : CS42L84_ASP_RX_CHx_CTL1_EDGE;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_CTL,
+					    CS42L84_ASP_CTL_TDM_MODE,
+					    dsp_a ? CS42L84_ASP_CTL_TDM_MODE : 0);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_RX_CH2_CTL1,
+					    CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	if (ret < 0)
+		return ret;
+	ret = snd_soc_component_update_bits(component, CS42L84_ASP_TX_CH2_CTL1,
+					    CS42L84_ASP_RX_CHx_CTL1_EDGE, ch2_edge);
+	if (ret < 0)
+		return ret;
 
+	cs42l84->dsp_a = dsp_a;
 	return 0;
 }
 
