@@ -90,6 +90,8 @@ struct apple_pmp_start;
 
 struct apple_pmp_report {
 	struct device *dev;
+	/* Optional independently bound RTKit owner of this report. */
+	struct device_node *pmp;
 	struct apple_pmp_dram dram;
 	struct apple_pmp_ane ane;
 	struct device *ane_owner;
@@ -110,9 +112,89 @@ struct apple_pmp_report {
 	struct delayed_work ready_work;
 };
 
+/* Kept independently of report probe order, including a crash during boot. */
+struct apple_pmp_report_owner {
+	struct list_head list;
+	struct device *dev;
+	bool failed;
+};
+
+static LIST_HEAD(apple_pmp_report_owners);
+static DEFINE_SPINLOCK(apple_pmp_report_owners_lock);
+
+static void apple_pmp_report_remove_owner(void *data)
+{
+	struct apple_pmp_report_owner *owner = data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmp_report_owners_lock, flags);
+	list_del_init(&owner->list);
+	spin_unlock_irqrestore(&apple_pmp_report_owners_lock, flags);
+}
+
+/* Register before starting RTKit; devres removal joins the read-side lock. */
+int apple_pmp_report_register_owner(struct device *dev)
+{
+	struct apple_pmp_report_owner *owner, *it;
+	unsigned long flags;
+
+	owner = devm_kzalloc(dev, sizeof(*owner), GFP_KERNEL);
+	if (!owner)
+		return -ENOMEM;
+	owner->dev = dev;
+	spin_lock_irqsave(&apple_pmp_report_owners_lock, flags);
+	list_for_each_entry(it, &apple_pmp_report_owners, list) {
+		if (it->dev->of_node == dev->of_node) {
+			spin_unlock_irqrestore(&apple_pmp_report_owners_lock, flags);
+			return -EBUSY;
+		}
+	}
+	list_add_tail(&owner->list, &apple_pmp_report_owners);
+	spin_unlock_irqrestore(&apple_pmp_report_owners_lock, flags);
+	return devm_add_action_or_reset(dev, apple_pmp_report_remove_owner, owner);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_register_owner);
+
+/* No firmware/MMIO operations: safe in an RTKit crash callback. */
+void apple_pmp_report_fail_owner(struct device *dev)
+{
+	struct apple_pmp_report_owner *owner;
+	unsigned long flags;
+
+	spin_lock_irqsave(&apple_pmp_report_owners_lock, flags);
+	list_for_each_entry(owner, &apple_pmp_report_owners, list)
+		if (owner->dev == dev)
+			owner->failed = true;
+	spin_unlock_irqrestore(&apple_pmp_report_owners_lock, flags);
+}
+EXPORT_SYMBOL_GPL(apple_pmp_report_fail_owner);
+
+static int apple_pmp_report_owner_error(const struct apple_pmp_report *rep)
+{
+	struct apple_pmp_report_owner *owner;
+	unsigned long flags;
+	int ret = -ENODEV;
+
+	if (!rep->pmp)
+		return 0;
+	spin_lock_irqsave(&apple_pmp_report_owners_lock, flags);
+	list_for_each_entry(owner, &apple_pmp_report_owners, list) {
+		if (owner->dev->of_node == rep->pmp) {
+			ret = owner->failed ? -EIO : 0;
+			break;
+		}
+	}
+	spin_unlock_irqrestore(&apple_pmp_report_owners_lock, flags);
+	return ret;
+}
+
 static bool apple_pmp_report_running(const struct apple_pmp_report *rep)
 {
-	u64 status = readq(rep->base + rep->offsets->status);
+	u64 status;
+
+	if (apple_pmp_report_owner_error(rep))
+		return false;
+	status = readq(rep->base + rep->offsets->status);
 
 	return rep->offsets->running_any ? status : status & PMP_REPORT_READY;
 }
@@ -358,6 +440,7 @@ static int apple_pmp_report_status_show(struct seq_file *s, void *unused)
 	u32 effort;
 
 	seq_printf(s, "running: %u\n", running);
+	seq_printf(s, "owner_error: %d\n", apple_pmp_report_owner_error(rep));
 	if (rep->start)
 		apple_pmp_start_show(s, rep->start);
 	if (!running || !offs->fast_die)
@@ -388,6 +471,11 @@ static void apple_pmp_report_release(void *data)
 	debugfs_remove(rep->debugfs);
 }
 
+static void apple_pmp_report_put_node(void *data)
+{
+	of_node_put(data);
+}
+
 /*
  * Wait for the PMP to run, then hand it every request made so far, as macOS
  * does for each PMP-notified device that is already powered on.
@@ -401,6 +489,8 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 	unsigned long flags;
 	u64 val, want;
 
+	if (apple_pmp_report_owner_error(rep))
+		return;
 	if (!apple_pmp_report_running(rep)) {
 		unsigned int ms = rep->polls++ < PMP_REPORT_FAST_POLLS ?
 				  PMP_REPORT_POLL_MS : PMP_REPORT_POLL_SLOW_MS;
@@ -411,6 +501,10 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 	}
 
 	spin_lock_irqsave(&rep->lock, flags);
+	if (apple_pmp_report_owner_error(rep)) {
+		spin_unlock_irqrestore(&rep->lock, flags);
+		return;
+	}
 	val = readq(rep->base + offs->tgt_read);
 	val = (val & ~rep->known) | rep->shadow;
 	writeq(val, rep->base + offs->tgt_write);
@@ -419,9 +513,12 @@ static void apple_pmp_report_ready_work(struct work_struct *work)
 	spin_unlock_irqrestore(&rep->lock, flags);
 
 	if (want && readq_poll_timeout(rep->base + offs->actual, val,
+				       apple_pmp_report_owner_error(rep) ||
 				       (val & want) == want, 1000, 1000000))
 		dev_warn(rep->dev, "PMP did not acknowledge requests %#llx (ack %#llx)\n",
 			 want, val);
+	if (apple_pmp_report_owner_error(rep))
+		return;
 	dev_info(rep->dev, "PMP running (status %#llx), requests %#llx\n",
 		 readq(rep->base + offs->status), want);
 }
@@ -1327,6 +1424,16 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	if (IS_ERR(rep->base))
 		return PTR_ERR(rep->base);
 	rep->offsets = of_device_get_match_data(dev);
+	/* Other reports can name a halted PMP started by the display handoff. */
+	if (of_device_is_compatible(np, "apple,t8142-pmp-v2-report")) {
+		rep->pmp = of_parse_phandle(np, "apple,pmp", 0);
+		ret = devm_add_action_or_reset(dev, apple_pmp_report_put_node, rep->pmp);
+		if (ret)
+			return ret;
+		ret = apple_pmp_report_owner_error(rep);
+		if (ret == -ENODEV)
+			return -EPROBE_DEFER;
+	}
 	if (of_property_match_string(np, "reg-names", "ane-dvfs") >= 0) {
 		struct resource *res;
 
@@ -1373,7 +1480,7 @@ static int apple_pmp_report_probe(struct platform_device *pdev)
 	list_add_tail_rcu(&rep->list, &apple_pmp_reports);
 	mutex_unlock(&apple_pmp_reports_lock);
 
-	if (rep->offsets->fast_die || rep->start)
+	if (rep->offsets->fast_die || rep->start || rep->pmp)
 		rep->debugfs = debugfs_create_file(dev_name(dev), 0400,
 						   apple_pmp_report_debugfs, rep,
 						   &apple_pmp_report_status_fops);
@@ -1579,8 +1686,14 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 	u64 val;
 	unsigned long flags;
 	bool ready;
+	int ret;
 
 	spin_lock_irqsave(&rep->lock, flags);
+	ret = apple_pmp_report_owner_error(rep);
+	if (ret) {
+		spin_unlock_irqrestore(&rep->lock, flags);
+		return ret;
+	}
 	if (id == PMP_ANE_ID && rep->ane.reserved) {
 		spin_unlock_irqrestore(&rep->lock, flags);
 		return -EBUSY;
@@ -1599,14 +1712,15 @@ static int apple_pmp_report_set_state(struct apple_pmp_report *rep, u32 id,
 		writeq(val, rep->base + rep->offsets->tgt_write);
 	}
 	spin_unlock_irqrestore(&rep->lock, flags);
+	ret = apple_pmp_report_owner_error(rep);
+	if (ret)
+		return ret;
 	if (!ready || !apple_pmp_report_running(rep) || no_ack)
-		return 0;
-	return readq_poll_timeout_atomic(
-		rep->base + rep->offsets->actual,
-		val,
-		!!(val & bit_val) == !!enable,
-		100,
-		50000);
+		return apple_pmp_report_owner_error(rep);
+	ret = readq_poll_timeout_atomic(rep->base + rep->offsets->actual, val,
+					apple_pmp_report_owner_error(rep) ||
+					!!(val & bit_val) == !!enable, 100, 50000);
+	return apple_pmp_report_owner_error(rep) ?: ret;
 }
 
 /* Find and check the report before taking the GPU vote; optionally update it. */
@@ -1686,14 +1800,17 @@ static int apple_pmp_report_entry_wait(struct apple_pmp_report_entry *ent)
 	unsigned long timeout = 0;
 	struct apple_pmp_report *rep;
 	bool found, deferred;
+	int ret;
 
 	for (;;) {
 		found = deferred = false;
+		ret = 0;
 		rcu_read_lock();
 		list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 			if (rep->dev->of_node != ent->report_node)
 				continue;
 			found = true;
+			ret = apple_pmp_report_owner_error(rep);
 			deferred = READ_ONCE(rep->defer);
 			if (deferred && !timeout)
 				timeout = jiffies +
@@ -1703,6 +1820,8 @@ static int apple_pmp_report_entry_wait(struct apple_pmp_report_entry *ent)
 		rcu_read_unlock();
 		if (!found)
 			return -ENODEV;
+		if (ret)
+			return ret;
 		if (!deferred)
 			return 0;
 		if (time_after(jiffies, timeout))
@@ -1742,6 +1861,9 @@ static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, boo
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
+		ret = apple_pmp_report_owner_error(rep);
+		if (ret)
+			break;
 		/* The device request is admitted first and the level dropped first. */
 		if (ent->dvfs && !enable)
 			apple_pmp_report_dvfs_write(rep, ent->dvfs_entry, PMP_DVFS_VALID);
@@ -1771,6 +1893,9 @@ static int apple_pmp_report_entry_sleep(struct apple_pmp_report_entry *ent, bool
 	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
 		if (rep->dev->of_node != ent->report_node)
 			continue;
+		ret = apple_pmp_report_owner_error(rep);
+		if (ret)
+			break;
 		if (release && (!(readq(rep->base + rep->offsets->status) & PMP_REPORT_READY) ||
 				!(readq(rep->base + rep->offsets->actual) & BIT_ULL(ent->id))))
 			ret = -EALREADY;
@@ -2048,4 +2173,5 @@ MODULE_LICENSE("Dual MIT/GPL");
 
 #if IS_ENABLED(CONFIG_APPLE_PMP_REPORT_START_KUNIT_TEST)
 #include "pmp-report-start-test.c"
+#include "pmp-report-owner-test.c"
 #endif

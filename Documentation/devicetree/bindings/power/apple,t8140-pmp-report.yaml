@@ -81,8 +81,10 @@ properties:
   apple,pmp:
     $ref: /schemas/types.yaml#/definitions/phandle
     description:
-      The PMP that publishes this report, on SoCs where the host starts the
-      PMP after a display handoff.
+      The PMP that publishes this report. On T8142, its RTKit driver supplies
+      firmware health so a crash invalidates stale SRAM status and device
+      acknowledgments. On SoCs with a halted PMP, the host starts it after a
+      display handoff.
 
 patternProperties:
   '^report@[0-9a-f]+$':
