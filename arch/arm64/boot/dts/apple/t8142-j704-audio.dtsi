@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: GPL-2.0-only OR MIT
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+/ {
+	speaker_sdz: regulator-sn012776-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "sn012776-sdz";
+		gpios = <&pinctrl_ap 151 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+	};
+
+	sound-jack {
+		compatible = "apple,j704-macaudio-jack", "apple,macaudio";
+		model = "MacBook Pro J704 Jack";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&aop_audio 4>;
+			};
+
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	sound {
+		compatible = "apple,j704-macaudio", "apple,macaudio";
+		model = "MacBook Pro J704";
+		speaker-id-gpios = <&pinctrl_ap 198 GPIO_ACTIVE_HIGH>,
+				   <&pinctrl_ap 199 GPIO_ACTIVE_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dai-link@0 {
+			reg = <0>;
+			link-name = "Speakers";
+
+			cpu {
+				sound-dai = <&aop_audio 3>;
+			};
+
+			codec {
+				sound-dai = <&spk_lw1>, <&spk_rw1>, <&spk_lw2>, <&spk_rw2>,
+					    <&spk_lt>, <&spk_rt>;
+			};
+		};
+	};
+};
+
+&ps_i2c1 {
+	status = "okay";
+};
+
+&ps_i2c3 {
+	status = "okay";
+};
+
+&pmgr_aop {
+	status = "okay";
+};
+
+&aop_mbox {
+	status = "okay";
+};
+
+&aop_setup_mbox {
+	status = "okay";
+};
+
+&aop_dart {
+	status = "okay";
+};
+
+&admac_base_ns {
+	status = "okay";
+};
+
+&admac_leap_s {
+	status = "okay";
+};
+
+&aop {
+	status = "okay";
+};
+
+&aop_audio {
+	apple,chassis-name = "J704";
+	apple,machine-kind = "MacBook Pro";
+};
+
+&i2c1 {
+	status = "okay";
+	clock-frequency = <100000>;
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		/* The driver drives this line high to run the codec. */
+		reset-gpios = <&pinctrl_nub 18 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 100 IRQ_TYPE_LEVEL_LOW>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Jack";
+	};
+};
+
+/* All six amplifiers share SDZ and the level-low fault interrupt. */
+&i2c3 {
+	status = "okay";
+	clock-frequency = <100000>;
+
+	spk_lw1: codec@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <0>;
+		ti,vmon-slot-no = <2>;
+	};
+
+	spk_lw2: codec@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <8>;
+		ti,vmon-slot-no = <10>;
+	};
+
+	spk_lt: codec@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <16>;
+		ti,vmon-slot-no = <18>;
+	};
+
+	spk_rw1: codec@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <4>;
+		ti,vmon-slot-no = <6>;
+	};
+
+	spk_rw2: codec@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <12>;
+		ti,vmon-slot-no = <14>;
+	};
+
+	spk_rt: codec@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		SDZ-supply = <&speaker_sdz>;
+		apple,sdz-group-fail-closed;
+		apple,deferred-shutdown;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		interrupts-extended = <&pinctrl_ap 150 IRQ_TYPE_LEVEL_LOW>;
+		ti,bclk-ratio = <250>;
+		ti,imon-slot-no = <20>;
+		ti,vmon-slot-no = <22>;
+	};
+};
+
+&pinctrl_nub {
+	/* Only the codec reset pin is accessible to the host. */
+	gpio-reserved-ranges = <0 18>, <19 21>;
+};
