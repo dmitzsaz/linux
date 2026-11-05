@@ -55,6 +55,9 @@
  *	not only bit 0
  * @defer_requests: keep power state requests in memory until the PMP runs,
  *	then write them all at once; nothing is written to a stopped PMP
+ * @defer_wait_ms: with @defer_requests, how long a sleeping power-on of an
+ *	entry waits for the PMP to run so that its request is acknowledged
+ *	before the domain counts as on; 0 to report it on at once
  * @starts_pmp: this driver starts a halted PMP that a display gate hands
  *	over to the report (see apple_pmp_start_init())
  * @name: with @starts_pmp, the SoC in messages
@@ -75,6 +78,7 @@ struct apple_pmp_report_offsets {
 	u32 dvfs_first, dvfs_count;
 	bool running_any;
 	bool defer_requests;
+	unsigned int defer_wait_ms;
 	bool starts_pmp;
 	const char *name;
 	const char *fallback;
@@ -1516,6 +1520,8 @@ static const struct apple_pmp_report_offsets apple_pmp_offsets_t8142 = {
 	.status = 0x10,
 	.running_any = true,
 	.defer_requests = true,
+	/* pmp.rs starts the PMP while the kernel boots; allow for a slow start. */
+	.defer_wait_ms = 10000,
 };
 
 static const struct of_device_id apple_pmp_report_of_match[] = {
@@ -1671,6 +1677,58 @@ static void apple_pmp_report_dvfs_write(struct apple_pmp_report *rep, u32 entry,
 	writeq(val, rep->base + rep->offsets->update + 8 * entry);
 }
 
+/*
+ * Wait until the report of @ent hands its requests to a running PMP. The
+ * report is looked up afresh on every check, so it may go away meanwhile.
+ */
+static int apple_pmp_report_entry_wait(struct apple_pmp_report_entry *ent)
+{
+	unsigned long timeout = 0;
+	struct apple_pmp_report *rep;
+	bool found, deferred;
+
+	for (;;) {
+		found = deferred = false;
+		rcu_read_lock();
+		list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+			if (rep->dev->of_node != ent->report_node)
+				continue;
+			found = true;
+			deferred = READ_ONCE(rep->defer);
+			if (deferred && !timeout)
+				timeout = jiffies +
+					  msecs_to_jiffies(rep->offsets->defer_wait_ms);
+			break;
+		}
+		rcu_read_unlock();
+		if (!found)
+			return -ENODEV;
+		if (!deferred)
+			return 0;
+		if (time_after(jiffies, timeout))
+			return -ETIMEDOUT;
+		msleep(PMP_REPORT_POLL_MS);
+	}
+}
+
+static bool apple_pmp_report_entry_waits(struct apple_pmp_report_entry *ent)
+{
+	struct apple_pmp_report *rep;
+	bool wait = false;
+
+	if (ent->genpd.flags & GENPD_FLAG_IRQ_SAFE)
+		return false;
+	rcu_read_lock();
+	list_for_each_entry_rcu(rep, &apple_pmp_reports, list) {
+		if (rep->dev->of_node == ent->report_node) {
+			wait = READ_ONCE(rep->defer) && rep->offsets->defer_wait_ms;
+			break;
+		}
+	}
+	rcu_read_unlock();
+	return wait;
+}
+
 static int apple_pmp_report_entry_set_state(struct generic_pm_domain *genpd, bool enable)
 {
 	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
@@ -1772,6 +1830,19 @@ static const struct dev_pm_ops apple_pmp_report_entry_pm_ops = {
 
 static int apple_pmp_report_entry_power_on(struct generic_pm_domain *genpd)
 {
+	struct apple_pmp_report_entry *ent = genpd_to_apple_pmp_report_entry(genpd);
+	int ret;
+
+	/*
+	 * A consumer may touch its hardware as soon as the domain is on, so an
+	 * entry whose request must be acknowledged first waits for the PMP,
+	 * where the report allows it and the domain may sleep.
+	 */
+	if (apple_pmp_report_entry_waits(ent)) {
+		ret = apple_pmp_report_entry_wait(ent);
+		if (ret)
+			return ret;
+	}
 	return apple_pmp_report_entry_set_state(genpd, true);
 }
 
