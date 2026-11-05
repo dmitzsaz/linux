@@ -2466,6 +2466,14 @@ struct macaudio_platform_cfg macaudio_j616_jack_cfg = {
 	.route_only_fes = BIT(1),
 };
 
+/* J704 uses the same jack stream with the opposite FSYNC edge. */
+struct macaudio_platform_cfg macaudio_j704_jack_cfg = {
+	.fe_dai_names = { "j616-jack-pcm-0", "j616-jack-pcm-1" },
+	.dai_fmt = SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_CBC_CFC | SND_SOC_DAIFMT_IB_IF,
+	.fe_cpu_is_platform = true,
+	.route_only_fes = BIT(1),
+};
+
 struct macaudio_platform_cfg macaudio_fallback_cfg = {
 	false,	AMP_NONE,	SPKR_NONE,	false,	0,	0,
 };
@@ -2535,6 +2543,13 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	{ .compatible = "apple,j616-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j700    AID44   max98360a   -       2x 1W    (AOP-fed, software gain) */
 	{ .compatible = "apple,j700-macaudio", .data = &macaudio_j700_cfg },
+	/* j704    AID39   sn012776    15      2x 2W+1T (AOP-fed, one serializer) */
+	{ .compatible = "apple,j704-macaudio", .data = &macaudio_j616_cfg },
+	/* j704    AID39   cs42l84     -       the jack, a card of its own (AOP-fed) */
+	{ .compatible = "apple,j704-macaudio-jack", .data = &macaudio_j704_jack_cfg },
+	/* j813    -       sn012776    -       2x 1W+1T, the J713 AOP stream */
+	{ .compatible = "apple,j813-macaudio", .data = &macaudio_j713_cfg },
+	{ .compatible = "apple,j813-macaudio-jack", .data = &macaudio_j616_jack_cfg },
 	/* j713    -       sn012776    15      2x 1W+1T (AOP-fed, one serializer) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
 	/* The J713 jack runs on the AOP like the J616s one. */
