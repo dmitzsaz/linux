@@ -945,6 +945,9 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.resident_fw = true,
 	/* The J813 IMX958 runs the xx24 setfile 2224_01, as T6040 does. */
 	.setfile_stride_fixup = true,
+	/* Rheia's native metadata reader uses section offset 0x1c, +0/+4. */
+	.meta_exposure = true,
+	.meta_analog_gain = true,
 };
 
 static const struct of_device_id apple_isp_of_match[] = {
