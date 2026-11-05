@@ -2396,13 +2396,22 @@ enum nl80211_auth_type brcmf_war_auth_type(struct brcmf_if *ifp,
 	return type;
 }
 
-static void brcmf_set_join_pref(struct brcmf_if *ifp,
-				struct cfg80211_bss_selection *bss_select)
+static int brcmf_set_join_pref(struct brcmf_if *ifp,
+			       struct cfg80211_connect_params *sme)
 {
+	struct cfg80211_bss_selection *bss_select = &sme->bss_select;
 	struct brcmf_pub *drvr = ifp->drvr;
-	struct brcmf_join_pref_params join_pref_params[2];
+	struct brcmf_join_pref_params join_pref_params[2] = {};
+	struct brcmf_join_pref_wpa wpa = {};
+	u8 pref[sizeof(join_pref_params) + sizeof(wpa)];
+	bool sae = ifp->vif->profile.use_fwsup == BRCMF_PROFILE_FWSUP_SAE;
 	enum nl80211_band band;
 	int err, i = 0;
+	u32 len;
+
+	if (sae && (!sme->crypto.n_akm_suites ||
+		    !sme->crypto.n_ciphers_pairwise || !sme->crypto.cipher_group))
+		return -EINVAL;
 
 	join_pref_params[i].len = 2;
 	join_pref_params[i].rssi_gain = 0;
@@ -2412,8 +2421,15 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 
 	switch (bss_select->behaviour) {
 	case __NL80211_BSS_SELECT_ATTR_INVALID:
-		brcmf_c_set_joinpref_default(ifp);
-		return;
+		if (!sae) {
+			brcmf_c_set_joinpref_default(ifp);
+			return 0;
+		}
+		join_pref_params[i].type = BRCMF_JOIN_PREF_RSSI_DELTA;
+		join_pref_params[i].rssi_gain = BRCMF_JOIN_PREF_RSSI_BOOST;
+		join_pref_params[i].band = WLC_BAND_5G;
+		i++;
+		break;
 	case NL80211_BSS_SELECT_ATTR_BAND_PREF:
 		join_pref_params[i].type = BRCMF_JOIN_PREF_BAND;
 		band = bss_select->param.band_pref;
@@ -2435,10 +2451,34 @@ static void brcmf_set_join_pref(struct brcmf_if *ifp,
 	join_pref_params[i].len = 2;
 	join_pref_params[i].rssi_gain = 0;
 	join_pref_params[i].band = 0;
-	err = brcmf_fil_iovar_data_set(ifp, "join_pref", join_pref_params,
-				       sizeof(join_pref_params));
+	len = (i + 1) * sizeof(join_pref_params[0]);
+	memcpy(pref, join_pref_params, len);
+	if (sae) {
+		/* SAE offload builds its own RSNE after clearing wpaie. The
+		 * legacy wsec AES bit does not distinguish CCMP from GCMP, so
+		 * constrain firmware BSS selection to the requested RSN suites.
+		 */
+		wpa.type = BRCMF_JOIN_PREF_WPA;
+		wpa.num_suites = 1;
+		wpa.akm = cpu_to_be32(sme->crypto.akm_suites[0]);
+		wpa.pairwise = cpu_to_be32(sme->crypto.ciphers_pairwise[0]);
+		wpa.group = cpu_to_be32(sme->crypto.cipher_group);
+		memcpy(pref + len, &wpa, sizeof(wpa));
+		len += sizeof(wpa);
+	}
+	err = brcmf_fil_iovar_data_set(ifp, "join_pref", pref, len);
+	if (err && sae &&
+	    bss_select->behaviour == __NL80211_BSS_SELECT_ATTR_INVALID) {
+		/* Some firmware rejects the default band boost. Keep the WPA
+		 * constraint when falling back to RSSI-only BSS selection.
+		 */
+		err = brcmf_fil_iovar_data_set(ifp, "join_pref",
+					       pref + sizeof(join_pref_params[0]),
+					       len - sizeof(join_pref_params[0]));
+	}
 	if (err)
 		bphy_err(drvr, "Set join_pref error (%d)\n", err);
+	return sae ? err : 0;
 }
 
 static s32
@@ -2593,7 +2633,9 @@ brcmf_cfg80211_connect(struct wiphy *wiphy, struct net_device *ndev,
 		if (err)
 			goto done;
 	}
-	brcmf_set_join_pref(ifp, &params->bss_select);
+	err = brcmf_set_join_pref(ifp, params);
+	if (err)
+		goto done;
 	if (params->ssid_len < IEEE80211_MAX_SSID_LEN)
 		brcmf_dbg(CONN, "SSID \"%s\", len (%zu)\n", params->ssid,
 			  params->ssid_len);

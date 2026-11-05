@@ -30,7 +30,6 @@ MODULE_LICENSE("Dual BSD/GPL");
 #define BRCMF_DEFAULT_SCAN_UNASSOC_TIME	40
 
 /* default boost value for RSSI_DELTA in preferred join selection */
-#define BRCMF_JOIN_PREF_RSSI_BOOST	8
 
 #define BRCMF_DEFAULT_TXGLOM_SIZE	32  /* max tx frames in glom chain */
 

@@ -212,6 +212,8 @@ enum brcmf_join_pref_types {
 	BRCMF_JOIN_PREF_RSSI_DELTA,
 };
 
+#define BRCMF_JOIN_PREF_RSSI_BOOST	8
+
 enum brcmf_fil_p2p_if_types {
 	BRCMF_FIL_P2P_IF_CLIENT,
 	BRCMF_FIL_P2P_IF_GO,
@@ -669,6 +671,17 @@ struct brcmf_join_pref_params {
 	u8 len;
 	u8 rssi_gain;
 	u8 band;
+};
+
+/* WPA preference length is reserved and must be zero. Suites use wire order. */
+struct brcmf_join_pref_wpa {
+	u8 type;
+	u8 len;
+	u8 reserved;
+	u8 num_suites;
+	__be32 akm;
+	__be32 pairwise;
+	__be32 group;
 };
 
 /* used for join with or without a specific bssid and channel list */
