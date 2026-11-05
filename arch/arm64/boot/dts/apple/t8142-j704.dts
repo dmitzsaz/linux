@@ -35,6 +35,8 @@
 		usb0 = &dwc3_0;
 		usb1 = &dwc3_1;
 		usb3 = &dwc3_3;
+		wifi0 = &wifi0;
+		bluetooth0 = &bluetooth0;
 	};
 
 	chosen {
@@ -334,6 +336,69 @@
 				remote-endpoint = <&typec3_ss>;
 			};
 		};
+	};
+};
+
+/*
+ * APCIe: port 0 carries the Wi-Fi/Bluetooth module (BCM4388, "linosa"),
+ * port 2 the SD card reader (GL9755). PERST# is gpio0 192/194 (ADT
+ * pci-bridgeN function-perst), power the SMC functions above.
+ */
+&ps_st0_aus5_aon {
+	status = "okay";
+};
+
+&ps_st0_aus5 {
+	status = "okay";
+};
+
+&apcie_dart0 {
+	status = "okay";
+};
+
+&apcie_dart2 {
+	status = "okay";
+};
+
+&apcie {
+	status = "okay";
+};
+
+&apcie_port0 {
+	bus-range = <1 1>;
+	reset-gpios = <&pinctrl_ap 192 GPIO_ACTIVE_LOW>;
+	pwren-gpios = <&smc_gpio 0x13 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+
+	wifi0: wifi@0,0 {
+		compatible = "pci14e4,4434";
+		reg = <0x10000 0x0 0x0 0x0 0x0>;
+		brcm,board-type = "apple,linosa";
+		/* To be filled by the loader */
+		local-mac-address = [00 00 00 00 00 00];
+		apple,antenna-sku = "XX";
+	};
+
+	bluetooth0: bluetooth@0,1 {
+		compatible = "pci14e4,5f72";
+		reg = <0x10100 0x0 0x0 0x0 0x0>;
+		brcm,board-type = "apple,linosa";
+		/* To be filled by the loader */
+		local-bd-address = [00 00 00 00 00 00];
+	};
+};
+
+&apcie_port2 {
+	bus-range = <2 2>;
+	reset-gpios = <&pinctrl_ap 194 GPIO_ACTIVE_LOW>;
+	pwren-gpios = <&smc_gpio 0x19 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+
+	sdhci0: mmc@0,0 {
+		compatible = "pci17a0,9755";
+		reg = <0x20000 0x0 0x0 0x0 0x0>;
+		cd-inverted;
+		wp-inverted;
 	};
 };
 
