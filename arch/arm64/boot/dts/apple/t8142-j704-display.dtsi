@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/phy/phy.h>
+
+/ {
+	aliases {
+		dcpext1 = &dcpext1;
+		dispext1 = &display;
+		dispext1_piodma = &dispext1_piodma;
+	};
+
+	/* ADT disp0 clock-frequencies[6]; selector 1 is the reference clock. */
+	clk_display_video: clock-display-video {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <402280000>;
+	};
+};
+
+&display {
+	/* The loader enables and reserves both display DARTs before admission. */
+	iommus = <&disp0_dart 0>, <&dispext1_dart 0>;
+};
+
+&dcp {
+	apple,notch-height = <74>;
+	clocks = <&clk_display_video>, <&clkref>;
+	clock-names = "video", "reference";
+
+	panel {
+		compatible = "apple,panel-j704", "apple,panel-mini-led", "apple,panel";
+		width-mm = <302>;
+		height-mm = <196>;
+		adj-height-mm = <189>;
+		apple,max-brightness = <600>;
+	};
+};
+
+&{/soc} {
+	pmgr_dcpext1: power-management@382730000 {
+		reg = <3 0x82730000 0 8>, <3 0x827b4000 0 4>;
+		reg-names = "dcp-bw-scratch", "dcp-bw-doorbell";
+		#apple,bw-scratch-cells = <3>;
+		#apple,bw-doorbell-cells = <2>;
+	};
+
+	dcpext1_mbox: mailbox@3aae08000 {
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <3 0xaae08000 0 0x4000>;
+		interrupts = <AIC_IRQ 925 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 926 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 927 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 928 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	dispext1_dart: iommu@3aa300000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0xaa300000 0 0xc000>;
+		interrupts = <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		status = "disabled";
+	};
+
+	dcpext1_dart: iommu@3aa340000 {
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <3 0xaa340000 0 0x20000>;
+		interrupts = <AIC_IRQ 947 IRQ_TYPE_LEVEL_HIGH>;
+		#iommu-cells = <1>;
+		apple,dma-range = <0x100 0 0x10 0>;
+		status = "disabled";
+	};
+
+	dcpext1: dcp@3aae00000 {
+		compatible = "apple,t8142-dcpext", "apple,dcpext";
+		reg = <3 0xaae00000 0 0x4000>,
+		      <3 0xa8000000 0 0xb1c000>,
+		      <3 0xaa240000 0 0x10000>,
+		      <3 0xaa3ac000 0 0x4000>,
+		      <3 0xaa800000 0 0x800000>,
+		      <3 0x82700000 0 0x114000>,
+		      <3 0xaa850000 0 0x4000>;
+		reg-names = "coproc", "disp-0", "disp-1", "disp-2", "disp-3", "disp-4", "iop-vbar";
+		mboxes = <&dcpext1_mbox>;
+		mbox-names = "mbox";
+		iommus = <&dcpext1_dart 23>;
+		clocks = <&clk_display_video>, <&clkref>;
+		clock-names = "video", "reference";
+		apple,bw-scratch = <&pmgr_dcpext1 0 5 0>;
+		apple,bw-doorbell = <&pmgr_dcpext1 1 6>;
+		apple,iomfb-surfaces = <0 0 1 0>;
+		apple,connector-type = "HDMI-A";
+		apple,dptx-phy = <2>;
+		apple,typec-dptx-phys = <3 0 1>;
+		apple,typec-mux-indices = <4 4 4>;
+		mux-index = <4>;
+		mux-controls = <&dpxbar3 0>, <&dpxbar0 0>, <&dpxbar1 0>, <&dpxbar2 0>;
+		mux-control-names = "typec0", "typec1", "typec2", "dp-xbar";
+		phys = <&atcphy3 PHY_TYPE_DP>, <&atcphy0 PHY_TYPE_DP>,
+		       <&atcphy1 PHY_TYPE_DP>, <&atcphy2 PHY_TYPE_DP>;
+		phy-names = "typec0", "typec1", "typec2", "dp-phy";
+		hdmi-hpd-gpios = <&pinctrl_ap 41 GPIO_ACTIVE_HIGH>;
+		hdmi-pwren-gpios = <&smc_gpio 15 GPIO_ACTIVE_HIGH>;
+		dp2hdmi-pwren-gpios = <&smc_gpio 26 GPIO_ACTIVE_HIGH>;
+		#address-cells = <2>;
+		#size-cells = <2>;
+		phandle = <&dcpext1>;
+		/* Enabled only after the loader validates this boot's retained mappings. */
+		status = "disabled";
+
+		dispext1_piodma: piodma {
+			iommus = <&dispext1_dart 16>;
+			phandle = <&dispext1_piodma>;
+		};
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			port@1 {
+				reg = <1>;
+				dcpext1_hdmi: endpoint {
+					remote-endpoint = <&atcphy2_dp>;
+				};
+			};
+		};
+
+		typec-routes {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			route@0 {
+				reg = <0>;
+				mode-switch;
+				status = "disabled";
+				port {
+					dcpext1_typec3: endpoint {
+						remote-endpoint = <&typec3_display>;
+					};
+				};
+			};
+			route@1 {
+				reg = <1>;
+				mode-switch;
+				status = "disabled";
+				port {
+					dcpext1_typec0: endpoint {
+						remote-endpoint = <&typec0_display>;
+					};
+				};
+			};
+			route@2 {
+				reg = <2>;
+				mode-switch;
+				status = "disabled";
+				port {
+					dcpext1_typec1: endpoint {
+						remote-endpoint = <&typec1_display>;
+					};
+				};
+			};
+		};
+	};
+
+	dpxbar0: mux-controller@40304c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc0_usb>;
+	};
+
+	dpxbar1: mux-controller@40b04c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x0b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc1_usb>;
+	};
+
+	dpxbar2: mux-controller@41304c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x1304c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&pmp_report_atc2>;
+	};
+
+	dpxbar3: mux-controller@41b04c000 {
+		compatible = "apple,t8142-display-crossbar";
+		reg = <4 0x1b04c000 0 0x4000>;
+		#mux-control-cells = <1>;
+		power-domains = <&ps_atc3_usb>;
+	};
+};
+
+/* ATC2 has no USB controller: only claim its DisplayPort banks. */
+&atcphy2 {
+	power-domains = <&pmp_report_atc2>;
+	reg = <4 0x13000000 0 0x4c000>,
+	      <4 0x13050000 0 0x8000>,
+	      <4 0x10000000 0 0x8000>,
+	      <4 0x10020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "lioa";
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+		port@2 {
+			reg = <2>;
+			atcphy2_dp: endpoint {
+				remote-endpoint = <&dcpext1_hdmi>;
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec0_display: endpoint {
+				remote-endpoint = <&dcpext1_typec0>;
+			};
+		};
+	};
+};
+
+&typec1 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec1_display: endpoint {
+				remote-endpoint = <&dcpext1_typec1>;
+			};
+		};
+	};
+};
+
+&typec3 {
+	ports {
+		port@3 {
+			reg = <3>;
+			typec3_display: endpoint {
+				remote-endpoint = <&dcpext1_typec3>;
+			};
+		};
+	};
+};
+
+/* The report domain holds ATC2_USB and its PMGR parents while in use. */
+&pmp_report {
+	status = "okay";
+};
+&ps_atc2_common {
+	status = "okay";
+};
+
+&ps_atc2_usb_aon {
+	status = "okay";
+};
+
+&ps_atc2_usb {
+	status = "okay";
+};
+
+&atcphy2 {
+	status = "okay";
+};
