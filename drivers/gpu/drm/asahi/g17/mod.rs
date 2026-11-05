@@ -1497,7 +1497,7 @@ impl Gpu {
 
         // Install all session ownership before either CPU starts. Error unwinding then runs
         // Firmware::drop, stopping both CPUs before releasing shared objects or translations.
-        let mut firmware = KBox::try_init(
+        let firmware = KBox::try_init(
             kernel::try_init!(Firmware {
                 secondary,
                 primary,
@@ -1680,7 +1680,7 @@ impl Gpu {
         Err(ETIMEDOUT)
     }
 
-    /// Stops the firmware and releases everything it used.
+    /// Close host admission and settle clients, retaining HAL300 firmware DMA owners.
     pub(crate) fn shutdown(&self) {
         self.shared.feed.begin_shutdown();
         self.shared.preparations.remove();
