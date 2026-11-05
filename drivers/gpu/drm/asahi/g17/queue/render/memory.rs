@@ -368,6 +368,7 @@ impl Generation {
 }
 
 pub(super) struct Memory {
+    programs: fw::render::RegisterPrograms,
     _fragment_view: mmu::KernelMapping,
     pub(super) graph: Graph,
     scratch: Compact,
@@ -481,6 +482,7 @@ impl Memory {
                 generations,
                 generation_count: count,
                 timestamps,
+                programs: variant.programs,
                 manager,
                 lifecycle: [tiling, fragment],
                 _fragment_view: fragment_view,
@@ -502,15 +504,30 @@ impl Memory {
                 .as_ref()
                 .is_some_and(|generation| generation.ordinal == Some(ordinal))
     }
-    pub(super) fn pass(&self, ordinal: u64) -> Result<[u64; 2]> {
+    pub(super) fn timestamp_offset(&self, ordinal: u64) -> usize {
+        ordinal as usize % RECORDS * self.programs.timestamp_stride()
+    }
+    pub(super) fn clear_pass(&mut self, ordinal: u64) -> Result {
+        let offset = self.timestamp_offset(ordinal);
+        for index in 0..self.programs.timestamp_stride() / 8 {
+            self.timestamps.dword(offset + index * 8)?.store(0, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+    pub(super) fn pass(&self, ordinal: u64) -> Result<[u64; 4]> {
         if !self.owns(ordinal) {
             return Err(EIO);
         }
-        let offset = ordinal as usize % RECORDS * 16;
-        Ok([
-            self.timestamps.dword(offset)?.load(Ordering::Relaxed),
-            self.timestamps.dword(offset + 8)?.load(Ordering::Relaxed),
-        ])
+        let offset = self.timestamp_offset(ordinal);
+        let mut words = [0; 4];
+        for (index, word) in words
+            .iter_mut()
+            .enumerate()
+            .take(self.programs.timestamp_stride() / 8)
+        {
+            *word = self.timestamps.dword(offset + index * 8)?.load(Ordering::Relaxed);
+        }
+        Ok(self.programs.timestamps(words))
     }
     pub(super) fn owners(&self) -> [Option<u64>; DEPTH] {
         core::array::from_fn(|index| self.generations[index].as_ref().and_then(|g| g.ordinal))
@@ -533,6 +550,7 @@ const _: () = {
     assert!(abi::TA_DESCRIPTOR_SIZE * RECORDS <= TA_BYTES);
     assert!(abi::FRAGMENT_SLOT_SIZE * RECORDS <= FRAGMENT_BYTES);
     assert!(RECORDS * CONFIG_STRIDE <= 0x4000);
+    assert!(RECORDS * 32 <= mmu::UAT_PGSZ);
     assert!(size_of::<queue::QueueConfig>() <= LEAD);
     assert!(LEAD + size_of::<queue::InitBufferManager>() <= CONFIG_STRIDE);
 };

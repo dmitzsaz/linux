@@ -114,18 +114,18 @@ pub(crate) struct Ticket {
 pub(crate) struct Snapshot {
     pub(crate) cursors: [Cursors; 2],
     pub(crate) job_list_empty: bool,
-    /// The tiler writes the start and fragment processing writes the end.
-    pub(crate) pass: [u64; 2],
+    /// Normalized tiler start/end and fragment start/end.
+    pub(crate) pass: [u64; 4],
 }
 
 impl Snapshot {
     fn executed(self) -> bool {
-        self.pass[0] != 0 && self.pass[1] != 0
+        self.pass[0] != 0 && self.pass[3] != 0
     }
 
     /// Neither the tiler start nor the fragment end was written: nothing ran.
     pub(crate) fn untouched(self) -> bool {
-        self.pass == [0, 0]
+        self.pass == [0; 4]
     }
 
     /// The command ran (tiler start and fragment end written) and the firmware consumed both
@@ -230,8 +230,7 @@ pub(crate) fn poll_stampless(ticket: &mut Ticket, memory: &mut impl Memory) -> R
     if !observation.complete {
         return Ok(Poll::Pending);
     }
-    let [start, end] = memory.pass(ticket.ordinal)?;
-    Ok(Poll::Complete([start, start, start, end]))
+    Ok(Poll::Complete(memory.pass(ticket.ordinal)?))
 }
 
 /// Outstanding publications span less than half the 24-bit stamp sequence.
@@ -254,7 +253,7 @@ fn visible(ticket: &Ticket, stamps: [u32; 2]) -> Result<bool> {
 pub(crate) trait Memory {
     fn snapshot(&mut self, ordinal: u64) -> Result<Snapshot>;
     fn stamps(&mut self) -> Result<[u32; 2]>;
-    fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]>;
+    fn pass(&mut self, ordinal: u64) -> Result<[u64; 4]>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -314,8 +313,7 @@ fn complete_poll(
         // Refresh this generation's pass after observing the post-maintenance
         // stamps. The pre-stamp snapshot alone cannot authorize export.
         fence(Ordering::Acquire);
-        let [start, end] = memory.pass(ticket.ordinal)?;
-        return Ok(Poll::Complete([start, start, start, end]));
+        return Ok(Poll::Complete(memory.pass(ticket.ordinal)?));
     }
     ticket.previous = snapshot.cursors;
     Ok(Poll::Pending)
@@ -449,7 +447,7 @@ mod executed_tests {
         Snapshot {
             cursors: [Cursors { done, read: done, write }; 2],
             job_list_empty: false,
-            pass,
+            pass: [pass[0], pass[0], pass[0], pass[1]],
         }
     }
 
@@ -460,6 +458,15 @@ mod executed_tests {
         assert!(!snapshot(3, 3, [1, 0]).executed_and_consumed());
         assert!(!snapshot(3, 3, [0, 2]).executed_and_consumed());
         assert!(!snapshot(2, 3, [1, 2]).executed_and_consumed());
+    }
+
+    #[test]
+    fn tiler_timestamps_alone_do_not_witness_a_hal300_render() {
+        let mut sample = snapshot(3, 3, [100, 200]);
+        sample.pass = [100, 120, 0, 0];
+        assert!(!sample.executed_and_consumed());
+        sample.pass = [100, 120, 140, 200];
+        assert!(sample.executed_and_consumed());
     }
 
     /// The firmware state of a stalled pair as read on hardware: the front group executed and
@@ -475,7 +482,7 @@ mod executed_tests {
         fn stamps(&mut self) -> Result<[u32; 2]> {
             Ok(self.stamps)
         }
-        fn pass(&mut self, _ordinal: u64) -> Result<[u64; 2]> {
+        fn pass(&mut self, _ordinal: u64) -> Result<[u64; 4]> {
             Ok(self.snapshot.pass)
         }
     }
@@ -489,7 +496,11 @@ mod executed_tests {
     fn stalled(pass: [u64; 2]) -> Stalled {
         let cursors = Cursors { done: 1099, read: 1099, write: 1099 };
         Stalled {
-            snapshot: Snapshot { cursors: [cursors; 2], job_list_empty: false, pass },
+            snapshot: Snapshot {
+                cursors: [cursors; 2],
+                job_list_empty: false,
+                pass: [pass[0], pass[0], pass[0], pass[1]],
+            },
             stamps: [406 << 8; 2],
         }
     }
