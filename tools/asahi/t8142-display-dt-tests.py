@@ -75,6 +75,7 @@ def check(path, board, phys):
     mailbox = t.ref(dcp, "mboxes")
     t.status(mailbox, "disabled")
     assert t.cells(mailbox, "interrupts")[1::3] == [925, 926, 927, 928]
+    assert t.ref(mailbox, "power-domains") == t.ref(dcp, "power-domains")
     domain = t.ref(dcp, "power-domains")
     for offset in (0x3b8, 0x3a8, 0x2b8):
         t.status(domain, "disabled")
@@ -88,6 +89,9 @@ def check(path, board, phys):
     assert t.get(dcp, "apple,connector-type", "s") == ["HDMI-A" if board == "j704" else "USB-C"]
     assert t.cells(dcp, "apple,typec-dptx-phys") == phys
     assert t.cells(dcp, "apple,typec-mux-indices") == [4] * len(phys)
+    names = [f"typec{n}" for n in range(len(phys))]
+    assert t.get(dcp, "phy-names", "s") == names + (["dp-phy"] if board == "j704" else [])
+    assert t.get(dcp, "mux-control-names", "s") == names + (["dp-xbar"] if board == "j704" else [])
     muxes = t.cells(dcp, "mux-controls")
     phy_refs = t.cells(dcp, "phys")
     for route, n in enumerate(phys):
@@ -101,6 +105,8 @@ def check(path, board, phys):
         endpoint = f"{dcp}/typec-routes/route@{route}/port/endpoint"
         connector = t.linked(endpoint)
         assert connector.endswith("/connector/ports/port@3/endpoint")
+        superspeed = connector.split("/ports/")[0] + "/ports/port@1/endpoint"
+        assert t.linked(superspeed).startswith(f"/soc/phy@{0x403000000 + n * 0x8000000:x}/")
         t.status(f"{dcp}/typec-routes/route@{route}", "disabled")
     if board == "j704":
         assert t.cells(dcp, "apple,dptx-phy") == [2]
@@ -111,6 +117,10 @@ def check(path, board, phys):
         assert t.linked(dcp + "/ports/port@1/endpoint").startswith("/soc/phy@413000000/")
         assert t.phandles[muxes[-2]] == "/soc/mux-controller@41304c000"
         assert t.get("/soc/phy@413000000", "reg-names", "s") == ["core", "lpdptx", "axi2af", "lioa"]
+        report = t.ref("/soc/phy@413000000", "power-domains")
+        assert t.ref("/soc/mux-controller@41304c000", "power-domains") == report
+        assert t.cells(report, "reg") == [26]
+        assert "apple,t8142-pmp-v2-report-entry" in t.get(report, "compatible", "s")
     # Preserve the measured audio path without admitting an unsupported ABI.
     audio = t.linked(dcp + "/ports/port@0/endpoint").split("/ports/")[0]
     t.status(audio, "disabled")
