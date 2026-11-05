@@ -426,3 +426,5 @@
 };
 
 #include "t8142-j704-usb4.dtsi"
+
+#include "t8142-j704-gpu.dtsi"
