@@ -767,7 +767,8 @@ static void iomfb_external_parameter_complete(struct apple_dcp *dcp, void *out, 
 static void iomfb_external_device_complete(struct apple_dcp *dcp, void *out, void *data)
 {
 	struct dcp_set_parameter_dcp parameter = {
-		.param = IOMFBPARAM_ADAPTIVE_SYNC,
+		.param = dcp->fw_compat == DCP_FIRMWARE_V_27_0 ? 15 :
+			 IOMFBPARAM_ADAPTIVE_SYNC,
 		.count = 3,
 	};
 
