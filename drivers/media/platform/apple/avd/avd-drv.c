@@ -552,23 +552,18 @@ static const struct avd_variant avd_t6041_variant = {
 };
 
 /*
- * M5 (Hibiscus, macOS CAvdMcpuHibiscus): T8140's VP block layout and HEVC
- * header; avd-fw's v5 tier 2 tunables match macOS's Hibiscus table.
+ * M5 (Hibiscus, macOS CAvdMcpuHibiscus): twelve VP blocks without holes,
+ * 4 HEVC, 4 H.264, 1 VP9 and 3 AV1, and 15 instruction FIFOs, as macOS's
+ * Hibiscus mode table and FIFO requirement give them; T8140's HEVC header.
  */
 static const struct avd_variant avd_t8142_variant = {
 	.vp_slots = {
-		[AVD_CODEC_HEVC] = 2,
-		[AVD_CODEC_H264] = 1,
-		[AVD_CODEC_VP9] = 1,
-		[AVD_CODEC_AV1] = 1,
-	},
-	.vp_slot_base = {
-		[AVD_CODEC_HEVC] = 0,
+		[AVD_CODEC_HEVC] = 4,
 		[AVD_CODEC_H264] = 4,
-		[AVD_CODEC_VP9] = 8,
-		[AVD_CODEC_AV1] = 9,
+		[AVD_CODEC_VP9] = 1,
+		[AVD_CODEC_AV1] = 3,
 	},
-	.fifo_slots = 7,
+	.fifo_slots = 15,
 	.configure_stream = t8122_configure_stream,
 	.capabilities = AVD_CAPABILITY_HEVC |
 			AVD_CAPABILITY_H264 |
