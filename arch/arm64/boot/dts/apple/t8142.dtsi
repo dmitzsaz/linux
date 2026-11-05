@@ -23,6 +23,12 @@
 	#size-cells = <2>;
 	interrupt-parent = <&aic>;
 
+	/* For machines that idle without PSCI. */
+	cpuidle: cpuidle {
+		compatible = "apple,t8142-cpuidle";
+		status = "disabled";
+	};
+
 	cpus {
 		#address-cells = <2>;
 		#size-cells = <0>;
