@@ -176,6 +176,8 @@ pub(crate) struct UatQuirks {
     /// Temporary: once the boot loader adds these regions to `/memory`, as m1n1 does, the
     /// regions lose `no-map` and this path goes away.
     pub(crate) reserved_tables: bool,
+    /// HAL300 reserved tables, TTBs and handoff retain the tested write-combined mapping.
+    pub(crate) reserved_write_combined: bool,
     // The following settings keep a SoC on the only policy it was tested with. Each one is
     // a candidate for the A18 Pro's value once a test on that SoC shows it is not needed.
     /// Write back every page-table and context-table change: the GPU table walker is not
@@ -197,6 +199,7 @@ impl UatQuirks {
     /// The A18 Pro and earlier policy.
     pub(crate) const DEFAULT: UatQuirks = UatQuirks {
         reserved_tables: false,
+        reserved_write_combined: false,
         clean_tables: false,
         page_tlbi: false,
         handoff_lock: true,
@@ -418,7 +421,13 @@ pub(crate) struct VmReadGuard(VmExecGuard);
 #[cfg(any(CONFIG_DRM_ASAHI_G15, CONFIG_DRM_ASAHI_G16))]
 impl VmReadGuard {
     #[cfg(CONFIG_DRM_ASAHI_G15)]
-    pub(crate) fn covers_range(&mut self, address: u64, size: u64, read: bool, write: bool) -> bool {
+    pub(crate) fn covers_range(
+        &mut self,
+        address: u64,
+        size: u64,
+        read: bool,
+        write: bool,
+    ) -> bool {
         Vm::covers_range_locked(&mut self.0, address, size, read, write)
     }
 
@@ -565,11 +574,13 @@ impl gpuvm::DriverGpuVm for VmInner {
         op: OpMap<'op, Self>,
         ctx: &mut Self::SmContext<'ctx>,
     ) -> Result<OpMapped<'op, Self>, Error> {
-        let bind_sequence = self.bind_sequence.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |value| value.checked_add(1),
-        ).map_err(|_| EOVERFLOW)? + 1;
+        let bind_sequence = self
+            .bind_sequence
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+                value.checked_add(1)
+            })
+            .map_err(|_| EOVERFLOW)?
+            + 1;
         let _mutation = self.mapping_mutation();
         let (map_addr, map_length) = (op.addr(), op.length() as usize);
         let mut iova = op.addr();
@@ -2632,12 +2643,13 @@ impl Vm {
         // Pin and copy backing before taking BO or DMA reservation locks.
         let dev: &device::Device<device::Bound> = device.as_ref().as_ref();
         let _bind_lease = crate::gem::held_sg_table(gem, dev)?.into_lease();
-        let vm_bo = self
-            .gpuvm
-            .obtain(gem, pin_init!(VmBoData {
+        let vm_bo = self.gpuvm.obtain(
+            gem,
+            pin_init!(VmBoData {
                 newest_bind: AtomicU64::new(0),
                 segments <- new_mutex!(None),
-            }))?;
+            }),
+        )?;
         prepare_sgt_segments(dev, gem, &vm_bo, &_bind_lease)?;
 
         let mut resources = VmOpResources {
@@ -3569,6 +3581,36 @@ impl Uat {
         Ok(snapshot)
     }
 
+    pub(crate) fn check_published_window(&self, l2: PhysicalAddr) -> Result<[u64; 3]> {
+        let reserved = self.inner.reserved.as_deref();
+        let secondary = self.inner.lock().secondary_ttb1.ok_or(EINVAL)?;
+        let index = IOVA_KERN_TOP_LEVEL_INDEX as usize;
+        let mut snapshot = [0; 3];
+        // SAFETY: ReservedTables owns both no-map roots and the shared L2 page.
+        unsafe {
+            pgtable::with_root_entries(reserved, self.kernel_vm.ttb(), snapshot.len(), |ptes| {
+                for (dst, src) in snapshot.iter_mut().zip(ptes) {
+                    *dst = src.load(Ordering::Relaxed);
+                }
+            })
+        }?;
+        let mirrored = unsafe {
+            pgtable::with_root_entries(reserved, secondary, index + 1, |ptes| {
+                ptes[index].load(Ordering::Relaxed)
+            })
+        }?;
+        let empty = unsafe {
+            pgtable::with_root_entries(reserved, l2, UAT_PGSZ / 8, |ptes| {
+                ptes.iter().all(|pte| pte.load(Ordering::Relaxed) == 0)
+            })
+        }?;
+        let table = snapshot[index] & ((1u64 << 42) - 1) & !(UAT_PGMSK as u64);
+        if table != l2 || snapshot[index] & 3 != 3 || mirrored != snapshot[index] || !empty {
+            return Err(EIO);
+        }
+        Ok(snapshot)
+    }
+
     /// Checks that allocation under the shared subtree did not replace a firmware-owned entry.
     pub(crate) fn confirm_firmware_root_entries(&self, snapshot: [u64; 3]) -> Result {
         // SAFETY: The root is a bootloader-reserved page retained for this UAT's lifetime.
@@ -3665,8 +3707,18 @@ impl Uat {
         quirks: UatQuirks,
         reserved: Option<Arc<pgtable::ReservedTables>>,
     ) -> Result<Arc<UatInner>> {
-        let handoff_rgn = Self::map_region(dev.as_ref().as_ref(), c"handoff", HANDOFF_SIZE, true)?;
-        let ttbs_rgn = Self::map_region(dev.as_ref().as_ref(), c"ttbs", SLOTS_SIZE, true)?;
+        let handoff_rgn = Self::map_region(
+            dev.as_ref().as_ref(),
+            c"handoff",
+            HANDOFF_SIZE,
+            !quirks.reserved_write_combined,
+        )?;
+        let ttbs_rgn = Self::map_region(
+            dev.as_ref().as_ref(),
+            c"ttbs",
+            SLOTS_SIZE,
+            !quirks.reserved_write_combined,
+        )?;
 
         // SAFETY: The Handoff struct layout matches the firmware's view of memory at this address,
         // and the region is at least large enough per the size specified above.
@@ -3723,10 +3775,18 @@ impl Uat {
         let reserved = if quirks.reserved_tables {
             let mut tables = pgtable::ReservedTables::new();
             for name in [c"pagetables", c"l2-pagetables"] {
-                let res = of_node.reserved_mem_region_to_resource_byname(name)?;
+                let res = of_node
+                    .reserved_mem_region_to_resource_byname(name)
+                    .or_else(|error| {
+                        if name == c"l2-pagetables" {
+                            of_node.reserved_mem_region_to_resource_byname(c"shared-l2")
+                        } else {
+                            Err(error)
+                        }
+                    })?;
                 // SAFETY: The boot loader reserved these regions (no-map) for the firmware's
                 // page tables; they stay reserved until reboot.
-                unsafe { tables.add(res)? };
+                unsafe { tables.add_with_cache(res, quirks.reserved_write_combined)? };
             }
             Some(Arc::new(tables, GFP_KERNEL)?)
         } else {
