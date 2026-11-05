@@ -96,3 +96,20 @@ thermal_pressure_level
     Firmware thermal pressure level, exposed read-only when the device tree
     supplies a valid key. The integer is firmware-defined and is not a
     temperature or a percentage.
+
+Debugging firmware telemetry
+---------------------------
+
+With debugfs enabled, ``macsmc-hwmon/keys`` lists the firmware key metadata
+and reads supported temperature and power floats. ``macsmc-hwmon/status``
+reads a small set of clock, battery and host-state keys: CLKM, B0AT, MSPS,
+MSLD, NTAP and WKTP. It shows metadata and raw bytes in firmware byte order;
+missing, unreadable and oversized keys are not read. These files are
+root-readable and perform no key writes or background polling.
+
+Collect repeated snapshots with boot ID and monotonic timestamps when
+investigating stale sensor values. CLKM is the SMC RTC counter; its progress
+can distinguish a stopped transport from stale temperature telemetry, but
+does not establish that a temperature sampler is running. Successful key
+reads, plausible values and an advancing RTC do not guarantee fresh sensor
+data. Equal consecutive temperatures alone do not establish a fault either.
