@@ -34,6 +34,7 @@ properties:
               - apple,t6000-dcpext
               - apple,t6020-dcpext
               - apple,t6041-dcpext
+              - apple,t8142-dcpext
           - const: apple,dcpext
       - items:
           - const: apple,t8140-dcpext
@@ -85,13 +86,17 @@ properties:
 
   clocks:
     minItems: 1
-    maxItems: 2
+    maxItems: 64
 
   clock-names:
     minItems: 1
+    maxItems: 64
     items:
-      - const: clock-154
-      - const: clock-194
+      pattern: '^[a-zA-Z0-9-]+$'
+    description: >
+      H17 firmware 27 clocks are ordered by firmware selector, with selector
+      zero naming the video clock and selector one the reference clock.
+      Older H17 firmware uses clock-154 and clock-194.
 
   memory-region:
     minItems: 1
@@ -394,11 +399,12 @@ allOf:
   - if:
       properties:
         compatible:
-          contains:
-            enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
+          not:
+            contains:
+              enum: ['apple,t6030-dcpext', 'apple,t8132-dcpext']
       required:
         - compatible
-    else:
+    then:
       properties:
         mux-controls:
           maxItems: 8
