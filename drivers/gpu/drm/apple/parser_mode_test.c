@@ -62,9 +62,9 @@ static void dcp_refresh_range_test(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp_refresh_range(120U << 16, 48U << 16,
 						  120U << 16, true, &low, &high));
 	KUNIT_EXPECT_EQ(test, low, 48U << 16);
-	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(true, true), 120ULL);
-	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(false, true), 0ULL);
-	KUNIT_EXPECT_EQ(test, dcp_desktop_present_deadline(true, false), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_present_deadline(true, true), 120ULL);
+	KUNIT_EXPECT_EQ(test, dcp_present_deadline(false, true), 0ULL);
+	KUNIT_EXPECT_EQ(test, dcp_present_deadline(true, false), 0ULL);
 }
 
 static struct kunit_case dcp_mode_rank_test_cases[] = {
