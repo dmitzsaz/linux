@@ -2163,7 +2163,8 @@ int dcp_get_modes(struct drm_connector *connector)
 
 	/* Internal H17P still has no supported EDID command transport. */
 	if (nr_modes && !apple_connector->drm_edid &&
-	    (dcp->fw_compat != DCP_FIRMWARE_H17P ||
+	    ((dcp->fw_compat != DCP_FIRMWARE_H17P &&
+	      dcp->fw_compat != DCP_FIRMWARE_V_27_0) ||
 	     (dcp->dcpavservep && dcp->dcpavservep->wire_v2))) {
 		const struct drm_edid *edid;
 		/* Let physical disconnect advance the generation during the request. */
@@ -2278,7 +2279,7 @@ edid_done:
 			if (hi > max_vfreq)
 				max_vfreq = hi;
 		}
-		vrr_capable |= modes[i].vrr;
+		vrr_capable |= modes[i].vrr && dcp->fw_compat != DCP_FIRMWARE_V_27_0;
 	}
 	drm_connector_set_vrr_capable_property(connector, vrr_capable);
 modes_done:
@@ -2751,7 +2752,8 @@ static bool dcp_mode_settable(struct apple_dcp *dcp,
 	if (!lookup_mode(dcp, mode, &dcp_mode))
 		return false;
 
-	if (dcp->fw_compat == DCP_FIRMWARE_H17P &&
+	if ((dcp->fw_compat == DCP_FIRMWARE_H17P ||
+	     dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
 	    dcp->hw.iomfb_method_profile !=
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		return dcp_mode.mode.type & DRM_MODE_TYPE_PREFERRED;
