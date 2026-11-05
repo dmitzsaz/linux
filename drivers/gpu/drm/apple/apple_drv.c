@@ -922,9 +922,17 @@ static int apple_probe_per_dcp(struct device *dev,
 			planes[zpos] = apple_plane_init(drm, 1U << num, surf,
 							supports_l10r,
 							supports_xrgb2101010,
+							/*
+							 * Alpha-only on the H17G 26.x
+							 * firmware, where the X byte is
+							 * blended (J813). Firmware 27 keeps
+							 * XRGB: compositors such as wlroots
+							 * and aquamarine cannot allocate
+							 * scanout without it.
+							 */
 							dcp_data->hw.iomfb_method_profile ==
-								DCP_IOMFB_METHODS_H17G ||
-							dcp_data->fw_compat == DCP_FIRMWARE_V_27_0,
+								DCP_IOMFB_METHODS_H17G &&
+							dcp_data->fw_compat != DCP_FIRMWARE_V_27_0,
 							plane_type, interchange,
 							supports_premultiplied);
 		}
