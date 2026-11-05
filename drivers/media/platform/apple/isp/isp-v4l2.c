@@ -70,15 +70,19 @@ static bool isp_p010_buffer_matches(const struct isp_format *fmt,
 }
 
 /*
- * A metadata buffer starts with a table of section offsets. On H17 firmware
- * the fourth section opens with the frame's exposure: the integration time in
+ * A metadata buffer has a section count at 0x10 and offsets from 0x14. On H17
+ * firmware the third section opens with the frame's exposure: integration in
  * microseconds (le32 at 0) and the total sensor gain in 1/256 steps, 256 for
  * unity (le16 at 6). Observed on T6040 and T8140 with AE converging under a
- * fixed scene and with the frame rate capping the integration time.
+ * fixed scene and with the frame rate capping the integration time. Rheia's
+ * native reader uses the same section for exposure and analogue gain (+4).
+ * Its total gain field has not been qualified, so report analogue gain only.
  */
-#define ISP_META_SECTIONS		0x10
-#define ISP_META_SECTION_EXPOSURE	3
+#define ISP_META_SECTION_COUNT		0x10
+#define ISP_META_SECTIONS		0x14
+#define ISP_META_SECTION_EXPOSURE	2
 #define ISP_META_EXPOSURE_TIME		0x0
+#define ISP_META_EXPOSURE_ANALOG_GAIN	0x4
 #define ISP_META_EXPOSURE_GAIN		0x6
 #define ISP_META_EXPOSURE_SIZE		0x8
 
@@ -86,20 +90,28 @@ static void isp_meta_read_exposure(struct apple_isp *isp,
 				   const struct isp_surf *meta)
 {
 	const u8 *virt = meta->virt;
-	u32 offset, time;
+	u32 count, offset, time;
 	u16 gain;
 
-	if (!isp->hw->meta_exposure || !virt)
+	if (!isp->hw->meta_exposure || !virt || meta->size < ISP_META_SECTIONS)
+		return;
+
+	count = get_unaligned_le32(virt + ISP_META_SECTION_COUNT);
+	if (count <= ISP_META_SECTION_EXPOSURE ||
+	    count > (meta->size - ISP_META_SECTIONS) / sizeof(u32))
 		return;
 
 	offset = get_unaligned_le32(virt + ISP_META_SECTIONS +
 				    4 * ISP_META_SECTION_EXPOSURE);
-	if (offset < ISP_META_SECTIONS || offset > meta->size ||
+	if (offset < ISP_META_SECTIONS + count * sizeof(u32) ||
+	    offset > meta->size ||
 	    meta->size - offset < ISP_META_EXPOSURE_SIZE)
 		return;
 
 	time = get_unaligned_le32(virt + offset + ISP_META_EXPOSURE_TIME);
-	gain = get_unaligned_le16(virt + offset + ISP_META_EXPOSURE_GAIN);
+	gain = get_unaligned_le16(virt + offset +
+		(isp->hw->meta_analog_gain ? ISP_META_EXPOSURE_ANALOG_GAIN :
+					   ISP_META_EXPOSURE_GAIN));
 	/* An unwritten section or one this layout does not describe */
 	if (!time || !gain)
 		return;
@@ -1127,6 +1139,7 @@ static int isp_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
 
 	switch (ctrl->id) {
 	case V4L2_CID_GAIN:
+	case V4L2_CID_ANALOGUE_GAIN:
 		ctrl->val = READ_ONCE(isp->frame_gain);
 		return 0;
 	case V4L2_CID_EXPOSURE_ABSOLUTE:
@@ -1147,13 +1160,17 @@ static const struct v4l2_ctrl_ops isp_exposure_ctrl_ops = {
  * Auto exposure picks the gain and exposure of each frame. Report the last
  * frame's values read-only, so that userspace can follow the scene light, for
  * example to decide when to denoise. The gain is the firmware's total sensor
- * gain in 1/256 steps.
+ * gain in 1/256 steps. On Rheia only the analogue component is qualified;
+ * expose that as ANALOGUE_GAIN, without claiming it is total sensor gain.
  */
 static void isp_init_exposure_ctrls(struct apple_isp *isp)
 {
+	u32 gain_id = isp->hw->meta_analog_gain ? V4L2_CID_ANALOGUE_GAIN :
+						V4L2_CID_GAIN;
+
 	isp->frame_gain = 256;
 	isp->gain = v4l2_ctrl_new_std(&isp->ctrl_handler,
-				      &isp_exposure_ctrl_ops, V4L2_CID_GAIN,
+				      &isp_exposure_ctrl_ops, gain_id,
 				      0, U16_MAX, 1, 256);
 	isp->exposure = v4l2_ctrl_new_std(&isp->ctrl_handler,
 					  &isp_exposure_ctrl_ops,
