@@ -2193,7 +2193,7 @@ impl super::recovery::Memory for InitData {
         kernel::time::delay::fsleep(kernel::time::Delta::from_millis(1));
     }
 
-    fn fail_all_policy(&self) -> bool {
+    fn native_recovery(&self) -> bool {
         self.layout.recovery_fail_all && self.recovery_enabled()
     }
 }
