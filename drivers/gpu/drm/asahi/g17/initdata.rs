@@ -292,6 +292,7 @@ struct BundleObjects {
 }
 
 impl InitData {
+    pub(crate) fn is_hal300(&self) -> bool { self.hal300.is_some() }
     /// Empty construction state, retained even if graph construction fails.
     pub(super) fn new() -> Self {
         Self {

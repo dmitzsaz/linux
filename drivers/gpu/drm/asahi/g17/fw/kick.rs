@@ -361,6 +361,8 @@ pub(crate) struct KickQos {
 
 /// Inputs of one kick entry.
 pub(crate) struct KickArgs<'a> {
+    /// Two-bit dependency type list required by HAL300.
+    pub(crate) typed_dependencies: bool,
     /// Kicked queue.
     pub(crate) qid: u8,
     /// Timestamp of this kick; it selects the ring slot.
@@ -502,7 +504,14 @@ impl KickEntry {
             register_arrays: args.register_arrays.map(RegisterArrayBinding::word),
             unk_170: 0,
             unk_178: Self::UNK_178,
-            pad_180: [0; KICK_ENTRY_STRIDE - 0x180],
+            pad_180: {
+                let mut pad = [0; KICK_ENTRY_STRIDE - 0x180];
+                if args.typed_dependencies {
+                    let types = (0..count).fold(0u64, |types, entry| types | 1 << (2 * entry));
+                    pad[..8].copy_from_slice(&types.to_le_bytes());
+                }
+                pad
+            },
         })
     }
 }

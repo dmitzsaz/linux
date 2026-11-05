@@ -2315,6 +2315,7 @@ impl Queue {
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
         let kick_args = KickArgs {
+            typed_dependencies: self.graph.program == ComputeProgram::G17G,
             qid,
             timestamp: kick_timestamp,
             parent: kick_parent,
