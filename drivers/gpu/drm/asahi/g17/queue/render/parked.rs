@@ -238,6 +238,7 @@ impl ParkedPair {
             descriptor_flags: self.descriptor_flags,
             variant: self.variant,
             installed: self.installed,
+            reinstall: [self.variant.compute == crate::g17::fw::compute::ComputeProgram::G17G; 2],
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: self.recovery_generation,

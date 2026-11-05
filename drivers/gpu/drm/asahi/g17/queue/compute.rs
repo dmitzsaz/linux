@@ -551,6 +551,7 @@ pub(crate) struct Queue {
     retained_owner: Option<crate::g17::context::FirmwarePages>,
     pool_phase: PoolPhase,
     release_sent_ns: Option<u64>,
+    pool_used: bool,
     growing: bool,
     growth_blocks: usize,
     /// A killed queue was recycled: its pool/ring must be vacated and re-armed
@@ -578,6 +579,7 @@ pub(crate) struct Queue {
     /// and whether that wait was reported.
     kill_wait: Option<(u64, bool)>,
     installed: bool,
+    reinstall: bool,
     /// Bit `p` set once a work slot of priority class `p` named this queue.
     outer_started: u8,
     published_config: Option<ConfigIdentity>,
@@ -635,6 +637,7 @@ impl Queue {
             retained_owner: None,
             pool_phase: PoolPhase::Populated,
             release_sent_ns: None,
+            pool_used: false,
             growing: false,
             growth_blocks: 0,
             needs_fresh_backing: false,
@@ -654,6 +657,7 @@ impl Queue {
             exit: None,
             kill_wait: None,
             installed: false,
+            reinstall: false,
             outer_started: 0,
             published_config: None,
             config_cache: None,
@@ -1622,6 +1626,7 @@ impl Queue {
         );
         self.owner = Some(owner);
         self.unpublished_binding = true;
+        if self.graph.program == ComputeProgram::G17G { self.reinstall = true; }
         self.released = false;
         self.retirement_ready = false;
         self.retired_by_teardown = false;
@@ -1872,7 +1877,9 @@ impl Queue {
         {
             return Err(EAGAIN);
         }
-        if self.installed {
+        let release =
+            self.installed && (self.pool_used || self.graph.program != ComputeProgram::G17G);
+        if release {
             let record =
                 ControlRecord::FreeListRelease(self.pool.release_record(self.free_list_generation));
             let cursor = Rings::publish_control(init, &record)?;
@@ -1882,9 +1889,10 @@ impl Queue {
             self.pool_phase = PoolPhase::Vacant;
             self.release_sent_ns = None;
         }
+        self.pool_used = false;
         self.growing = true;
         self.growth_blocks = blocks;
-        Ok(self.installed)
+        Ok(release)
     }
 
     pub(crate) fn finish_growth(
@@ -2306,11 +2314,18 @@ impl Queue {
         self.free_list_generation = u64::from(packet.context.scheduler_generation());
         let policy = packet.context.policy();
         let ring = 1u8 << policy.priority();
-        let config = self.queue_config(&identity, first, args.context_id, policy, &packet)?;
+        let config = self.queue_config(
+            &identity,
+            first || self.reinstall,
+            args.context_id,
+            policy,
+            &packet,
+        )?;
         let cached = self
             .config_cache
             .and_then(|(config, at)| (at == epoch).then_some(config));
-        let send_config = first || super::render::publication::required(cached, config);
+        let send_config =
+            first || self.reinstall || super::render::publication::required(cached, config);
         let announce =
             KickAnnounce::new(qid, DataMaster::Compute, kick_timestamp, policy.priority())?;
         let predecessor = KickPredecessor::new(qid, kick_parent)?;
@@ -2509,6 +2524,8 @@ impl Queue {
             )?;
             self.outer_started |= ring;
             self.installed = true;
+            self.pool_used = true;
+            self.reinstall = false;
             self.published_config = Some(identity);
             if send_config {
                 self.config_cache = Some((config, epoch));

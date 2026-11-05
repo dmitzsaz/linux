@@ -80,6 +80,9 @@ pub(super) struct RenderState {
     /// until the firmware stops, when this state is dropped.
     kept_graphs: KVec<crate::g17::queue::render::RetiredBinding>,
     next_pm_generation: u64,
+    hal300: bool,
+    closed_pools: KVec<Arc<crate::g17::freelist::RenderPool>>,
+    spare_pools: KVec<Arc<crate::g17::freelist::RenderPool>>,
 }
 
 impl RenderState {
@@ -87,6 +90,7 @@ impl RenderState {
         clusters: u32,
         deflake: crate::g17::fw::render::Deflake,
         descriptor_flags: [u32; 2],
+        variant: &crate::g17::fw::Variant,
     ) -> Result<Self> {
         if clusters == 0 {
             return Err(EINVAL);
@@ -107,6 +111,9 @@ impl RenderState {
             retired: KVec::with_capacity(128, GFP_KERNEL)?,
             kept_graphs: KVec::new(),
             next_pm_generation: 1,
+            hal300: variant.compute == crate::g17::fw::compute::ComputeProgram::G17G,
+            closed_pools: KVec::with_capacity(127, GFP_KERNEL)?,
+            spare_pools: KVec::with_capacity(127, GFP_KERNEL)?,
         })
     }
 
@@ -1029,7 +1036,11 @@ impl Registry {
             let Some(pool) = entry.pool.as_ref() else {
                 continue;
             };
-            if pool.vacant() || !render.pools.idle(pool.id()) || !pool.client_evicted() {
+            if render.hal300
+                || pool.vacant()
+                || !render.pools.idle(pool.id())
+                || !pool.client_evicted()
+            {
                 continue;
             }
             if let Some(backing) = pool.vacate() {

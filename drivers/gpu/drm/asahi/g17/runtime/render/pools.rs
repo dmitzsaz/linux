@@ -90,7 +90,7 @@ impl Pools {
             return Err(EBUSY);
         }
         // Pools arrive fully populated. There is no asynchronous initial grow.
-        let next = Lease::acquire(previous.as_ref(), owner)?;
+        let next = Lease::acquire_variant(previous.as_ref(), owner, init.is_hal300())?;
         if previous.is_none_or(|lease| lease.owner() != owner) {
             self.stage(init, pool)?;
         }
@@ -117,7 +117,7 @@ impl Pools {
         if previous.is_some_and(|lease| !lease.released()) {
             return Err(EBUSY);
         }
-        Lease::acquire(previous.as_ref(), owner)?;
+        Lease::acquire_variant(previous.as_ref(), owner, init.is_hal300())?;
         self.stage(init, pool)
     }
 

@@ -163,6 +163,8 @@ impl Drop for ComputeSlot {
 }
 
 pub(super) struct Registry {
+    quarantine: Option<Arc<super::quarantine::Quarantine>>,
+    hal300: bool,
     pub(super) qids: kick::QueueIds,
     pub(super) buffers: BufferIds,
     pub(super) metrics: Arc<MetricsIds>,
@@ -207,6 +209,12 @@ impl Registry {
         renders: Option<Arc<super::availability::Availability>>,
     ) -> impl Init<Self, Error> {
         kernel::try_init!(Self {
+            quarantine: if variant.compute == super::fw::compute::ComputeProgram::G17G {
+                Some(super::quarantine::Quarantine::new()?)
+            } else {
+                None
+            },
+            hal300: variant.compute == super::fw::compute::ComputeProgram::G17G,
             qids <- kick::QueueIds::new(variant.qid_floor).chain(|qids| {
                 qids.reserve_initial_render()
             }),
@@ -214,7 +222,7 @@ impl Registry {
             metrics: Arc::new(MetricsIds::new(), GFP_KERNEL)?,
             qos_ids: QosIds::new()?,
             admission: admission::Pool::with_waiters(kick::queue_limit(variant.qid_floor), queues, renders)?,
-            render: render::RenderState::new(clusters, deflake, descriptor_flags)?,
+            render: render::RenderState::new(clusters, deflake, descriptor_flags, variant)?,
             identities: queue::Identities::new(),
             compute: {
                 let mut compute = KVec::with_capacity(QIDS, GFP_KERNEL)?;
@@ -237,7 +245,7 @@ impl Registry {
                 seen
             },
             worker_deferred: Some(DeferredBatch::worker()?),
-            teardown: super::teardown::Pending::new()?,
+            teardown: super::teardown::Pending::for_variant(variant)?,
         })
     }
 
@@ -283,6 +291,7 @@ impl Registry {
         if self.qids.compute_fits(self.admission.queues() as usize) {
             return Ok(Rebind::Fresh);
         }
+        if self.hal300 { return Err(ENOSPC); }
         let teardown = &self.teardown;
         let idle = self
             .compute
@@ -697,7 +706,7 @@ impl Backend {
         // sleeping, and nothing of the new queue is visible yet.
         const RETAINED_CONTEXT_WAIT_NS: u64 = 4 * WORK_RING_WAIT_NS;
         let started = now_ns();
-        let (lease, uat, pool, qos, execution, slot) = loop {
+        let (lease, uat, pool, qos, execution, slot, quarantine) = loop {
             let observed = shared.queues.observe();
             let lease = shared.preparations.enter(true)?;
             let mut state = shared.state.lock();
@@ -720,6 +729,7 @@ impl Backend {
                         firmware.queues.qos_ids.clone(),
                         execution,
                         slot,
+                        firmware.queues.quarantine.clone(),
                     )
                 }
                 Err(error) if error == ENOSPC => {
@@ -763,6 +773,7 @@ impl Backend {
                 policy,
                 shared.renders.clone(),
                 shared.progress.clone(),
+                quarantine,
             )?,
             GFP_KERNEL,
         )?;

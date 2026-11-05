@@ -170,6 +170,7 @@ pub(crate) struct Pair {
     descriptor_flags: [u32; 2],
     variant: &'static crate::g17::fw::Variant,
     installed: [bool; 2],
+    reinstall: [bool; 2],
     configs: [Option<crate::g17::fw::queue::QueueConfig>; 2],
     cursors: [u32; 2],
     recovery_generation: u64,
@@ -280,6 +281,7 @@ impl Pair {
             descriptor_flags,
             variant,
             installed: [false; 2],
+            reinstall: [false; 2],
             configs: [None; 2],
             cursors: [0; 2],
             recovery_generation: 0,
@@ -641,7 +643,7 @@ impl Pair {
                 kick_ring_va: self.kicks[stage].low_va(),
                 kick_ring_fw_va: self.kicks[stage].firmware_va(),
                 qid: qids[stage],
-                install: !self.installed[stage],
+                install: !self.installed[stage] || self.reinstall[stage],
                 completion_seed: covered[stage].then(|| {
                     kicks[stage]
                         .prev()
@@ -904,6 +906,7 @@ impl Pair {
         }
         self.recovery_generation = epoch;
         self.installed = [true; 2];
+        self.reinstall = [false; 2];
         self.published_completions = Some(kicks.map(|kick| kick.completion_value(payload)));
         self.outer_started |= ring;
         if let Some(previous) = self.previous.as_mut().filter(|p| p.publication.is_none()) {
@@ -2259,6 +2262,8 @@ impl Pair {
     }
     /// The previous scheduler page of an owner change whose first command has
     /// not left the pair yet.
+    pub(crate) fn executed_scheduler(&self) -> u64 { self.executed }
+    pub(crate) fn scrub_tpc(&mut self) { self.memory.target.scrub_tpc(); }
     pub(crate) fn switch_in_flight(&self) -> Option<u64> {
         let (from, first) = self.switch?;
         (self.replay.len() != 0
@@ -2438,6 +2443,9 @@ impl Pair {
         if foreign {
             self.cursors = [0; 2];
             self.configs = [None; 2];
+            if self.variant.compute == crate::g17::fw::compute::ComputeProgram::G17G {
+                self.reinstall = [true; 2];
+            }
         }
         Ok(())
     }

@@ -309,6 +309,11 @@ impl RenderPool {
         })
     }
 
+    pub(crate) fn blocks(&self) -> usize { self.blocks }
+    /// Reuse the retained lower-window backing in another application's context.
+    pub(crate) fn alias_client(&self, client: &mmu::Vm) -> Result<mmu::KernelMapping> {
+        self.backing.lock().as_ref().ok_or(EAGAIN)?.pages.map_client(client)
+    }
     /// No backing is installed: the pool must be re-armed before staging.
     pub(crate) fn vacant(&self) -> bool {
         self.page_list.load(Ordering::Acquire) == 0
@@ -693,13 +698,18 @@ pub(crate) struct Lease {
     commands: u32,
     phase: LeasePhase,
     previous_release: Option<u32>,
+    retained: bool,
 }
 
 impl Lease {
     /// Acquires an unchanged overlapping owner, or an owner whose previous
     /// release was sent. A changed owner additionally requires caller-side
     /// proof of old-pool release before its backing can be repopulated.
-    pub(crate) fn acquire(previous: Option<&Self>, owner: Owner) -> Result<Self> {
+    pub(crate) fn acquire_variant(
+        previous: Option<&Self>,
+        owner: Owner,
+        retained: bool,
+    ) -> Result<Self> {
         let Some(previous) = previous else {
             return Ok(Self {
                 owner,
@@ -708,6 +718,7 @@ impl Lease {
                 commands: 2,
                 phase: LeasePhase::Preparing,
                 previous_release: None,
+                retained,
             });
         };
         if previous.owner.buffer_slot != owner.buffer_slot {
@@ -719,7 +730,8 @@ impl Lease {
         // overlap of the owner's previous render.
         let overlapping = same_owner
             && match previous.phase {
-                LeasePhase::Ready => previous.references >= 2 && previous.commands >= 2,
+                LeasePhase::Ready => (previous.references >= 2 && previous.commands >= 2)
+                    || (retained && previous.references == 0 && previous.commands == 0),
                 LeasePhase::Lingering(_) => true,
                 _ => false,
             };
@@ -740,6 +752,7 @@ impl Lease {
             commands,
             phase: LeasePhase::Preparing,
             previous_release: previous.release_witness(),
+            retained,
         })
     }
 
@@ -814,7 +827,7 @@ impl Lease {
         }
     }
     pub(crate) fn pending_release(&self) -> Option<super::fw::channels::FreeListRelease> {
-        (self.phase == LeasePhase::Ready && self.references == 0).then(|| {
+        (!self.retained && self.phase == LeasePhase::Ready && self.references == 0).then(|| {
             super::fw::channels::FreeListRelease::new(self.generation, self.owner.buffer_slot)
         })
     }

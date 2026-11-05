@@ -43,6 +43,7 @@ mod fence;
 mod freelist;
 pub(crate) mod fw;
 pub(crate) mod hal300;
+mod quarantine;
 pub(crate) mod hazard;
 mod ids;
 mod initdata;

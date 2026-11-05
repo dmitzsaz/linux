@@ -85,16 +85,18 @@ pub(crate) trait Host {
     fn publish(&mut self, record: &SchedulerStateRelease) -> Result<u32>;
     fn notify(&mut self) -> Result;
     fn detach(&mut self, context: &Arc<Context>) -> Result;
+    fn retain_closed(&mut self, _context: &Arc<Context>) -> Result { Err(EINVAL) }
     fn report(&mut self, context: &Arc<Context>, failure: Failure);
 }
 
 pub(crate) struct Pending {
+    hal300: bool,
     entries: KVec<Entry>,
 }
 
 impl Pending {
-    pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
+    pub(crate) fn for_variant(variant: &super::fw::Variant) -> Result<Self> {
+        Ok(Self { hal300: variant.compute == super::fw::compute::ComputeProgram::G17G,
             entries: KVec::with_capacity(CAPACITY, GFP_KERNEL)?,
         })
     }
@@ -118,13 +120,13 @@ impl Pending {
     /// last ran have not been detached yet. Until then the firmware may still
     /// process the release against those queues: none of them may change owner.
     pub(crate) fn releasing(&self, context: &Arc<Context>) -> bool {
-        self.find(context)
+        !self.hal300 && self.find(context)
             .is_some_and(|index| self.entries[index].phase != Phase::Deferred)
     }
 
     /// `releasing` for the context that owns scheduler page `scheduler`.
     pub(crate) fn releasing_scheduler(&self, scheduler: u64) -> bool {
-        self.entries.iter().any(|entry| {
+        !self.hal300 && self.entries.iter().any(|entry| {
             entry.phase != Phase::Deferred && entry.context.scheduler_va() == scheduler
         })
     }
@@ -190,7 +192,7 @@ impl Pending {
     /// Publish in insertion order. Mandatory control replies and a full control ring stop this
     /// pass; an error for one page leaves it retained while other ready releases may progress.
     pub(crate) fn publish_ready(&mut self, host: &mut impl Host, recovery: bool, now: u64) -> Result {
-        if !recovery {
+        if !recovery && !self.hal300 {
             for entry in self.entries.iter_mut() {
                 // The ring record is already published. Retry only its doorbell;
                 // never duplicate a scheduler release after a transport error.
@@ -254,6 +256,7 @@ impl Pending {
         producer: u32,
         host: &mut impl Host,
     ) -> Result<Option<Arc<Context>>> {
+        if self.hal300 { return self.take_closed_idle(host); }
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
             let Phase::Released(target) = entry.phase else {
@@ -361,6 +364,27 @@ impl Pending {
         self.entries
             .iter()
             .filter_map(move |entry| entry.kill_wait.map(|(since, _)| now.saturating_sub(since)))
+    }
+
+    fn take_closed_idle(&mut self, host: &mut impl Host) -> Result<Option<Arc<Context>>> {
+        for index in 0..self.entries.len() {
+            let entry = &self.entries[index];
+            if entry.phase != Phase::Draining
+                || !host.render_idle(&entry.context)?
+                || !host.compute_idle(&entry.context)
+            {
+                continue;
+            }
+            match host.retain_closed(&entry.context) {
+                Ok(()) => {}
+                Err(EBUSY) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+            let entry = self.entries.remove(index).map_err(|_| EIO)?;
+            entry.context.quarantine_pages();
+            return Ok(Some(entry.context));
+        }
+        Ok(None)
     }
 
     /// Poll for a bounded window at close and again at actual release publication.

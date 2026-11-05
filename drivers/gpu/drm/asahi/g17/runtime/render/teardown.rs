@@ -89,6 +89,99 @@ impl RenderState {
         Ok(())
     }
 
+    pub(in crate::g17::runtime) fn collect_closed_retired(
+        &mut self,
+        buffers: &mut BufferIds,
+        out: &mut ReclaimBatch,
+    ) -> Result {
+        if !self.hal300
+        {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.retired.len() {
+            let context = self.retired[index].context();
+            let scheduler = context.scheduler_va();
+            let busy = context.is_current()
+                || self.entries.iter().flatten().any(|entry| {
+                    entry.borrowed_switch == Some(scheduler)
+                        || entry
+                            .context
+                            .as_ref()
+                            .is_some_and(|owner| Arc::ptr_eq(owner, context))
+                        || entry.pair.as_ref().is_some_and(|pair| {
+                            pair.executed_scheduler() == scheduler
+                                || pair.switch_in_flight() == Some(scheduler)
+                        })
+                });
+            if busy {
+                index += 1;
+                continue;
+            }
+            let Ok(target) = out.binding_slot() else {
+                break;
+            };
+            if let Some(id) = self.retired[index].buffer_id() {
+                buffers.unreserve_owner(id)?;
+            }
+            *target = Some(self.retired.remove(index).map_err(|_| EIO)?);
+        }
+        // A pool becomes spare once no pair, borrowed pair or retired binding names it.
+        if self
+            .entries
+            .iter()
+            .flatten()
+            .any(|entry| entry.constructing || entry.growing || entry.preparing.is_some())
+        {
+            return Ok(());
+        }
+        let mut index = 0;
+        while index < self.closed_pools.len() {
+            let pool = &self.closed_pools[index];
+            let named = self.entries.iter().flatten().any(|entry| {
+                entry.pool.as_ref().is_some_and(|bound| Arc::ptr_eq(bound, pool))
+                    || entry.pair.as_ref().is_some_and(|pair| Arc::ptr_eq(pair.pool(), pool))
+            }) || self.retired.iter().any(|old| Arc::ptr_eq(old.pool(), pool));
+            if named {
+                index += 1;
+                continue;
+            }
+            let pool = self.closed_pools.remove(index).map_err(|_| EIO)?;
+            // On allocation failure the pool simply stays retained (Context::render_pool).
+            if self.spare_pools.push(pool, GFP_KERNEL).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::g17::runtime) fn park_closed_pool(&mut self, context: &Arc<Context>) {
+        if let Some(pool) = context.take_render_pool() {
+            let _ = self.closed_pools.push(pool, GFP_KERNEL);
+        }
+    }
+
+    pub(in crate::g17::runtime) fn adopt_spare_pool(&mut self, context: &Arc<Context>) {
+        if !self.hal300
+            || context.has_render_pool()
+        {
+            return;
+        }
+        let Some(index) = self
+            .spare_pools
+            .iter()
+            .position(|pool| pool.blocks() >= context.render_blocks())
+        else {
+            return;
+        };
+        let Ok(pool) = self.spare_pools.remove(index) else {
+            return;
+        };
+        if let Err(pool) = context.adopt_render_pool(pool) {
+            let _ = self.spare_pools.push(pool, GFP_KERNEL);
+        }
+    }
+
     /// Preflight the entire Context before detaching its first graph. Successor
     /// graphs on the same VM have a different Arc and remain installed.
     pub(in crate::g17::runtime) fn detach_context(

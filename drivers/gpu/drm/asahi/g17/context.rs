@@ -123,6 +123,10 @@ pub(crate) struct FirmwarePages {
 }
 
 pub(crate) struct Context {
+    quarantine: Option<Arc<super::quarantine::Quarantine>>,
+    retained_pages: Option<super::quarantine::Reservation>,
+    render_alias: Arc<Mutex<Option<mmu::KernelMapping>>>,
+    render_adopted: AtomicBool,
     execution: Arc<ExecutionContext>,
     status: Arc<VmStatus>,
     scheduler: Arc<KernelObject>,
@@ -161,7 +165,7 @@ impl Context {
         clippy::too_many_arguments,
         reason = "A context takes its allocators, identities and both admission domains."
     )]
-    pub(crate) fn new(
+    pub(super) fn new(
         alloc: &Allocator<'_>,
         pool: &Arc<Pool>,
         qos: &Arc<QosIds>,
@@ -170,7 +174,9 @@ impl Context {
         policy: Policy,
         state_returns: Arc<super::availability::Availability>,
         compute_returns: Arc<super::availability::Availability>,
+        quarantine: Option<Arc<super::quarantine::Quarantine>>,
     ) -> Result<Self> {
+        let retained_pages = quarantine.as_ref().map(|q| q.reserve(3 * UAT_PGSZ)).transpose()?;
         let status = execution.vm().status().ok_or(EINVAL)?.clone();
         let qos = qos.acquire()?;
         let mut scheduler = alloc.kernel(
@@ -220,7 +226,15 @@ impl Context {
         let render = Arc::pin_init(new_mutex!(None, "G17 context private memory"), GFP_KERNEL)?;
         let order =
             Arc::pin_init(new_mutex!(Order::new(), "G17 context admission order"), GFP_KERNEL)?;
+        let render_alias = Arc::pin_init(
+            new_mutex!(None, "G17 adopted render pool alias"),
+            GFP_KERNEL,
+        )?;
         Ok(Self {
+            quarantine,
+            retained_pages,
+            render_alias,
+            render_adopted: AtomicBool::new(false),
             execution,
             status,
             scheduler,
@@ -306,6 +320,11 @@ impl Context {
     /// The pages an installed queue record of this context still names: the
     /// scheduler page and the work storage holding the job-list head. A retained
     /// physical queue keeps these after dropping the context itself.
+    pub(crate) fn quarantine_pages(&self) {
+        if let Some(reservation) = &self.retained_pages {
+            reservation.pages(self.retain_firmware_pages());
+        }
+    }
     pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
         FirmwarePages {
             _scheduler: self.scheduler.clone(),
@@ -397,18 +416,43 @@ impl Context {
         if let Some(pool) = &*render {
             // A pool vacated under memory pressure is re-armed before reuse.
             pool.ensure_backing(alloc, render_global, self.vm())?;
+            if self.render_adopted.load(Ordering::Acquire) {
+                let mut alias = self.render_alias.lock();
+                if alias.is_none() { *alias = Some(pool.alias_client(self.vm())?); }
+            }
             return Ok(pool.clone());
         }
+        let reservation = self.quarantine.as_ref().map(|q| {
+            let bytes = self.render_blocks().checked_mul(super::fw::initdata::FREE_LIST_BLOCK_SIZE)
+                .and_then(|bytes| bytes.checked_add(4 * UAT_PGSZ)).ok_or(ENOSPC)?;
+            q.reserve(bytes)
+        }).transpose()?;
         let pool = Arc::new(
             RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?,
             GFP_KERNEL,
         )?;
+        if let Some(reservation) = reservation { reservation.pool(pool.clone()); }
         *render = Some(pool.clone());
         Ok(pool)
     }
     /// Drops the pool once its free-list release is consumed and the closed
     /// scheduler is detached. Installed compute bindings may retain the
     /// context itself until replacement; they never use the render pool.
+    pub(crate) fn adopt_render_pool(
+        &self,
+        pool: Arc<RenderPool>,
+    ) -> core::result::Result<(), Arc<RenderPool>> {
+        let mut render = self.render.lock();
+        if render.is_some() || pool.blocks() < self.render_blocks() {
+            return Err(pool);
+        }
+        *render = Some(pool);
+        self.render_adopted.store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn has_render_pool(&self) -> bool {
+        self.render.lock().is_some()
+    }
     pub(crate) fn take_render_pool(&self) -> Option<Arc<RenderPool>> {
         self.render.lock().take()
     }
