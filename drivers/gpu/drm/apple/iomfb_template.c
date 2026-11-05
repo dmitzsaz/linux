@@ -3643,7 +3643,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	dcp->output_pq = dcp->pq_requested && mode->pq.score >= 0;
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
-	dcp->use_timestamps = mode->vrr && dcp->main_display;
+	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
@@ -3892,14 +3892,16 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->clear = 1;
 	}
 
-#if DCP_FW_DESKTOP_26(DCP_FW_VER)
+#if DCP_FW_DESKTOP_26(DCP_FW_VER) || \
+	(DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
 	{
-		u64 deadline = dcp_desktop_present_deadline(has_surface, dcp->use_timestamps);
+		u64 deadline = dcp_present_deadline(has_surface, dcp->use_timestamps);
 
-		/* Types 1, 2 and 7 carry the same desktop presentation deadline. */
+		/* Types 1, 2 and 7 carry the same expired presentation deadline. */
 		req->swap.timestamp[0] = deadline;
 		req->swap.timestamp[1] = deadline;
 		req->swap.timestamp[6] = deadline;
+		trace_iomfb_vrr_timestamps(dcp, dcp->vrr_enabled, deadline, deadline);
 	}
 #else
 	if (has_surface && (dcp->use_timestamps || dcp->vrr_enabled)) {

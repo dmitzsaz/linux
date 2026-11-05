@@ -30,10 +30,12 @@ static inline bool dcp_refresh_range(u32 rate, u32 minimum, u32 maximum,
 }
 
 /*
- * Desktop 26.6 uses its own presentation clock. A deadline long past asks
- * for the next permitted refresh. ARM counter values can stall the swap.
+ * A deadline long past asks for the next permitted refresh; 120 is not Hz.
+ * Desktop 26.6 has its own presentation clock. Use an expired deadline for
+ * fixed ProMotion on H17 firmware 27 too, as its original host path did,
+ * rather than assuming that the ARM counter is in the same clock domain.
  */
-static inline u64 dcp_desktop_present_deadline(bool have_surface, bool required)
+static inline u64 dcp_present_deadline(bool have_surface, bool required)
 {
 	return have_surface && required ? 120 : 0;
 }
