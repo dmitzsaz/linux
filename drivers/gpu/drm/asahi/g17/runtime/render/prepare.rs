@@ -97,6 +97,7 @@ impl super::super::Backend {
                 return Ok(());
             }
             let resources = BuildResources::new(firmware)?;
+            firmware.queues.render.adopt_spare_pool(&self.context);
             let build =
                 if let Some(entry) = firmware.queues.render.entries[usize::from(slot)].as_ref() {
                     if entry.pending_error.is_some() || entry.pending_timeout {
