@@ -2796,12 +2796,79 @@ impl SecondaryRoot {
     }
 }
 
+/// Fixed bootstrap carrier records in the HAL300 submission arena.
+#[repr(C)]
+struct ArenaSupport {
+    ptr_0: u64,
+    pad_8: [u8; 0xf8],
+    ptr_100: u64,
+    pad_108: [u8; 8],
+    unk_110: u32,
+    pad_114: [u8; 4],
+}
+#[repr(C)]
+struct ArenaSchedulerSupport {
+    ptr_0: u64,
+    pad_8: [u8; 8],
+    unk_10: u32,
+    pad_14: [u8; 4],
+}
+#[repr(C)]
+struct SubmissionArena {
+    pad_0: [u8; 0x1e0000],
+    support: ArenaSupport,
+    pad_1e0118: [u8; 0x1e4000 - 0x1e0118],
+    pool: super::FreeListControl,
+    pad_1e4068: [u8; 0x1e8000 - 0x1e4068],
+    pool_state: u64,
+    pad_1e8008: [u8; 0x1ec000 - 0x1e8008],
+    status: [u32; 2],
+    pad_1ec008: [u8; 0x1f0000 - 0x1ec008],
+    scheduler_support: ArenaSchedulerSupport,
+    pad_1f0018: [u8; 0x1f4000 - 0x1f0018],
+    scheduler_state: u32,
+    pad_1f4004: [u8; 0x800000 - 0x1f4004],
+}
+// SAFETY: Every field consists only of integers or arrays of integers.
+unsafe impl Zeroable for SubmissionArena {}
+static_assert!(size_of::<SubmissionArena>() == 0x800000);
+static_assert!(core::mem::offset_of!(SubmissionArena, pool) == 0x1e4000);
+static_assert!(core::mem::offset_of!(SubmissionArena, pool_state) == 0x1e8000);
+static_assert!(core::mem::offset_of!(SubmissionArena, status) == 0x1ec000);
+static_assert!(core::mem::offset_of!(SubmissionArena, scheduler_support) == 0x1f0000);
+static_assert!(core::mem::offset_of!(SubmissionArena, scheduler_state) == 0x1f4000);
+impl SubmissionArena {
+    fn init(&mut self) {
+        let base = crate::hw::t8142::OBJECTS[9].va;
+        let pool = crate::hw::t8142::OBJECTS[11].aliases[0];
+        self.support.ptr_0 = base + 0x1ec000;
+        self.support.ptr_100 = base + 0x1ec004;
+        self.support.unk_110 = crate::hw::t8142::ARENA_UNK_50;
+        self.pool = super::FreeListControl::compute(&super::FreeListArgs {
+            buffer_slot: crate::hw::t8142::ARENA_POOL_SLOT,
+            class: super::FreeListClass::One,
+            page_list_va: pool,
+            run_list_va: pool + 0x200000,
+            blocks: 21,
+            state_va: base + 0x1e8000,
+        });
+        self.status = [0, 1];
+        self.scheduler_support.ptr_0 = base + 0x1f4000;
+        self.scheduler_support.unk_10 = crate::hw::t8142::ARENA_UNK_50;
+        self.scheduler_state = 1;
+    }
+}
+
 pub(crate) fn fill(
     kind: Object,
     object: &mut crate::g17::object::KernelObject,
     inputs: &crate::g17::hal300::Inputs,
 ) -> Result {
     match kind {
+        Object::SubmissionArena => object.initialize::<SubmissionArena>(0, |value| {
+            value.init();
+            Ok(())
+        }),
         Object::HardwareData => object.initialize::<HardwareData>(0, |value| {
             value.init(inputs);
             Ok(())
