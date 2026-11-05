@@ -31,53 +31,21 @@
 	};
 };
 
+&pinctrl_ap {
+	/*
+	 * Not every pin is the AP's: reading pin 78's register raises
+	 * an SError. Expose only the pins sound uses: 100 (jack IRQ),
+	 * 150 (amp IRQ) and 151 (amp shutdown).
+	 */
+	gpio-reserved-ranges = <0 100>, <101 49>, <152 72>;
+};
+
+&pinctrl_nub {
+	/* Only pin 18 (jack codec reset), as on pinctrl_ap. */
+	gpio-reserved-ranges = <0 18>, <19 21>;
+};
+
 &{/soc} {
-	pinctrl_ap: pinctrl@39a000000 {
-		compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
-		reg = <0x3 0x9a000000 0x0 0x100000>;
-		gpio-controller;
-		#gpio-cells = <2>;
-		gpio-ranges = <&pinctrl_ap 0 0 224>;
-		apple,npins = <224>;
-		/*
-		 * Not every pin is the AP's: reading pin 78's register raises
-		 * an SError. Expose only the pins sound uses: 100 (jack IRQ),
-		 * 150 (amp IRQ) and 151 (amp shutdown).
-		 */
-		gpio-reserved-ranges = <0 100>, <101 49>, <152 72>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 347 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 348 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 349 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 350 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 351 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 352 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 353 IRQ_TYPE_LEVEL_HIGH>;
-	};
-
-	pinctrl_nub: pinctrl@3881f0000 {
-		compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
-		reg = <0x3 0x881f0000 0x0 0x4000>;
-		gpio-controller;
-		#gpio-cells = <2>;
-		gpio-ranges = <&pinctrl_nub 0 0 40>;
-		apple,npins = <40>;
-		/* Only pin 18 (jack codec reset), as on pinctrl_ap. */
-		gpio-reserved-ranges = <0 18>, <19 21>;
-		interrupt-controller;
-		#interrupt-cells = <2>;
-		interrupt-parent = <&aic>;
-		interrupts = <AIC_IRQ 574 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 575 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 576 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 577 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 578 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 579 IRQ_TYPE_LEVEL_HIGH>,
-			     <AIC_IRQ 580 IRQ_TYPE_LEVEL_HIGH>;
-	};
-
 	pmgr_aop: power-management@388284000 {
 		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 		reg = <0x3 0x88284000 0x0 0x4000>;
