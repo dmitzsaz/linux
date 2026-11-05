@@ -1686,12 +1686,22 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 	return 0;
 }
 
+static int dcp_typec_route_apply(struct typec_mux_dev *mux,
+				 struct typec_mux_state *state);
+
 static int dcp_typec_route_finish(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state)
 {
 	struct apple_dcp_typec_port *port =
 		((struct apple_dcp_typec_route *)typec_mux_get_drvdata(mux))->port;
 	int ret;
+
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+
+	/* Every provider's set phase (including the PHY) has completed. */
+	if (route->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    state->mode != TYPEC_STATE_SAFE)
+		return dcp_typec_route_apply(mux, state);
 
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending ||
@@ -1749,7 +1759,7 @@ static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
 	return -ENOSPC;
 }
 
-static int dcp_typec_route_set(struct typec_mux_dev *mux,
+static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
 	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
@@ -1821,7 +1831,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 		 * another port is refused as busy. The route is taken again
 		 * when HPD returns.
 		 */
-		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+		if (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			port->preferred_route = port->owner;
 			port->hpd = false;
 			/*
@@ -1946,7 +1957,8 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	 * would otherwise hold it against the port that has one.
 	 */
 	if (!port->owner && !hpd &&
-	    route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP) {
+	    (route->dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP ||
+	     route->dcp->fw_compat == DCP_FIRMWARE_V_27_0)) {
 		port->applied_valid = true;
 		return 0;
 	}
@@ -2004,6 +2016,17 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	port->applied_valid = true;
 
 	return 0;
+}
+
+static int dcp_typec_route_set(struct typec_mux_dev *mux,
+			       struct typec_mux_state *state)
+{
+	struct apple_dcp_typec_route *route = typec_mux_get_drvdata(mux);
+
+	if (route->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    state->mode != TYPEC_STATE_SAFE)
+		return 0;
+	return dcp_typec_route_apply(mux, state);
 }
 
 /* Limited to the T6030 14.7 pipeline; other T602X tunnels keep their order. */
