@@ -899,7 +899,11 @@ enum drm_asahi_cmd_type {
  * these enums allow userspace to communicate the intentions.
  */
 enum drm_asahi_priority {
-	/** @DRM_ASAHI_PRIORITY_LOW: Low priority queue. */
+	/**
+	 * @DRM_ASAHI_PRIORITY_LOW: Low priority queue.
+	 *
+	 * Firmware with a single scheduling profile may promote LOW to MEDIUM.
+	 */
 	DRM_ASAHI_PRIORITY_LOW = 0,
 
 	/** @DRM_ASAHI_PRIORITY_MEDIUM: Medium priority queue. */
@@ -909,7 +913,8 @@ enum drm_asahi_priority {
 	 * @DRM_ASAHI_PRIORITY_HIGH: High priority queue.
 	 *
 	 * Requires CAP_SYS_NICE or DRM master; otherwise queue creation fails
-	 * with -EACCES.
+	 * with -EACCES. Firmware without an admitted elevated scheduling profile
+	 * may also refuse HIGH with -EACCES.
 	 */
 	DRM_ASAHI_PRIORITY_HIGH = 2,
 

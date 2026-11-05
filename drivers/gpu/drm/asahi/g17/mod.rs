@@ -1836,12 +1836,15 @@ impl gpu::Gpu for Gpu {
             self.shared.variant,
             self.shared.active_cores,
         )?;
-        // 26A434 has one supported scheduling profile. Reject unimplemented priority
-        // classes rather than promising preemption with untested scheduler records.
-        if self.shared.variant.compute == fw::compute::ComputeProgram::G17G && priority != 2 {
-            return Err(EINVAL);
-        }
-        let policy = scheduling_policy(priority)?;
+        // HAL300 currently has one admitted scheduling profile. LOW is a hint
+        // and may run at MEDIUM; elevated service must fail for userspace fallback.
+        let policy = if self.shared.variant.compute == fw::compute::ComputeProgram::G17G {
+            match priority {
+                2 | 3 => hw::t8140::scheduling::MEDIUM,
+                1 => return Err(EACCES),
+                _ => return Err(EINVAL),
+            }
+        } else { scheduling_policy(priority)? };
         let admission_started = now_ns();
         let (backend, slot) = loop {
             let observed = self.shared.queues.observe();

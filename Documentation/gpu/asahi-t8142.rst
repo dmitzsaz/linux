@@ -392,7 +392,14 @@ There is no verified hibernation or kexec handover; neither is supported while
 this firmware session exists. The existing idle and s2idle firmware behavior
 is preserved and requires hardware requalification after driver changes.
 
-Only medium priority is admitted. Matrix, ray-traversal, SCS and render-resource
-extensions remain unadvertised. Userspace timestamp-only commands must execute
+LOW and MEDIUM queue requests are accepted and both use the MEDIUM firmware
+profile. LOW is promoted; queue creation succeeds without a resolved-priority
+query. HIGH queue creation fails with EACCES, including for privileged callers
+because this build has no admitted elevated profile. The common ioctl still
+checks CAP_SYS_NICE or DRM-master permission first. REALTIME remains reserved
+and fails with EINVAL. Gallium's existing HIGH-to-MEDIUM fallback remains usable;
+Honeykrisp advertises LOW/MEDIUM and returns VK_ERROR_NOT_PERMITTED for elevated
+global requests. Matrix, ray-traversal, SCS and render-resource extensions remain
+unadvertised. Userspace timestamp-only commands must execute
 a real carrier dispatch: the driver reports a measured raw/record interval only
 after the normal post-maintenance completion witness.
