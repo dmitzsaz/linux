@@ -1483,6 +1483,7 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 	 * use EPICProviderClass to match the service.
 	 */
 	if (props_size > 36) {
+		const char *fallback_name = NULL;
 		int ret = parse(props, props_size, &ctx);
 		if (ret) {
 			dev_err(ep->dcp->dev,
@@ -1490,8 +1491,13 @@ static void afk_recv_handle_init(struct apple_dcp_afkep *ep, u32 channel,
 				ep->endpoint, name);
 			return;
 		}
+		if (ep->wire_v2 && ep == ep->dcp->systemep &&
+		    !strcmp(name, "powerlog-service"))
+			fallback_name = name;
 		ret = parse_epic_service_init(&ctx, &epic_name, &epic_class, &epic_unit,
-					      (ep->dcp->fw_compat == DCP_FIRMWARE_H17P || ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0));
+					     ep->dcp->fw_compat == DCP_FIRMWARE_H17P ||
+					     ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0,
+					     fallback_name);
 		if (ret == -ENOENT &&
 		    ep->dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17G) {
 			/* Match name-only H17G powerlog service announcements. */
