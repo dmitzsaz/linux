@@ -414,7 +414,7 @@ impl Pair {
             self.memory.lifecycle
         };
         let (scratch, metric) = self.memory.manager.scene_registers(scene)?;
-        let timestamp_offset = ordinal as usize % memory::RECORDS * 16;
+        let timestamp_offset = self.memory.timestamp_offset(ordinal);
         let timestamp = self.memory.timestamps.gpu_va() + timestamp_offset as u64;
         let resources = abi::RenderResources {
             context_id: packet.context.id().try_into()?,
@@ -487,7 +487,7 @@ impl Pair {
                 return Err(error);
             }
         };
-        self.memory.timestamps.write(timestamp_offset, [0u64; 2])?;
+        self.memory.clear_pass(ordinal)?;
         self.memory.manager.claim_scene(ordinal, scene)?;
         self.prepared = Some(Prepared {
             packet: packet.clone(),
@@ -1036,7 +1036,7 @@ impl<H: Host> retirement::Memory for Observer<'_, H> {
     fn stamps(&mut self) -> Result<[u32; 2]> {
         self.host.stamps(self.qids)
     }
-    fn pass(&mut self, ordinal: u64) -> Result<[u64; 2]> {
+    fn pass(&mut self, ordinal: u64) -> Result<[u64; 4]> {
         self.memory.pass(ordinal)
     }
 }
