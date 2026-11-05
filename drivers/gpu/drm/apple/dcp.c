@@ -1235,7 +1235,13 @@ VISIBLE_IF_KUNIT void dcp_swap_watchdog(struct work_struct *work)
 
 void dcp_swap_watchdog_arm(struct apple_dcp *dcp)
 {
-	if (dcp_is_typec_output(dcp) ||
+	/*
+	 * The HDMI output of an external H17P pipe drops swaps as a Type-C
+	 * one does once its display is unplugged; without the watchdog the
+	 * dropped present holds the queue until the coprocessor is declared
+	 * crashed, and the pipeline is lost for every later display.
+	 */
+	if (dcp_is_typec_output(dcp) || dcp_is_external_h17p(dcp) ||
 	    (dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP &&
 	     READ_ONCE(dcp->vrr_enabled))) {
 		dcp->swap_watchdog_deadline = jiffies +
