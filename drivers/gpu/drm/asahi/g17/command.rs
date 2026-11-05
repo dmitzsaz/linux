@@ -3,7 +3,7 @@
 //! Decode a submission and validate its user resources before publishing any work.
 
 use super::fw::{
-    compute::{IntersectionTables, ScratchRequest},
+    compute::{ComputeProgram, ComputeStorage, IntersectionTables, ScratchRequest, StorageProgram},
     kick::WriteRange,
     render::{RenderPass, UscProgram, ZlsSurface},
     render_rt::RayQueryStage,
@@ -88,7 +88,7 @@ impl Attachments {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Payload {
     Render(uapi::drm_asahi_cmd_render, [Attachments; 2], [RayQueryStage; 2]),
-    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables),
+    Compute(uapi::drm_asahi_cmd_compute, Attachments, IntersectionTables, ComputeStorage, u32),
 }
 
 pub(crate) struct Command {
@@ -103,14 +103,20 @@ pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     counts: [u16; 2],
     attachments: [Attachments; 3],
+    storage: ComputeStorage,
+    cores: u32,
+    g17g: bool,
 }
 
 impl<'a> Parser<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub(crate) fn new(bytes: &'a [u8], cores: u32, program: ComputeProgram) -> Self {
         Self {
             bytes,
             counts: [0; 2],
             attachments: [Attachments::EMPTY; 3],
+            storage: ComputeStorage::NONE,
+            cores,
+            g17g: program == ComputeProgram::G17G,
         }
     }
 
@@ -150,6 +156,8 @@ impl<'a> Parser<'a> {
                             payload(&bytes[..bytes.len().min(COMPUTE_BASE_SIZE)])?,
                             self.attachments[2],
                             IntersectionTables::parse(bytes.get(COMPUTE_BASE_SIZE..).unwrap_or(&[]))?,
+                            self.storage,
+                            self.cores,
                         )
                     };
                     return Ok(Some(Command { barriers, payload }));
@@ -163,6 +171,18 @@ impl<'a> Parser<'a> {
                     let slot = header.cmd_type as usize
                         - uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_VERTEX_ATTACHMENTS as usize;
                     self.attachments[slot] = Attachments::parse(bytes)?;
+                }
+                uapi::drm_asahi_cmd_type_DRM_ASAHI_SET_COMPUTE_RESOURCES => {
+                    if !self.g17g || barriers != [uapi::DRM_ASAHI_BARRIER_NONE as u16; 2]
+                        || bytes.len() % size_of::<StorageProgram>() != 0 {
+                        return Err(EINVAL);
+                    }
+                    let mut storage = ComputeStorage::NONE;
+                    let mut records = Reader::new(bytes);
+                    for _ in 0..bytes.len() / size_of::<StorageProgram>() {
+                        storage.fold(&records.read::<StorageProgram>()?, self.cores)?;
+                    }
+                    self.storage = storage;
                 }
                 _ => return Err(EINVAL),
             }
@@ -344,7 +364,7 @@ impl Payload {
     pub(crate) fn prior(&self) -> [u64; 2] {
         match self {
             Self::Render(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
-            Self::Compute(cmd, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
+            Self::Compute(cmd, _, _, _, _) => [cmd.prior_vdm, cmd.prior_cdm],
         }
     }
 
@@ -371,6 +391,7 @@ impl Payload {
                     1 => 0,
                     2 => 1,
                     4 => 2,
+                    8 if variant.compute == ComputeProgram::G17G => 3,
                     _ => return Err(EINVAL),
                 };
                 if u64::from(cmd.sample_size_B)
@@ -478,7 +499,7 @@ impl Payload {
                     timestamps: [cmd.ts_vtx, cmd.ts_frag],
                 })
             }
-            Self::Compute(cmd, attachments, intersection) => {
+            Self::Compute(cmd, attachments, intersection, storage, cores) => {
                 let as_build = super::timeout::as_build(cmd.flags).ok_or(EINVAL)?;
                 if cmd.cdm_ctrl_stream_base & 3 != 0
                     || cmd.cdm_ctrl_stream_end & 3 != 0
@@ -495,7 +516,10 @@ impl Payload {
                 )?;
                 sampler(space, cmd.sampler_heap, cmd.sampler_count)?;
                 attachments.validate(space)?;
-                let scratch = ScratchRequest::new(cmd.scs_layout)?;
+                let scratch = if variant.compute == ComputeProgram::G17G {
+                    if cmd.scs_layout != 0 || intersection.enabled() { return Err(EINVAL); }
+                    ScratchRequest::m5(storage, *cores)?
+                } else { ScratchRequest::new(cmd.scs_layout)? };
                 if (scratch.enabled() || intersection.enabled()) && !variant.ray_traversal {
                     return Err(refuse_ray_traversal());
                 }
