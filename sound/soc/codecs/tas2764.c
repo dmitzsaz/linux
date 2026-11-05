@@ -1421,6 +1421,8 @@ static int tas2764_parse_tx_zd_config(struct device *dev, struct tas2764_priv *t
 	tas2764->have_tx_zd = true;
 	return 0;
 }
+
+/*
  * BCLK/FS ratios and the TAS2764_CLK_CFG value that makes the amplifier
  * accept them. Only the J873 speaker frame (250 BCLKs, which the ratio
  * auto-detection rejects with "bad TDM clock") is verified on hardware;
