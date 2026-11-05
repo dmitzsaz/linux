@@ -24,6 +24,37 @@ pub(crate) const METRICS_SLOTS: usize = cfg::METRICS_SIZE as usize / METRICS_STR
 pub(crate) const NORMAL_MAX_BLOCKS: usize = 0x45e;
 pub(crate) const GROW_BLOCKS: usize = 10;
 
+/// Parameter-buffer allocation and wire units for one firmware variant.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Layout { pub(crate) hal300: bool }
+impl Layout {
+    pub(crate) const fn new(programs: super::render::RegisterPrograms) -> Self {
+        Self { hal300: matches!(programs, super::render::RegisterPrograms::G17G) }
+    }
+    pub(crate) fn block_size(self) -> usize {
+        if self.hal300 {
+            0x80000
+        } else {
+            cfg::TVB_BLOCK_SIZE
+        }
+    }
+    pub(crate) fn pages_per_block(self) -> usize { self.block_size() / cfg::TVB_PAGE as usize }
+    pub(crate) fn block_stride(self) -> u64 { self.block_size() as u64 + cfg::TVB_PAGE }
+    pub(crate) fn max_blocks(self) -> usize {
+        cfg::TVB_MAX_BLOCKS
+            .min(cfg::TVB_BLOCK_SLOTS * cfg::TVB_PAGES_PER_BLOCK / self.pages_per_block())
+    }
+    pub(crate) fn normal_max(self) -> usize {
+        NORMAL_MAX_BLOCKS * cfg::TVB_BLOCK_SIZE / self.block_size()
+    }
+    pub(crate) fn grow_blocks(self) -> usize { if self.hal300 { 4 } else { GROW_BLOCKS } }
+    /// TA masks the scratch address to 64-byte granularity on G17G.
+    pub(crate) fn scratch_stride(self) -> u64 { if self.hal300 { 0x40 } else { SCRATCH_STRIDE } }
+    pub(crate) fn layout_blocks(self, blocks: usize) -> usize {
+        (blocks * cfg::TVB_BLOCK_SIZE).div_ceil(self.block_size()).max(cfg::TVB_INITIAL_PAGES.len())
+    }
+}
+
 /// Firmware's active parameter-buffer state. Pointers at +0x44, +0x4c,
 /// +0x64 and +0x84 are intentionally unaligned.
 #[repr(C, packed)]
@@ -128,6 +159,7 @@ pub(crate) struct MetricsAddresses {
 }
 
 pub(crate) struct GraphArgs<'a> {
+    pub(crate) layout: Layout,
     pub(crate) fw_va: u64,
     pub(crate) page_list_client: u64,
     pub(crate) metrics: MetricsAddresses,
@@ -138,11 +170,11 @@ pub(crate) struct GraphArgs<'a> {
     pub(crate) generation: u64,
 }
 
-pub(crate) fn compact_page(address: u64) -> Result<u32> {
+pub(crate) fn compact_page(address: u64, layout: Layout) -> Result<u32> {
     let relative = address.checked_sub(cfg::USER_BASE).ok_or(EINVAL)?;
     if relative % cfg::TVB_PAGE != 0
         || address
-            .checked_add(cfg::TVB_BLOCK_SIZE as u64)
+            .checked_add(layout.block_size() as u64)
             .ok_or(EOVERFLOW)?
             > cfg::USER_END
     {
@@ -155,7 +187,7 @@ impl Graph {
     pub(crate) fn init(&mut self, args: &GraphArgs<'_>) -> Result {
         if args.generation == 0
             || args.blocks.len() < cfg::TVB_INITIAL_PAGES.len()
-            || args.blocks.len() > cfg::TVB_MAX_BLOCKS
+            || args.blocks.len() > args.layout.max_blocks()
         {
             return Err(EINVAL);
         }
@@ -167,23 +199,23 @@ impl Graph {
         let stats = offset_va(args.fw_va, (CONTROL + 0x40) as u64)?;
         clear(self);
         for (index, &address) in args.blocks.iter().enumerate() {
-            let first = compact_page(address)?;
+            let first = compact_page(address, args.layout)?;
             self.blocks[index].first_page = first;
-            for page in 0..cfg::TVB_PAGES_PER_BLOCK {
-                self.pages[index * cfg::TVB_PAGES_PER_BLOCK + page] = first + page as u32;
+            for page in 0..args.layout.pages_per_block() {
+                self.pages[index * args.layout.pages_per_block() + page] = first + page as u32;
             }
         }
         for (index, scene) in self.scenes.iter_mut().enumerate() {
             scene.metric_client = offset_va(args.metrics.client, (index * 4) as u64)?;
             scene.metric_fw = offset_va(args.metrics.firmware, (index * 4) as u64)?;
-            scene.scratch = scratch + (index % SCRATCH_SLOTS) as u64 * SCRATCH_STRIDE;
+            scene.scratch = scratch + (index % SCRATCH_SLOTS) as u64 * args.layout.scratch_stride();
             scene.statistics = stats;
         }
         self.scenes[FIRST_SCENE].generation = args.generation;
         self.control.total = args.blocks.len() as u32;
         self.control.committed = self.control.total;
         self.control.reset = 1;
-        let pages = (args.blocks.len() * cfg::TVB_PAGES_PER_BLOCK) as u32;
+        let pages = (args.blocks.len() * args.layout.pages_per_block()) as u32;
         self.state.buffer_id = args.buffer_id;
         self.state.page_list_fw = offset_va(args.fw_va, PAGE_LIST as u64)?;
         self.state.page_list_client = args.page_list_client;
@@ -194,10 +226,13 @@ impl Graph {
         self.state.block_table = offset_va(args.fw_va, BLOCK_TABLE as u64)?;
         self.state.control = offset_va(args.fw_va, CONTROL as u64)?;
         self.state.last_page = pages - 1;
-        self.state.block_size = cfg::TVB_BLOCK_SIZE as u32;
+        self.state.block_size = args.layout.block_size() as u32;
         self.state.counter = offset_va(args.fw_va, COUNTER as u64)?;
-        self.state.maximum_size = (cfg::TVB_BLOCK_SLOTS * 4) as u32;
-        self.state.normal_maximum_size = (NORMAL_MAX_BLOCKS * 4) as u32;
+        self.state.maximum_size = if args.layout.hal300 {
+            (args.layout.max_blocks() * args.layout.pages_per_block()) as u32
+        } else { (cfg::TVB_BLOCK_SLOTS * 4) as u32 };
+        self.state.normal_maximum_size =
+            (args.layout.normal_max() * args.layout.pages_per_block()) as u32;
         self.state.discard = discard;
         Ok(())
     }
@@ -222,7 +257,12 @@ pub(crate) fn reload_descriptor(previous: [u32; 4], address: u64, pages: u32) ->
 }
 
 /// Compact scratch and tagged metrics addresses carried by scene registers.
-pub(crate) fn scene_registers(index: usize, scratch: u64, metrics: u64) -> Result<(u64, u64)> {
+pub(crate) fn scene_registers(
+    index: usize,
+    scratch: u64,
+    metrics: u64,
+    layout: Layout,
+) -> Result<(u64, u64)> {
     const SEGMENT_SELECT: u64 = 1 << 42;
     const SEGMENT_BIAS: u64 = 0x70_0000_0000;
     const ADDRESS_MASK: u64 = 0x7f_ffff_fffe;
@@ -233,7 +273,7 @@ pub(crate) fn scene_registers(index: usize, scratch: u64, metrics: u64) -> Resul
     let scratch = scratch
         .checked_sub(cfg::USER_BASE)
         .ok_or(EINVAL)?
-        .checked_add((index % SCRATCH_SLOTS) as u64 * SCRATCH_STRIDE)
+        .checked_add((index % SCRATCH_SLOTS) as u64 * layout.scratch_stride())
         .ok_or(EOVERFLOW)?;
     if scratch > u64::from(u32::MAX) || scratch & 0xf != 0 {
         return Err(EINVAL);

@@ -126,7 +126,7 @@ impl Pools {
         pool.repopulate()?;
         let descriptor = pool
             .page_pool_state()?
-            .descriptor(words[3].load(Ordering::Relaxed));
+            .descriptor(words[3].load(Ordering::Relaxed), init.is_hal300());
         for (word, value) in words.into_iter().zip([
             descriptor.page_list,
             descriptor.counters,
@@ -249,10 +249,10 @@ impl Pools {
             page_count: words[2].load(Ordering::Relaxed),
             unk_18: words[3].load(Ordering::Relaxed),
         };
-        if descriptor.page_list != state.descriptor(descriptor.unk_18).page_list {
+        if descriptor.page_list != state.descriptor(descriptor.unk_18, init.is_hal300()).page_list {
             return Err(EIO);
         }
-        pool.store_page_pool_state(state.updated(&descriptor))
+        pool.store_page_pool_state(state.updated(&descriptor, init.is_hal300()))
     }
 }
 

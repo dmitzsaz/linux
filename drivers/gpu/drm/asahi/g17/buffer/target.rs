@@ -109,7 +109,7 @@ impl Layout {
                     .ok_or(EOVERFLOW)?,
             );
         }
-        tvb_blocks = tvb_blocks.max(cfg::TVB_INITIAL_PAGES.len());
+        tvb_blocks = crate::g17::fw::buffer::Layout::new(programs).layout_blocks(tvb_blocks);
         let mut gtp = [None; 8];
         let mut tpc_end = tpc_size;
         if programs == RegisterPrograms::V25G83 {
@@ -237,6 +237,12 @@ impl Target {
             }
         }
         Ok(addresses)
+    }
+
+    /// Cancelled tiling leaves tail pointers that must not feed a later pass.
+    pub(crate) fn scrub_tpc(&mut self) {
+        self.tpc.backing.bytes_mut().fill(0);
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
     }
 
     /// Only the span consumed by this render is cleared. A small render does

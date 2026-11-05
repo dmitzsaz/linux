@@ -412,7 +412,12 @@ impl Memory {
         let state = Generation::allocate_state(alloc, vm)?;
         let scratch = Compact::new(alloc, vm, cfg::SCENE_SIZE as usize)?;
         let discard = Compact::new(alloc, vm, cfg::DISCARD_SIZE as usize)?;
-        let (tvb, mappings) = buffer::Tvb::new(alloc.dev, vm, layout.tvb_blocks)?;
+        let (tvb, mappings) = buffer::Tvb::new(
+            alloc.dev,
+            vm,
+            layout.tvb_blocks,
+            fw::buffer::Layout::new(variant.programs),
+        )?;
         let count = DEPTH;
         let initial = if ordinal == 0 {
             0

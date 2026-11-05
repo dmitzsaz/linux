@@ -707,6 +707,8 @@ impl Pair {
         let barriers = render_barriers(pass.fragment_barriers, dependencies, own_tiling);
         let tiling_barriers = &barriers.tiling[..barriers.tiling_count];
         let args = |stage: usize, barriers, arrays, mcache| KickArgs {
+            typed_dependencies: self.variant.programs
+                == crate::g17::fw::render::RegisterPrograms::G17G,
             qid: qids[stage],
             timestamp: kicks[stage],
             parent: parents[stage],
@@ -2095,7 +2097,7 @@ fn install_memory(
         ];
         let previous = words.map(|word| word.load(Ordering::Relaxed));
         let pages: u32 = (memory.manager.blocks()
-            * crate::hw::t8140::resources::TVB_PAGES_PER_BLOCK)
+            * memory.manager.layout().pages_per_block())
             .try_into()?;
         let next = crate::g17::fw::buffer::reload_descriptor(
             previous,
