@@ -2272,6 +2272,7 @@ impl Queue {
                 self.graph.support.gpu_va() + 0x318,
             ],
             timestamp_va,
+            raw_timestamp_va: None,
         };
         let identity = ConfigIdentity {
             scheduler: packet.context.scheduler_va(),
