@@ -1332,6 +1332,48 @@ static int macsmc_hwmon_keys_show(struct seq_file *m, void *unused)
 }
 DEFINE_SHOW_ATTRIBUTE(macsmc_hwmon_keys);
 
+/* Normal read-only queries, kept separate from the full sensor inventory. */
+static int macsmc_hwmon_status_show(struct seq_file *m, void *unused)
+{
+	static const smc_key keys[] = {
+		SMC_KEY(CLKM), SMC_KEY(B0AT), SMC_KEY(MSPS),
+		SMC_KEY(MSLD), SMC_KEY(NTAP), SMC_KEY(WKTP),
+	};
+	struct macsmc_hwmon *hwmon = m->private;
+	struct apple_smc_key_info info;
+	u8 value[8];
+	unsigned int i;
+	int ret;
+
+	seq_puts(m, "# key type size flags raw bytes (firmware byte order)\n");
+	for (i = 0; i < ARRAY_SIZE(keys); i++) {
+		macsmc_hwmon_seq_fourcc(m, keys[i]);
+		ret = apple_smc_get_key_info(hwmon->smc, keys[i], &info);
+		if (ret < 0) {
+			seq_printf(m, " info error %d\n", ret);
+			continue;
+		}
+		seq_putc(m, ' ');
+		macsmc_hwmon_seq_fourcc(m, info.type_code);
+		seq_printf(m, " %u %02x", info.size, info.flags);
+		if (!(info.flags & APPLE_SMC_READABLE) ||
+		    !info.size || info.size > sizeof(value)) {
+			seq_puts(m, " unavailable\n");
+			continue;
+		}
+		ret = apple_smc_read(hwmon->smc, keys[i], value, info.size);
+		if (ret < 0)
+			seq_printf(m, " read error %d\n", ret);
+		else if (ret != info.size)
+			seq_printf(m, " short read %d\n", ret);
+		else
+			seq_printf(m, " %*phN\n", info.size, value);
+	}
+
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(macsmc_hwmon_status);
+
 static void macsmc_hwmon_debugfs_remove(void *data)
 {
 	debugfs_remove_recursive(data);
@@ -1345,6 +1387,7 @@ static void macsmc_hwmon_debugfs_init(struct macsmc_hwmon *hwmon)
 	if (IS_ERR(dir))
 		return;
 	debugfs_create_file("keys", 0400, dir, hwmon, &macsmc_hwmon_keys_fops);
+	debugfs_create_file("status", 0400, dir, hwmon, &macsmc_hwmon_status_fops);
 	devm_add_action_or_reset(hwmon->dev, macsmc_hwmon_debugfs_remove, dir);
 }
 
@@ -1506,8 +1549,7 @@ static int macsmc_hwmon_probe(struct platform_device *pdev)
 		return dev_err_probe(hwmon->dev, PTR_ERR(hwmon->hwmon_dev),
 				     "Probing SMC hwmon device failed\n");
 
-	if (macsmc_hwmon_is_m3())
-		macsmc_hwmon_debugfs_init(hwmon);
+	macsmc_hwmon_debugfs_init(hwmon);
 
 	ret = macsmc_hwmon_die_register(hwmon);
 	if (ret)
