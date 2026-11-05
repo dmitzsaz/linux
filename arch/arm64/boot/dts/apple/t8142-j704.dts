@@ -100,6 +100,16 @@
 	};
 };
 
+/*
+ * The 26.x ANS firmware ends the nvme block at 0x10000 (ADT ans reg[9]) and
+ * keeps the linear submission queues in the NVMMU block.
+ */
+&nvme {
+	reg = <0x4 0xc5cc0000 0x0 0x10000>,
+	      <0x4 0x81600000 0x0 0x4000>,
+	      <0x4 0x85cc0000 0x0 0x60000>;
+};
+
 /* The loader starts the kernel at EL2 with spin-table: no PSCI idle. */
 &cpuidle {
 	status = "okay";
