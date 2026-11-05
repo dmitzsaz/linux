@@ -184,8 +184,8 @@ struct apple_isp_hw {
 
 	/* doorbell block inside "mbox" instead of an "mbox2" window */
 	u32 mbox2_offset;
-	/* further interrupt enable and routing words (ISP17a) */
-	bool mbox_irq_route;
+	/* ISP17a interrupt routing register, 0 if absent */
+	u32 mbox_irq_route;
 	/* coprocessor control register, 0 for ISP_COPROC_CONTROL */
 	u32 coproc_control;
 
