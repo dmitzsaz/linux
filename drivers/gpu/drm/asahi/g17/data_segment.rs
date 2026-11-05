@@ -13,7 +13,7 @@
 //! loader keeps for the loaded firmware until reboot.
 
 use kernel::{
-    c_str, device,
+    device,
     io::{
         self,
         IoSysMap,
@@ -32,9 +32,14 @@ pub(super) struct DataSegmentLog {
 impl DataSegmentLog {
     /// Maps the `size` bytes at physical address `iova` that the firmware asked for, which
     /// must lie inside the `fw-data` region of `dev`.
-    pub(super) fn map(dev: &device::Device, iova: usize, size: usize) -> Result<Self> {
+    pub(super) fn map(
+        dev: &device::Device,
+        name: &kernel::str::CStr,
+        iova: usize,
+        size: usize,
+    ) -> Result<Self> {
         let node = dev.of_node().ok_or(EINVAL)?;
-        let res = node.reserved_mem_region_to_resource_byname(c_str!("fw-data"))?;
+        let res = node.reserved_mem_region_to_resource_byname(name)?;
         let offset = iova.checked_sub(res.start().try_into()?).ok_or(EINVAL)?;
         if offset.checked_add(size).ok_or(EINVAL)? > res.size().try_into()? {
             return Err(EINVAL);

@@ -115,6 +115,25 @@ impl KernelObject {
         })
     }
 
+    /// Removes every CPU cache line of the backing before the host writes contents through the
+    /// write-combined mapping for an agent that does not snoop the CPU caches. Lines the page
+    /// allocator zeroed through the cacheable linear map could otherwise be written back over
+    /// newer contents later. Maintenance by VA applies to the physical lines of every alias.
+    pub(crate) fn evict_cpu_caches(&mut self) {
+        crate::pgtable::clean_invalidate_poc(self.ptr.as_ptr(), self.size);
+        crate::pgtable::poc_barrier();
+    }
+
+    /// Installs the primary mapping of a [`Self::backing`] object at the fixed address `addr`,
+    /// which [`Self::gpu_va`] then reports.
+    pub(crate) fn map_primary_at(&mut self, vm: &mmu::Vm, addr: u64, prot: mmu::Prot) -> Result {
+        if self.mapping.is_some() {
+            return Err(EBUSY);
+        }
+        self.mapping = Some(self.obj.map_at(vm, addr, prot, false)?);
+        Ok(())
+    }
+
     /// Maps this object into another address space at `addr`, as an alias of the same memory.
     pub(crate) fn map_alias(
         &self,
