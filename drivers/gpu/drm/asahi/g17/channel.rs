@@ -200,6 +200,9 @@ impl Rings {
     /// The returned cursor is the value the consumer must reach to retire it.
     /// The caller announces the publication through the coprocessor mailbox.
     pub(crate) fn publish_control(init: &InitData, record: &ControlRecord) -> Result<u32> {
+        if !init.control_qualified(record.opcode()) {
+            return Err(EAGAIN);
+        }
         fence(Ordering::Acquire);
         let consumer = init.control_consumer()?.load(Ordering::Relaxed);
         let producer = init.control_producer()?.load(Ordering::Relaxed);

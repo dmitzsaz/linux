@@ -2164,6 +2164,7 @@ mod ta_mode_tests {
     fn selected(firmware: &Firmware) -> &'static Variant {
         match firmware {
             Firmware::Fixed(variant) => variant,
+            Firmware::Pair { variant, .. } => variant,
             Firmware::Identified(builds) => {
                 assert_eq!(builds.len(), 1);
                 builds[0].variant
