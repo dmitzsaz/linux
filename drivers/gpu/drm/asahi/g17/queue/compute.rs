@@ -1270,6 +1270,11 @@ impl Queue {
         Ok(())
     }
 
+    /// Fail clients without releasing any object still visible to the coprocessors.
+    pub(crate) fn fail_owned(&self, error: Error) {
+        for packet in self.replays.iter() { packet.completion.fail_while_owned(error); }
+        for active in self.active.iter() { active.packet.completion.fail_while_owned(error); }
+    }
     pub(crate) fn fail_replays(&mut self, error: Error) {
         if self.replay_error.is_none() {
             self.replay_error = Some(error);

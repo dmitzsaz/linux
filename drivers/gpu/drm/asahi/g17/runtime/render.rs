@@ -852,6 +852,18 @@ impl crate::g17::Firmware {
         self.queues.fail_render_vm(status, error, deferred)
     }
 
+    pub(in crate::g17) fn fail_render_owned(&self, error: Error) {
+        for pair in self
+            .queues
+            .render
+            .entries
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.pair.as_ref())
+        {
+            pair.fail_owned(error);
+        }
+    }
     pub(in crate::g17) fn stop_render(&mut self) {
         for entry in self.queues.render.entries.iter_mut().flatten() {
             if let Some(pair) = entry.pair.as_mut() {

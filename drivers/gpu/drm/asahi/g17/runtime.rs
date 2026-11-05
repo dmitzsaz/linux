@@ -2213,6 +2213,19 @@ impl super::Firmware {
     /// Both processors are stopped and their owner detached before this call.
     /// Error fences release their command mappings without the device mutex
     /// or an allocation-dependent collector.
+    fn retain_failed_session(self: KBox<Self>) {
+        self.fail_render_owned(EIO);
+        for queue in self
+            .queues
+            .compute
+            .iter()
+            .flatten()
+            .filter_map(|entry| entry.queue.as_deref())
+        {
+            queue.fail_owned(EIO);
+        }
+        super::hal300::retain(self);
+    }
     fn finish_stopped_queues(&mut self) {
         self.stop_render();
         for mut queue in self
@@ -2261,10 +2274,10 @@ impl super::Shared {
         {
             let mut state = self.state.lock();
             if let Some(firmware) = state.as_deref_mut() {
-                if let Some(secondary) = firmware.secondary.as_mut() {
-                    secondary.stop();
+                if !firmware.init.is_hal300() {
+                    if let Some(secondary) = firmware.secondary.as_mut() { secondary.stop(); }
+                    firmware.primary.stop();
                 }
-                firmware.primary.stop();
             }
         }
         if self.preparations.wait_drained_until(now_ns().saturating_add(WORK_RING_WAIT_NS)).is_err() {
@@ -2273,7 +2286,10 @@ impl super::Shared {
         }
         self.forget_port();
         let firmware = self.state.lock().take();
-        if let Some(mut firmware) = firmware { firmware.finish_stopped_queues(); }
+        if let Some(mut firmware) = firmware {
+            if firmware.init.is_hal300() { firmware.retain_failed_session(); }
+            else { firmware.finish_stopped_queues(); }
+        }
     }
 
     /// Joins construction and complete host teardown, including RTKit drops.
@@ -2289,14 +2305,15 @@ impl super::Shared {
         let firmware = {
             let mut state = self.state.lock();
             if let Some(firmware) = (*state).as_deref_mut() {
-                if let Some(secondary) = firmware.secondary.as_mut() {
-                    secondary.stop();
+                if !firmware.init.is_hal300() {
+                    if let Some(secondary) = firmware.secondary.as_mut() { secondary.stop(); }
+                    firmware.primary.stop();
                 }
-                firmware.primary.stop();
             }
             state.take()
         };
         if let Some(mut firmware) = firmware {
+            if firmware.init.is_hal300() { firmware.retain_failed_session(); return; }
             firmware.finish_stopped_queues();
             // RTKit destruction still dereferences the mailbox provider.
             drop(firmware);

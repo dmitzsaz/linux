@@ -2015,6 +2015,15 @@ impl Pair {
         Ok(true)
     }
 
+    /// Fence failure is independent of the firmware's ownership of these mappings.
+    pub(crate) fn fail_owned(&self, error: Error) {
+        if let Some(prepared) = &self.prepared {
+            prepared.packet.completion.fail_while_owned(error);
+        }
+        for active in self.active.iter() { active.packet.completion.fail_while_owned(error); }
+        for packet in self.replay.iter() { packet.completion.fail_while_owned(error); }
+    }
+
     /// Both processors have stopped before the caller reaches this method.
     /// VM ownership settles before quarantined admission is rehabilitated.
     pub(crate) fn stopped(&mut self, defer: &mut impl FnMut(Deferred) -> Result) -> Result {
