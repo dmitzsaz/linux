@@ -110,6 +110,9 @@ pub(crate) const OBJECTS: [ObjectSpec; 17] = [
     },
 ];
 
+pub(crate) const ARENA_UNK_50: u32 = 0x50;
+pub(crate) const ARENA_POOL_SLOT: u32 = 3;
+
 pub(crate) const PB_DESCRIPTORS: u64 = 0xfffffc2001838000;
 pub(crate) const PB_LOW: u64 = 0x7001838000;
 pub(crate) const STAMPS: [u64; 2] = [0xfffffc200183c000, 0xfffffc2001840000];
