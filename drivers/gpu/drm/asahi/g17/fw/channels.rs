@@ -31,13 +31,21 @@ pub(crate) const STATISTICS_SLOTS: u32 = 256;
 /// Words in an event, trace or statistics entry.
 pub(crate) const EVENT_WORDS: usize = 18;
 /// Byte stride of an event, trace or statistics entry.
+/// HAL300 keeps this 0x48-byte slot, including statistics type 32.
 pub(crate) const EVENT_RECORD_SIZE: usize = EVENT_WORDS * size_of::<u32>();
 /// Producer offset within a firmware-produced ring's state block.
 pub(crate) const RX_PRODUCER_OFFSET: usize = 0x20;
 /// Trace records use type 5.
 pub(crate) const TRACE_TYPES: u32 = 1 << 5;
 /// Statistics record types accepted by the host.
-pub(crate) const STATISTICS_TYPES: u32 = 0x5fff_0000;
+pub(crate) const STATISTICS_TYPES: u64 = 0x5fff_0000;
+/// HAL300 adds type 32, with packed u64 values at +4 and +0xc. Their units
+/// are unknown, so retain the complete slot only as a raw report.
+pub(crate) const HAL300_STATISTICS_TYPES: u64 = STATISTICS_TYPES | (1 << 32);
+/// Number of tag-indexed raw samples per coprocessor.
+pub(crate) const STATISTICS_TAGS: usize = 33;
+
+static_assert!(EVENT_RECORD_SIZE == 0x48);
 
 /// Completion stamp indices signalled by the firmware.
 #[repr(C, packed)]
