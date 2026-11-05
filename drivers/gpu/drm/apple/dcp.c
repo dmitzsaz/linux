@@ -1825,7 +1825,8 @@ static int dcp_dptx_connect_raw(struct apple_dcp *dcp, u32 port, bool *retryable
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp) && !late_hpd) {
+	if ((dcp_is_typec_output(dcp) || dcp->fw_compat == DCP_FIRMWARE_V_27_0) &&
+	    !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
@@ -2479,6 +2480,18 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 		return ret;
 	}
 	guard(mutex)(&dcp->external_lock);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_is_typec_output(dcp) &&
+	    !READ_ONCE(dcp->dptxport[0].connected)) {
+		dcp->external_generation++;
+		dcp->external_cable = true;
+		WRITE_ONCE(dcp->external_physically_absent, false);
+		dcp_external_publish_generation(dcp);
+		scoped_guard(mutex, &dcp->hpd_mutex) {
+			dcp->typec_generation++;
+			dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+			dcp_announce_end(&dcp->announce);
+		}
+	}
 	return dcp_external_link_locked(dcp);
 }
 
@@ -2648,6 +2661,9 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		}
 		return true;
 	}
+	if (!connected && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->active_typec_route))
+		return false;
 	if (!connected && !READ_ONCE(dcp->iomfb.presentation_paused)) {
 		/* Fence admission in RX before a busy actor can delay teardown. */
 		dcp_firmware_metadata_hotplug(dcp, false);

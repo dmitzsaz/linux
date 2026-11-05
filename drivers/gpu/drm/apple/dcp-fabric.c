@@ -230,6 +230,8 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 {
 	struct apple_dcp *dcp = route->dcp;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp->fixed_phy)
+		return !READ_ONCE(dcp->fixed_sink_known) || READ_ONCE(dcp->fixed_sink_present);
 	if (dcp->fixed_connector_type == DRM_MODE_CONNECTOR_USB)
 		return false;
 	/* Its HDMI display gave the pipeline to a Type-C display. */
@@ -858,6 +860,12 @@ static enum dcp_fabric_presence_state dcp_hdmi_presence(struct apple_dcp *dcp)
 	enum dcp_fabric_presence_state state;
 	unsigned long flags;
 
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		if (!READ_ONCE(dcp->fixed_sink_known))
+			return DCP_FABRIC_SETTLING;
+		return READ_ONCE(dcp->fixed_sink_present) ?
+			DCP_FABRIC_PRESENT : DCP_FABRIC_ABSENT;
+	}
 	/* A yielded hybrid is free for Type-C, whatever HDMI shows. */
 	if (!dcp_hdmi_settle_enabled(dcp) || READ_ONCE(dcp->hdmi_yielded))
 		return DCP_FABRIC_ABSENT;
@@ -1100,6 +1108,12 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	/* Oneshot unmask precedes thread completion. Never wait under fabric. */
 	synchronize_irq(dcp->hdmi_hpd_irq);
 	guard(mutex)(&dcp_typec_fabric_lock);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		if (!READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->active_typec_route) &&
+		    READ_ONCE(dcp->fixed_sink_known) && !READ_ONCE(dcp->fixed_sink_present))
+			dcp_typec_pipeline_freed();
+		return;
+	}
 	if (!dcp_hdmi_settle_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
@@ -1121,6 +1135,18 @@ static void dcp_hdmi_recheck_work(struct work_struct *work)
 	dcp_hdmi_update_locked(dcp);
 	/* Catch a level change during this update's firmware/debounce waits. */
 	mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
+}
+
+/* Called on the serialized IOMFB receiver; fabric work rechecks current ownership. */
+void dcp_fixed_sink_hotplug(struct apple_dcp *dcp, bool connected)
+{
+	if (READ_ONCE(dcp->active_typec_route) || !dcp->fixed_phy ||
+	    READ_ONCE(dcp->quiescing))
+		return;
+	WRITE_ONCE(dcp->fixed_sink_present, connected);
+	WRITE_ONCE(dcp->fixed_sink_known, true);
+	if (READ_ONCE(dcp->typec_work_enabled))
+		mod_delayed_work(system_freezable_wq, &dcp->hdmi_recheck_wq, 0);
 }
 
 static void dcp_hybrid_work(struct work_struct *work);
@@ -1723,6 +1749,8 @@ static void dcp_typec_route_commit(struct typec_mux_dev *mux,
 	guard(mutex)(&dcp_typec_fabric_lock);
 	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending)
 		return;
+	struct apple_dcp *released = port->owner ? port->owner->dcp : NULL;
+
 	if (port->owner)
 		port->preferred_route = port->owner;
 	port->owner = NULL;
@@ -1733,6 +1761,9 @@ static void dcp_typec_route_commit(struct typec_mux_dev *mux,
 	port->applied_status = 0;
 	port->applied_conf = 0;
 	port->applied_valid = true;
+	if (released && released->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    released->fixed_route_selected && released->fixed_phy && released->active)
+		dcp_dptx_connect(released, 0);
 	dcp_typec_pipeline_freed();
 }
 
