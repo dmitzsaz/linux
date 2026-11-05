@@ -364,6 +364,20 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
+
+			/*
+			 * PMP soc-device 32, ATC2: PMGR flags ATC2_COMMON as
+			 * notify-PMP. The PHY of a DisplayPort-only ATC2 is not
+			 * usable until the PMP has acknowledged it.
+			 */
+			pmp_report_atc2: report@1a {
+				compatible = "apple,t8142-pmp-v2-report-entry",
+					     "apple,t8140-pmp-v2-report-entry";
+				reg = <26>;
+				label = "pmp-atc2";
+				#power-domain-cells = <0>;
+				power-domains = <&ps_atc2_usb>;
+			};
 		};
 
 		pmgr: power-management@380700000 {
