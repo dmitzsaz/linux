@@ -623,7 +623,9 @@ bool iomfb_v27_callback_size_valid(unsigned int tag, u32 input, u32 output)
 
 static void client_opened_v27(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	if (!out || get_unaligned_le32(out)) {
+	/* A466 has no output; only a missing ACK indicates failure. */
+	if (!out) {
+		dev_err(dcp->dev, "firmware-27 first client open failed\n");
 		WRITE_ONCE(dcp->crashed, true);
 		complete(&dcp->start_done);
 		return;
@@ -633,7 +635,9 @@ static void client_opened_v27(struct apple_dcp *dcp, void *out, void *cookie)
 
 static void started_v27(struct apple_dcp *dcp, void *out, void *cookie)
 {
-	if (!out || get_unaligned_le32(out)) {
+	/* A401 returns a boolean, with untouched padding in its u32 slot. */
+	if (!out || *(u8 *)out != 1) {
+		dev_err(dcp->dev, "firmware-27 start signal failed\n");
 		WRITE_ONCE(dcp->crashed, true);
 		complete(&dcp->start_done);
 		return;
