@@ -204,6 +204,8 @@ struct apple_isp_hw {
 
 	/* metadata buffers carry the frame's exposure report (H17 firmware) */
 	bool meta_exposure;
+	/* report the analogue gain at +4 instead of the total gain at +6 */
+	bool meta_analog_gain;
 
 	/*
 	 * The firmware can be started only once per system boot, so it is
