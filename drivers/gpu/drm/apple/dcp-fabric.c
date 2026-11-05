@@ -1143,6 +1143,9 @@ void dcp_fixed_sink_hotplug(struct apple_dcp *dcp, bool connected)
 	if (READ_ONCE(dcp->active_typec_route) || !dcp->fixed_phy ||
 	    READ_ONCE(dcp->quiescing))
 		return;
+	if (!connected && (!READ_ONCE(dcp->fixed_sink_known) ||
+			   READ_ONCE(dcp->fixed_sink_present)))
+		dcp_modes_begin_attachment(dcp);
 	WRITE_ONCE(dcp->fixed_sink_present, connected);
 	WRITE_ONCE(dcp->fixed_sink_known, true);
 	if (READ_ONCE(dcp->typec_work_enabled))
