@@ -172,7 +172,7 @@ fn aop_counter_ticks(counter: u64, frequency: u64) -> Result<u64> {
         .ok_or(EOVERFLOW)
 }
 
-fn aop_timestamp() -> Result<u64> {
+pub(crate) fn aop_timestamp() -> Result<u64> {
     // SAFETY: both helpers read the architected timer through the arch timer
     // layer and take no arguments.
     let (counter, rate) = unsafe { (bindings::arch_timer_counter(), bindings::arch_timer_rate()) };
