@@ -1129,3 +1129,5 @@
 
 #include "t8142-pmgr.dtsi"
 #include "t8142-usb4.dtsi"
+
+#include "t8142-display.dtsi"
