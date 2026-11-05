@@ -27,6 +27,9 @@ use crate::g17::now_ns;
 /// Descriptor slots per queue. A kick's descriptor is rewritten when the kick 32 slots later
 /// is published; with IN_FLIGHT kicks outstanding at most, that kick has completed by then.
 const DESCRIPTORS: usize = 32;
+const USAGE_RECORD: usize = 0x40;
+const TIMESTAMPS: usize = 0x8000;
+const TIMESTAMP_STRIDE: usize = 0x10;
 const GRAPH_SIZE: usize = 0x8000;
 const CONTEXT_SIZE: usize = 0x20000;
 const RECORD_STRIDE: usize = 0x1000;
@@ -237,7 +240,7 @@ impl Graph {
             return Err(EFAULT);
         }
         let vm = context.vm();
-        vm.install_job_context_aliases()?;
+        if self.program != ComputeProgram::G17G { vm.install_job_context_aliases()?; }
         let descriptors = self.descriptor_alias(vm)?;
         let prot = mmu::PROT_GPU_FW_SHARED_RW;
         let page = mmu::UAT_PGSZ as u64;
@@ -1039,6 +1042,15 @@ impl Queue {
                     })
                 {
                     return Err(EIO);
+                }
+                if self.graph.program == ComputeProgram::G17G {
+                    if let Some(fallback) = timestamps {
+                        let at = TIMESTAMPS + ticket.kick as usize % DESCRIPTORS * TIMESTAMP_STRIDE;
+                        let start = self.graph.support.dword(at)?.load(Ordering::Acquire);
+                        let end = self.graph.support.dword(at + 8)?.load(Ordering::Acquire);
+                        if start != 0 && end >= start { return Ok(Some([start, end])); }
+                        return Ok(Some(fallback));
+                    }
                 }
                 Ok(timestamps)
             })();
@@ -2211,6 +2223,18 @@ impl Queue {
         let work_node = work.node_va()?;
         let timestamp_va = packet.completion.compute_timestamp_va()?;
         let kick_timestamp = self.kick.timestamp();
+        let (raw_timestamp_va, usage_offset) = if self.graph.program == ComputeProgram::G17G {
+            let offset = TIMESTAMPS + kick_timestamp.slot() % DESCRIPTORS * TIMESTAMP_STRIDE;
+            self.graph.support.dword(offset)?.store(0, Ordering::Relaxed);
+            self.graph.support.dword(offset + 8)?.store(0, Ordering::Relaxed);
+            let usage = kick_timestamp.slot() % DESCRIPTORS * USAGE_RECORD;
+            for word in (0..USAGE_RECORD).step_by(8) {
+                self.graph.usage.dword(usage + word)?.store(0, Ordering::Relaxed);
+            }
+            fence(Ordering::SeqCst);
+            (Some([self.graph.support.gpu_va() + offset as u64,
+                self.graph.support.gpu_va() + offset as u64 + 8]), usage as u64)
+        } else { (None, 0) };
         let kick_parent = self.kick.parent();
         let qid = self.qid();
         let ordinal = self.ordinal.checked_add(1).ok_or(EOVERFLOW)?;
@@ -2261,8 +2285,8 @@ impl Queue {
             preempt_va: addresses.preempt,
             operand_state_va: addresses.operand,
             operand: self.graph.operand_state,
-            usage_va: addresses.usage,
-            usage_fw_va: self.graph.usage.gpu_va(),
+            usage_va: addresses.usage + usage_offset,
+            usage_fw_va: self.graph.usage.gpu_va() + usage_offset,
             free_list_slot: u32::from(self.pool.id()),
             free_list_control_va: self.pool.control_va(),
             stamp_va: self.graph.support.gpu_va() + STAMP as u64,
@@ -2272,7 +2296,7 @@ impl Queue {
                 self.graph.support.gpu_va() + 0x318,
             ],
             timestamp_va,
-            raw_timestamp_va: None,
+            raw_timestamp_va,
         };
         let identity = ConfigIdentity {
             scheduler: packet.context.scheduler_va(),
