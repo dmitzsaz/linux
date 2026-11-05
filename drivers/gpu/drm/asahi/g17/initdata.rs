@@ -479,6 +479,9 @@ impl InitData {
     }
 
     pub(super) fn compute_vm_cached(&self, vm: &mmu::Vm) -> bool {
+        if let Some(graph) = self.hal300.as_ref() {
+            return vm.compute_pool_mappings_match(graph.client_id);
+        }
         self.compute_shared
             .as_ref()
             .is_some_and(|shared| vm.compute_pool_mappings_match(shared.id))
