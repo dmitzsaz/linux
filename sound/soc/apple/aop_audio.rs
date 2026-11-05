@@ -804,12 +804,16 @@ unsafe extern "C" fn aop_hw_params(
     unsafe { dmaengine_slave_config(chan, &mut slave_config) }
 }
 
-unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
-    let data = unsafe { Arc::<SndSocAopData>::borrow((*substream).private_data.cast()) };
-    if let Err(e) = data.set_audio_power(POWER_STATE_IDLE, 0) {
-        dev_err!(data.dev, "Unable to enter 'pw1 ' state");
-        return e.to_errno();
-    }
+/// Requests the microphone array's DMA channel and opens the substream on it: 48 kHz, three
+/// float32 channels.
+///
+/// # Safety
+///
+/// Called from a PCM open op with a live substream whose private data is the driver's `Arc`.
+unsafe fn pcm_open_dma(
+    data: &SndSocAopData,
+    substream: *mut bindings::snd_pcm_substream,
+) -> i32 {
     let mut hwparams = bindings::snd_pcm_hardware {
         info: bindings::SNDRV_PCM_INFO_MMAP
             | bindings::SNDRV_PCM_INFO_MMAP_VALID
@@ -878,6 +882,19 @@ unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -
         return ret;
     }
     channel.dismiss();
+    0
+}
+
+unsafe extern "C" fn aop_pcm_open(substream: *mut bindings::snd_pcm_substream) -> i32 {
+    let data = unsafe { Arc::<SndSocAopData>::borrow((*substream).private_data.cast()) };
+    if let Err(e) = data.set_audio_power(POWER_STATE_IDLE, 0) {
+        dev_err!(data.dev, "Unable to enter 'pw1 ' state");
+        return e.to_errno();
+    }
+    let ret = unsafe { pcm_open_dma(&data, substream) };
+    if ret < 0 {
+        return ret;
+    }
     if let Err(e) = data.set_audio_power(POWER_STATE_ON, 1) {
         dev_err!(data.dev, "Unable to power mic on");
         // The ALSA core will not call close after a failed open. Unwind the
@@ -936,7 +953,8 @@ impl SndSocAopDriver {
         mmap: None,
         ack: None,
     };
-    fn new(data: Arc<SndSocAopData>) -> Result<Self> {
+    /// The microphone card, its PCM driven by `ops`.
+    fn new(data: Arc<SndSocAopData>, ops: &'static bindings::snd_pcm_ops) -> Result<Self> {
         let mut this = SndSocAopDriver {
             card: ptr::null_mut(),
             mic: aop_lid::MicLid::new()?,
@@ -995,11 +1013,7 @@ impl SndSocAopDriver {
         }
 
         unsafe {
-            bindings::snd_pcm_set_ops(
-                pcm,
-                bindings::SNDRV_PCM_STREAM_CAPTURE as i32,
-                &Self::VTABLE,
-            );
+            bindings::snd_pcm_set_ops(pcm, bindings::SNDRV_PCM_STREAM_CAPTURE as i32, ops);
         }
 
         unsafe {
@@ -1125,11 +1139,12 @@ impl platform::Driver for AopAudio {
     }
 }
 
-impl SndSocAopDriver {
+impl SndSocAopData {
+    /// The audio service device's data: its AOP, its EPIC service and the parent's `audio` node.
     fn probe(
         pdev: &platform::Device<Core<'_>>,
         info: &'static SndSocAopHwConfig,
-    ) -> Result<Self> {
+    ) -> Result<Arc<Self>> {
         let dev = ARef::<device::Device>::from(pdev.as_ref());
         let parent = pdev.as_ref().parent().ok_or(ENODEV)?;
         // SAFETY: this is a service device the AOP core registered, being
@@ -1152,7 +1167,16 @@ impl SndSocAopDriver {
         if !audio && parent_fwnode.property_present(c_str!("apple,no-beamforming")) {
             return Err(ENODEV);
         }
-        let data = SndSocAopData::new(dev, adata, svc, fwnode, info)?;
+        SndSocAopData::new(dev, adata, svc, fwnode, info)
+    }
+}
+
+impl SndSocAopDriver {
+    fn probe(
+        pdev: &platform::Device<Core<'_>>,
+        info: &'static SndSocAopHwConfig,
+    ) -> Result<Self> {
+        let data = SndSocAopData::probe(pdev, info)?;
         for dev in [AUDIO_DEV_PDM0, AUDIO_DEV_HPAI, AUDIO_DEV_LPAI] {
             data.audio_attach_device(dev)?;
         }
@@ -1172,7 +1196,7 @@ impl SndSocAopDriver {
             if data.set_decimator_config_hf().is_err() {
                 dev_warn!(data.dev, "decimator config refused, continuing\n");
             }
-            let mut this = Self::new(data.clone())?;
+            let mut this = Self::new(data.clone(), &Self::VTABLE)?;
             // The speaker and jack streams, where the node has their DMA
             // channels: a machine may have the jack before its speakers.
             let listed = |name: &CStr| {
@@ -1192,7 +1216,7 @@ impl SndSocAopDriver {
         } else {
             data.set_decimator_config()?;
         }
-        Ok(Self::new(data)?)
+        Ok(Self::new(data, &Self::VTABLE)?)
     }
 }
 
