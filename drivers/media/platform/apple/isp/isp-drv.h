@@ -54,6 +54,7 @@ enum isp_generation {
 	ISP_GEN_T6031,
 	ISP_GEN_T8140,
 	ISP_GEN_T6040,
+	ISP_GEN_T8142,
 };
 
 /*

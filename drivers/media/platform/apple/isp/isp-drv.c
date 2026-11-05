@@ -204,7 +204,7 @@ static int apple_isp_init_iommu(struct apple_isp *isp)
 	 * the heap top, is the host's to back.
 	 */
 	err = -ENOENT;
-	if (isp->hw->gen == ISP_GEN_T6040)
+	if (isp->hw->gen == ISP_GEN_T6040 || isp->hw->gen == ISP_GEN_T8142)
 		err = isp_of_region_iova(dev, "data", &data_base, &data_size);
 	if (!err) {
 		isp->fw.data_top = data_base + data_size;
@@ -908,7 +908,7 @@ static const struct isp_mmio_window apple_isp_fw_mmio_t8142[] = {
 };
 
 static const struct apple_isp_hw apple_isp_hw_t8142 = {
-	.gen = ISP_GEN_T8140,
+	.gen = ISP_GEN_T8142,
 	.fw_abi = ISP_FW_ABI_H17,
 	.pmu_base = 0x0,
 
