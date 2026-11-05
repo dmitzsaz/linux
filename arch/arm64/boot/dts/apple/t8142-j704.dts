@@ -112,9 +112,21 @@
 	gpio-reserved-ranges = <78 1>, <136 2>, <163 1>, <203 1>;
 };
 
+&smc_gpio {
+	/* ADT pKW4(gPxx, template) platform functions */
+	apple,function-templates =
+		<0x0f 0x800000>,	/* dp2hdmi-gpio0 hdmi_pwr_en */
+		<0x10 0x10000>,		/* dp2hdmi-gpio0 reset */
+		<0x13 0x800000>,	/* amfm reg_on (Wi-Fi/Bluetooth) */
+		<0x19 0x0>,		/* pcie-sdreader sd_pwr_en */
+		<0x1a 0x0>,		/* dp2hdmi-gpio0 dp2hdmi_pwr_en */
+		<0x1c 0x10000>,		/* multi-touch afe-reset */
+		<0x1d 0x10000>;		/* stm stm-reset */
+};
+
 &mtp_hid {
 	/* ADT dockchannel-mtp/mtp-transport/multi-touch function-afe-reset */
-	apple,afe-reset-gpios = <&smc_gpio 28 GPIO_ACTIVE_LOW>;
+	apple,afe-reset-gpios = <&smc_gpio 0x1c GPIO_ACTIVE_HIGH>;
 
 	stm { };
 
