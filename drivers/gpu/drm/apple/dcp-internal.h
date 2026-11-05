@@ -644,6 +644,7 @@ struct apple_dcp {
 	struct work_struct dimensions_wq;
 	bool modes_admitted;
 	bool modes_provisional;
+	bool full_catalog_v27; /* modes_lock, current attachment only */
 
 	/* Attributes of the connector */
 	int connector_type;

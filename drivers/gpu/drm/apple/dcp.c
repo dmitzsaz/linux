@@ -623,7 +623,9 @@ static void dcp_firmware_metadata_present_locked(struct apple_dcp *dcp)
 	 * Fresh proof may precede HPD assertion after a same-cable loss.
 	 * Keep invalidated firmware metadata and old receipt tickets revoked.
 	 */
-	if (READ_ONCE(dcp->typec_cable_connected) &&
+	if ((READ_ONCE(dcp->typec_cable_connected) ||
+	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	      !READ_ONCE(dcp->active_typec_route) && READ_ONCE(dcp->external_cable))) &&
 	    dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation))
 		dcp->metadata.epoch.connected = true;
 }
@@ -2482,6 +2484,7 @@ int dcp_dptx_connect(struct apple_dcp *dcp, u32 port)
 	guard(mutex)(&dcp->external_lock);
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && !dcp_is_typec_output(dcp) &&
 	    !READ_ONCE(dcp->dptxport[0].connected)) {
+		dcp_modes_begin_attachment(dcp);
 		dcp->external_generation++;
 		dcp->external_cable = true;
 		WRITE_ONCE(dcp->external_physically_absent, false);
@@ -2640,6 +2643,10 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 	lockdep_assert_held(&dcp->iomfb.lock);
 	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
 		return true;
+	/* The fixed converter stays connected when its downstream sink leaves. */
+	if (!connected && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->active_typec_route))
+		return false;
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
@@ -2661,9 +2668,6 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		}
 		return true;
 	}
-	if (!connected && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    !READ_ONCE(dcp->active_typec_route))
-		return false;
 	if (!connected && !READ_ONCE(dcp->iomfb.presentation_paused)) {
 		/* Fence admission in RX before a busy actor can delay teardown. */
 		dcp_firmware_metadata_hotplug(dcp, false);

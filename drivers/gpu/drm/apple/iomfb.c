@@ -1803,12 +1803,14 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	/* H17P external catalogs are fenced by their connection receipt. */
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return;
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
 	dcp->modes_provisional = false;
+	dcp->full_catalog_v27 = false;
 }
 
 bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
@@ -1817,7 +1819,9 @@ bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *ro
 	if (READ_ONCE(dcp->active_typec_route) != route)
 		return false;
 	/* H17P external catalogs are fenced by their connection receipt. */
-	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		dcp->full_catalog_v27 = false;
 		dcp->modes_generation++;
 		dcp->modes_admitted = false;
 		dcp->modes_provisional = false;
@@ -1908,7 +1912,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			return -ESTALE;
 	}
 
-	if (h17p_external && dcp->chunks.payload_complete &&
+	if (h17p_external && dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	    dcp->chunks.payload_complete &&
 	    dcp->chunks.mode_ticket.associated) {
 		ctx->automatic_1080p180_rgb8 = true;
 		rate_ticket = dcp->chunks.mode_ticket;
@@ -2141,7 +2146,8 @@ int dcp_get_modes(struct drm_connector *connector)
 	modes = dcp_modes_snapshot(dcp, apple_connector, &nr_modes);
 
 	physical_edid = dcp->hw.iomfb_method_profile ==
-		DCP_IOMFB_METHODS_H17P_EXTERNAL;
+		DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+		dcp->fw_compat != DCP_FIRMWARE_V_27_0;
 	/* get_modes holds mode_config.mutex; HPD paths never acquire it. */
 	if (physical_edid) {
 		mutex_lock(&dcp->hpd_mutex);

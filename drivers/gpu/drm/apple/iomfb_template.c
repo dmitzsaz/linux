@@ -1414,7 +1414,10 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 			dcp->chunks.mode_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
 			dcp->chunks.mode_ticket.associated =
 				dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
-				READ_ONCE(dcp->typec_cable_connected);
+				(READ_ONCE(dcp->typec_cable_connected) ||
+				 (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+				  !READ_ONCE(dcp->active_typec_route) &&
+				  READ_ONCE(dcp->external_cable)));
 			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 		}
 		mutex_unlock(&dcp->dcpavserv.lock);
@@ -1501,7 +1504,16 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	/* parse() resets the context: set the tracing pointer afterwards. */
 	ctx.dcp = dcp;
 
-	if (!strcmp(req->key, "TimingElements")) {
+	bool full_catalog = !strcmp(req->key, "TimingElements");
+	bool preferred_catalog = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		!strcmp(req->key, "PreferredTimingElements");
+
+	if (preferred_catalog) {
+		guard(mutex)(&dcp->modes_lock);
+		if (dcp->full_catalog_v27)
+			return true;
+	}
+	if (full_catalog || preferred_catalog) {
 		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
@@ -1513,8 +1525,13 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			dcp_firmware_metadata_timing(dcp);
 			return false;
 		}
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && full_catalog) {
+			guard(mutex)(&dcp->modes_lock);
+			if (dcp->chunks.modes_generation == dcp->modes_generation && dcp->nr_modes)
+				dcp->full_catalog_v27 = true;
+		}
 		if (!READ_ONCE(dcp->nr_modes))
-			dev_warn(dcp->dev, "TimingElements without valid modes!\n");
+			dev_warn(dcp->dev, "Timing catalog without valid modes!\n");
 		dcp_180hz_notify(dcp);
 		dcp_firmware_metadata_timing(dcp);
 	} else if (!strcmp(req->key, "DisplayAttributes")) {

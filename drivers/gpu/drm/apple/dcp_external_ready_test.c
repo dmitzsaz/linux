@@ -412,8 +412,55 @@ static void ready_other_link_test(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, ready_probe_lists_180(test, t));
 }
 
+static void sdk27_catalogue_ready_test(struct kunit *test)
+{
+	struct ready_test *t = ready_init(test);
+	struct apple_dcp *dcp = t->dcp;
+
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	ready_catalogue(t, 1);
+	KUNIT_EXPECT_FALSE(test, ready(t));
+	ready_announce(t);
+	/* Firmware metadata is sufficient; no unqualified EDID RPC is required. */
+	KUNIT_EXPECT_FALSE(test, dcp->dcpavserv.enabled);
+	KUNIT_EXPECT_TRUE(test, ready(t));
+
+	/* A route change revokes this attachment's catalogue. */
+	dcp->typec_generation++;
+	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+	ready_announce(t);
+	KUNIT_EXPECT_FALSE(test, ready(t));
+	ready_catalogue(t, 1);
+	KUNIT_EXPECT_TRUE(test, ready(t));
+}
+
+static void sdk27_fixed_sink_ready_test(struct kunit *test)
+{
+	struct ready_test *t = ready_init(test);
+	struct apple_dcp *dcp = t->dcp;
+
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->active_typec_route = NULL;
+	dcp->external_cable = true;
+	ready_catalogue(t, 1);
+	dcp->typec_cable_connected = false;
+	ready_announce(t);
+	KUNIT_EXPECT_TRUE(test, ready(t));
+	dcp_firmware_metadata_hotplug(dcp, false);
+	KUNIT_EXPECT_FALSE(test, ready(t));
+	/* A new D575 may revive the fixed sink, but it needs a fresh catalogue. */
+	ready_announce(t);
+	KUNIT_EXPECT_FALSE(test, ready(t));
+	dcp->typec_cable_connected = true;
+	ready_catalogue(t, 1);
+	dcp->typec_cable_connected = false;
+	KUNIT_EXPECT_TRUE(test, ready(t));
+}
+
 static struct kunit_case ready_cases[] = {
 	KUNIT_CASE(ready_complete_test),
+	KUNIT_CASE(sdk27_catalogue_ready_test),
+	KUNIT_CASE(sdk27_fixed_sink_ready_test),
 	KUNIT_CASE(ready_any_order_test),
 	KUNIT_CASE(ready_retained_catalogue_test),
 	KUNIT_CASE(ready_generation_advance_test),
