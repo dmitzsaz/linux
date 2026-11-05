@@ -111,6 +111,14 @@ struct macsmc_gpio {
 	struct mutex j713_reg_on_lock;
 	bool j713_reg_on_known;
 	bool j713_reg_on_level;
+
+	/* Lines set through a key-write function (apple,function-templates). */
+	DECLARE_BITMAP(fn_lines, MAX_GPIO);
+	/* Orders a function write with its cached level, which is all .get sees. */
+	struct mutex fn_lock;
+	DECLARE_BITMAP(fn_known, MAX_GPIO);
+	DECLARE_BITMAP(fn_level, MAX_GPIO);
+	u32 fn_template[MAX_GPIO];
 };
 
 static bool macsmc_gpio_is_j700_pcio(struct macsmc_gpio *smcgp,
@@ -199,7 +207,8 @@ static int macsmc_gpio_get_direction(struct gpio_chip *gc, unsigned int offset)
 	int ret;
 
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset) ||
-	    macsmc_gpio_is_j713_reg_on(smcgp, offset))
+	    macsmc_gpio_is_j713_reg_on(smcgp, offset) ||
+	    test_bit(offset, smcgp->fn_lines))
 		return GPIO_LINE_DIRECTION_OUT;
 
 	/* First try reading the explicit pin mode register */
@@ -233,6 +242,14 @@ static int macsmc_gpio_get(struct gpio_chip *gc, unsigned int offset)
 	/* pcIO cannot be read back; report the last level written. */
 	if (macsmc_gpio_is_j700_pcio(smcgp, offset))
 		return test_bit(offset, smcgp->j700_pcio_level);
+
+	/* Neither can a function line, until it has been set. */
+	if (test_bit(offset, smcgp->fn_lines)) {
+		guard(mutex)(&smcgp->fn_lock);
+		if (!test_bit(offset, smcgp->fn_known))
+			return -EOPNOTSUPP;
+		return test_bit(offset, smcgp->fn_level);
+	}
 
 	ret = macsmc_gpio_get_direction(gc, offset);
 	if (ret < 0)
@@ -295,6 +312,20 @@ static int macsmc_gpio_set(struct gpio_chip *gc, unsigned int offset, int value)
 		return 0;
 	}
 
+	if (test_bit(offset, smcgp->fn_lines)) {
+		guard(mutex)(&smcgp->fn_lock);
+		ret = apple_smc_write_u32(smcgp->smc, key,
+					  smcgp->fn_template[offset] | !!value);
+		if (ret < 0) {
+			dev_err_ratelimited(smcgp->dev, "%p4ch set to %u failed: %d\n",
+					    &key, !!value, ret);
+			return ret;
+		}
+		assign_bit(offset, smcgp->fn_level, value);
+		set_bit(offset, smcgp->fn_known);
+		return 0;
+	}
+
 	value |= CMD_OUTPUT;
 	ret = apple_smc_write_u32(smcgp->smc, key, CMD_OUTPUT | value);
 	if (ret < 0)
@@ -342,6 +373,38 @@ static int macsmc_gpio_init_valid_mask(struct gpio_chip *gc,
 	return 0;
 }
 
+/*
+ * Some lines are not driven with the GPIO commands but through a platform
+ * function that writes a fixed template with the level in its low bits, as
+ * the Apple device tree describes them: pKW4(gPxx, template).
+ */
+static int macsmc_gpio_parse_templates(struct macsmc_gpio *smcgp)
+{
+	struct device_node *np = smcgp->dev->of_node;
+	const char *prop = "apple,function-templates";
+	u32 line, template;
+	int i, count;
+
+	count = of_property_count_u32_elems(np, prop);
+	if (count == -EINVAL)
+		return 0;
+	if (count < 0 || count % 2)
+		return dev_err_probe(smcgp->dev, -EINVAL, "invalid %s\n", prop);
+
+	for (i = 0; i < count; i += 2) {
+		of_property_read_u32_index(np, prop, i, &line);
+		of_property_read_u32_index(np, prop, i + 1, &template);
+		if (line >= MAX_GPIO || template & 1)
+			return dev_err_probe(smcgp->dev, -EINVAL,
+					     "invalid %s entry <%#x %#x>\n",
+					     prop, line, template);
+		set_bit(line, smcgp->fn_lines);
+		smcgp->fn_template[line] = template;
+	}
+
+	return 0;
+}
+
 struct macsmc_gpio_of_match_data {
 	smc_key base_key;
 };
@@ -365,6 +428,11 @@ static int macsmc_gpio_probe(struct platform_device *pdev)
 				device_is_compatible(&pdev->dev, "apple,smc-gpio");
 	smcgp->j713 = of_machine_is_compatible("apple,j713");
 	mutex_init(&smcgp->j713_reg_on_lock);
+	mutex_init(&smcgp->fn_lock);
+
+	ret = macsmc_gpio_parse_templates(smcgp);
+	if (ret)
+		return ret;
 
 	smcgp->first_index = macsmc_gpio_find_first_gpio_index(smcgp);
 	if (smcgp->first_index < 0)
