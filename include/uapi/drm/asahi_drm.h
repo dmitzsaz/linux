@@ -241,7 +241,7 @@ enum drm_asahi_gpu_hal_generation {
 	 */
 	DRM_ASAHI_GPU_HAL_200 = 200,
 
-	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. Never reported by this kernel. */
+	/** @DRM_ASAHI_GPU_HAL_300: HAL300 command stream. */
 	DRM_ASAHI_GPU_HAL_300 = 300,
 };
 
