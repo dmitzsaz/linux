@@ -949,6 +949,95 @@
 		};
 
 		/*
+		 * APCIe (ADT /arm-io/apcie): three root ports with a shared
+		 * ECAM window. The boot loader powers and trains the ports a
+		 * machine uses. Port 0 owns the first 32 of the 96 MSI vectors.
+		 * Port 0 is bus 1 and port 2 bus 2; the DARTs map their first
+		 * functions to streams 1 and 2.
+		 */
+		apcie: pcie@1cb0000000 {
+			compatible = "apple,t8142-pcie";
+			device_type = "pci";
+			reg = <0x1c 0xb0000000 0x0 0x10000000>,
+			      <0x4 0x8c000000 0x0 0x4000>,
+			      <0x4 0x88028000 0x0 0x8000>,
+			      <0x4 0x89028000 0x0 0x8000>,
+			      <0x4 0x8a028000 0x0 0x8000>,
+			      <0x4 0x8f010000 0x0 0x4000>,
+			      <0x4 0x8f014000 0x0 0x4000>,
+			      <0x4 0x8f018000 0x0 0x4000>;
+			reg-names = "config", "rc", "port0", "port1", "port2",
+				    "phy0", "phy1", "phy2";
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1462 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1471 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 1480 IRQ_TYPE_LEVEL_HIGH>;
+			msi-controller;
+			msi-parent = <&apcie>;
+			msi-ranges = <&aic AIC_IRQ 1741 IRQ_TYPE_EDGE_RISING 32>;
+			bus-range = <0 2>;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			ranges = <0x43000000 0xb 0xc0000000 0xb 0xc0000000 0x0 0x20000000>,
+				 <0x02000000 0x0 0x80000000 0xb 0x80000000 0x0 0x40000000>;
+			iommu-map = <0x100 &apcie_dart0 1 2>,
+				    <0x200 &apcie_dart2 1 1>;
+			iommu-map-mask = <0xffff>;
+			power-domains = <&ps_st0_aus5>;
+			status = "disabled";
+
+			apcie_port0: pci@0,0 {
+				device_type = "pci";
+				reg = <0x0 0x0 0x0 0x0 0x0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &apcie_port0 0 0 0 0>,
+						<0 0 0 2 &apcie_port0 0 0 0 1>,
+						<0 0 0 3 &apcie_port0 0 0 0 2>,
+						<0 0 0 4 &apcie_port0 0 0 0 3>;
+				status = "disabled";
+			};
+
+			apcie_port2: pci@2,0 {
+				device_type = "pci";
+				reg = <0x1000 0x0 0x0 0x0 0x0>;
+				#address-cells = <3>;
+				#size-cells = <2>;
+				ranges;
+				interrupt-controller;
+				#interrupt-cells = <1>;
+				interrupt-map-mask = <0 0 0 7>;
+				interrupt-map = <0 0 0 1 &apcie_port2 0 0 0 0>,
+						<0 0 0 2 &apcie_port2 0 0 0 1>,
+						<0 0 0 3 &apcie_port2 0 0 0 2>,
+						<0 0 0 4 &apcie_port2 0 0 0 3>;
+				status = "disabled";
+			};
+		};
+
+		apcie_dart0: iommu@488000000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <0x4 0x88000000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1463 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		apcie_dart2: iommu@48a000000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <0x4 0x8a000000 0x0 0x20000>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 1481 IRQ_TYPE_LEVEL_HIGH>;
+			#iommu-cells = <1>;
+			status = "disabled";
+		};
+
+		/*
 		 * ANS2 NVMe (ADT /arm-io/ans, /arm-io/sart-ans). ANS is an
 		 * ascwrap-v6 ASC with its mailbox at +0x8000, like the SMC; the
 		 * SART is coastguard sart-version 3. As on T8140, the NVMe
