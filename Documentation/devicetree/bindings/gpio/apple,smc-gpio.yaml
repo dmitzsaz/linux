@@ -23,9 +23,34 @@ properties:
   '#gpio-cells':
     const: 2
 
+  apple,function-templates:
+    $ref: /schemas/types.yaml#/definitions/uint32-matrix
+    maxItems: 64
+    items:
+      items:
+        - description: GPIO line, the number in the gPxx key.
+          maximum: 63
+        - description: Template word the level is inserted into.
+    description:
+      Lines that the platform drives through an SMC key-write function,
+      pKW4(gPxx, template) in the Apple device tree, instead of the GPIO
+      commands. Setting such a line writes the template with the level in
+      bit 0; the level is what the function takes, which need not be the
+      level of the pin. These lines are outputs only and cannot be read
+      back.
+
 required:
   - compatible
   - gpio-controller
   - '#gpio-cells'
 
 additionalProperties: false
+
+examples:
+  - |
+    gpio {
+        compatible = "apple,smc-gpio";
+        gpio-controller;
+        #gpio-cells = <2>;
+        apple,function-templates = <0x13 0x800000>, <0x1c 0x10000>;
+    };
