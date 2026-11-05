@@ -23,19 +23,23 @@ enum ReportRing {
 }
 
 impl ReportRing {
-    fn geometry(self) -> (usize, usize, u32, u32) {
+    fn geometry(self, hal300: bool) -> (usize, usize, u32, u64) {
         match self {
             Self::Trace => (
                 status::TRACE_STATE as usize,
                 status::TRACE_RING as usize,
                 TRACE_SLOTS,
-                TRACE_TYPES,
+                u64::from(TRACE_TYPES),
             ),
             Self::Statistics => (
                 status::STATS_STATE as usize,
                 status::STATS_RING as usize,
                 STATISTICS_SLOTS,
-                STATISTICS_TYPES,
+                if hal300 {
+                    HAL300_STATISTICS_TYPES
+                } else {
+                    STATISTICS_TYPES
+                },
             ),
         }
     }
@@ -154,7 +158,8 @@ impl Rings {
         max_age_ns: u64,
         accept_statistics: bool,
     ) -> Result {
-        let (state, entries, capacity, allowed_types) = ring.geometry();
+        let hal300 = init.is_hal300();
+        let (state, entries, capacity, allowed_types) = ring.geometry(hal300);
         let consumer_word = init.status_word(role, state)?;
         let producer_word = init.status_word(role, state + RX_PRODUCER_OFFSET)?;
         fence(Ordering::Acquire);
@@ -172,10 +177,14 @@ impl Rings {
             let words = init.status_read_words::<EVENT_WORDS>(role, offset)?;
             super::trace::report(role as u8, ring as u8, &words);
             let tag = words[0];
-            if tag >= u32::BITS || allowed_types & (1 << tag) == 0 {
+            let known = tag < u64::BITS && allowed_types & (1u64 << tag) != 0;
+            // HAL300 statistics are advisory fixed-size slots. Return unknown
+            // records too, so an unsupported report cannot stall the producer.
+            // Neither their contents nor type 32 have qualified telemetry units.
+            if !known && !(hal300 && matches!(ring, ReportRing::Statistics)) {
                 return Err(EIO);
             }
-            if matches!(ring, ReportRing::Statistics) {
+            if known && matches!(ring, ReportRing::Statistics) {
                 let host_ns = super::now_ns();
                 reports.record(role, words, host_ns);
                 if accept_statistics {

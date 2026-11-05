@@ -5,7 +5,7 @@
 //! Writers and readers hold the device mutex; reads never power the GPU up.
 
 use super::{
-    fw::channels::{EVENT_WORDS, STATISTICS_TYPES},
+    fw::channels::{EVENT_WORDS, HAL300_STATISTICS_TYPES, STATISTICS_TAGS},
     Role,
 };
 use kernel::prelude::*;
@@ -24,8 +24,8 @@ pub(super) struct Reports {
 impl Reports {
     pub(super) fn new() -> Result<Self> {
         // Allocate before firmware starts; receive and debugfs paths allocate nothing.
-        let mut samples = KVec::with_capacity(64, GFP_KERNEL)?;
-        for _ in 0..64 {
+        let mut samples = KVec::with_capacity(2 * STATISTICS_TAGS, GFP_KERNEL)?;
+        for _ in 0..2 * STATISTICS_TAGS {
             samples.push(Sample::default(), GFP_KERNEL)?;
         }
         Ok(Self { samples })
@@ -33,10 +33,10 @@ impl Reports {
 
     pub(super) fn record(&mut self, role: Role, words: [u32; EVENT_WORDS], host_ns: u64) {
         let tag = words[0];
-        if tag >= u32::BITS || STATISTICS_TYPES & (1 << tag) == 0 {
+        if tag as usize >= STATISTICS_TAGS || HAL300_STATISTICS_TYPES & (1u64 << tag) == 0 {
             return;
         }
-        let sample = &mut self.samples[role as usize * 32 + tag as usize];
+        let sample = &mut self.samples[role as usize * STATISTICS_TAGS + tag as usize];
         sample.count = sample.count.saturating_add(1);
         sample.host_ns = host_ns;
         sample.words = words;
@@ -56,8 +56,8 @@ impl Reports {
             writeln!(
                 f,
                 "role={} tag={:#x} count={} host_ns={} words={:08x?}",
-                index / 32,
-                index % 32,
+                index / STATISTICS_TAGS,
+                index % STATISTICS_TAGS,
                 sample.count,
                 sample.host_ns,
                 sample.words
@@ -131,7 +131,7 @@ mod tests {
         assert_eq!(reports.samples[16].count, 2);
         assert_eq!(reports.samples[16].host_ns, 101);
         assert_eq!(reports.samples[16].words, words);
-        assert_eq!(reports.samples[48].count, 1);
+        assert_eq!(reports.samples[STATISTICS_TAGS + 16].count, 1);
         words[0] = 17;
         reports.record(Role::Primary, words, 103);
         assert_eq!(reports.samples[17].count, 1);
@@ -141,11 +141,27 @@ mod tests {
     #[test]
     fn rejects_invalid_tags_before_indexing() {
         let mut reports = Reports::new().unwrap();
-        for tag in [0, 15, 29, 31, 32, u32::MAX] {
+        for tag in [0, 15, 29, 31, 33, 63, 64, u32::MAX] {
             let mut words = [0; EVENT_WORDS];
             words[0] = tag;
             reports.record(Role::Primary, words, 1);
         }
         assert!(reports.samples.iter().all(|s| s.count == 0));
+    }
+
+    #[test]
+    fn retains_hal300_type_32_without_aliasing_the_other_role() {
+        let mut reports = Reports::new().unwrap();
+        let mut words = [0; EVENT_WORDS];
+        words[..5].copy_from_slice(&[32, 1, 2, 3, 4]);
+        words[17] = 0xdeadbeef;
+        reports.record(Role::Primary, words, 10);
+        reports.record(Role::Secondary, words, 20);
+        reports.record(Role::Secondary, words, 21);
+        assert_eq!(reports.samples[32].count, 1);
+        assert_eq!(reports.samples[32].host_ns, 10);
+        assert_eq!(reports.samples[STATISTICS_TAGS + 32].count, 2);
+        assert_eq!(reports.samples[STATISTICS_TAGS + 32].words, words);
+        assert_eq!(reports.samples[STATISTICS_TAGS].count, 0);
     }
 }
