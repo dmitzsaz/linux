@@ -127,6 +127,27 @@
 		power-domains = <&ps_apcie_sys_st>, <&ps_apcie_sys_gp>;
 	};
 
+	ps_st0_aus5_aon: power-controller@578 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x578 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "st0_aus5_aon";
+		power-domains = <&ps_apcie_phy_sw>;
+		status = "disabled";
+	};
+
+	/* The APCIe PHY: last of the ADT apcie power-gates. */
+	ps_st0_aus5: power-controller@580 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x580 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "st0_aus5";
+		power-domains = <&ps_st0_aus5_aon>;
+		status = "disabled";
+	};
+
 	ps_pmp: power-controller@598 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x598 4>;
