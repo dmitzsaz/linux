@@ -1,0 +1,227 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+#include <dt-bindings/interrupt-controller/apple-aic.h>
+#include <dt-bindings/interrupt-controller/irq.h>
+
+&pmgr {
+	ps_i2c1: power-controller@350 {
+		status = "disabled";
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x350 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c1";
+	};
+
+	ps_i2c3: power-controller@360 {
+		status = "disabled";
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x360 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "i2c3";
+	};
+};
+
+&soc {
+	pmgr_aop: power-management@388284000 {
+		status = "disabled";
+		compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
+		reg = <0x3 0x88284000 0x0 0x4000>;
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * Firmware owns AUDIO_A, AUDIO_FR, AUDIO_P, AUDIO_BASE_NS_A and
+		 * the LEAP parent fabric. It gates them around its audio services.
+		 * Describe only the host-controlled MCA and LEAP leaves: votes
+		 * on their parents would prevent firmware audio initialization.
+		 */
+		ps_audio_leap_mca: power-controller@100 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x100 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_mca";
+		};
+
+		ps_audio_mca0_m: power-controller@108 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x108 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca0_m";
+		};
+
+		ps_audio_mca1_m: power-controller@110 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x110 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca1_m";
+		};
+
+		ps_audio_mca2_m: power-controller@118 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x118 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca2_m";
+		};
+
+		ps_audio_mca3_m: power-controller@120 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x120 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca3_m";
+		};
+
+		ps_audio_mca4_m: power-controller@128 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x128 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca4_m";
+		};
+
+		ps_audio_mca5_m: power-controller@130 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x130 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_mca5_m";
+		};
+
+		ps_audio_leap_s_a: power-controller@140 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x140 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_s_a";
+		};
+
+		ps_audio_leap_rx0: power-controller@150 {
+			compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+			reg = <0x150 4>;
+			#power-domain-cells = <0>;
+			#reset-cells = <0>;
+			label = "audio_leap_rx0";
+		};
+	};
+
+	aop_mbox: mailbox@390608000 {
+		status = "disabled";
+		compatible = "apple,t8142-asc-mailbox", "apple,asc-mailbox-v4";
+		reg = <0x3 0x90608000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 490 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 491 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 492 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 493 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "send-not-empty",
+				  "recv-empty", "recv-not-empty";
+		#mbox-cells = <0>;
+	};
+
+	aop_setup_mbox: mailbox@3d067c000 {
+		status = "disabled";
+		compatible = "apple,t8142-aop-setup-mailbox", "apple,t8140-aop-setup-mailbox";
+		reg = <0x3 0xd067c000 0x0 0x4000>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 494 IRQ_TYPE_LEVEL_HIGH>,
+			     <AIC_IRQ 497 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-names = "send-empty", "recv-not-empty";
+		/* dart-aop stream 1: ADT vm-base-1 0x20000000000, as on T8140. */
+		iommus = <&aop_dart 1>;
+		apple,dma-range = <0x200 0x0 0x10 0x0>;
+		#mbox-cells = <0>;
+	};
+
+	aop_dart: iommu@390fc0000 {
+		status = "disabled";
+		compatible = "apple,t8142-dart", "apple,t8110-dart";
+		reg = <0x3 0x90fc0000 0x0 0xc000>;
+		#iommu-cells = <1>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 528 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	admac_base_ns: dma-controller@393800000 {
+		status = "disabled";
+		compatible = "apple,t8140-admac";
+		reg = <0x3 0x93800000 0x0 0x34000>;
+		dma-channels = <13>;
+		interrupts-extended = <&aic AIC_IRQ 549 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 8>;
+		apple,dma-range = <0x110 0x00000000 0x0 0x10000000>;
+	};
+
+	admac_leap_s: dma-controller@3d3200000 {
+		status = "disabled";
+		compatible = "apple,t8140-admac";
+		reg = <0x3 0xd3200000 0x0 0x34000>;
+		dma-channels = <9>;
+		interrupts-extended = <&aic AIC_IRQ 551 IRQ_TYPE_LEVEL_HIGH>,
+				      <0>, <0>, <0>;
+		#dma-cells = <1>;
+		iommus = <&aop_dart 11>;
+		apple,dma-range = <0x100 0x40000000 0x0 0xffff0000>;
+	};
+
+	i2c1: i2c@3a5014000 {
+		status = "disabled";
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
+		reg = <0x3 0xa5014000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1248 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c1>;
+	};
+
+	i2c3: i2c@3a501c000 {
+		status = "disabled";
+		compatible = "apple,t8142-i2c", "apple,t8103-i2c";
+		reg = <0x3 0xa501c000 0x0 0x4000>;
+		clocks = <&clkref>;
+		interrupt-parent = <&aic>;
+		interrupts = <AIC_IRQ 1250 IRQ_TYPE_LEVEL_HIGH>;
+		#address-cells = <1>;
+		#size-cells = <0>;
+		power-domains = <&ps_i2c3>;
+	};
+
+	aop: aop@390c00000 {
+		status = "disabled";
+		compatible = "apple,t8142-aop", "apple,t8152-aop";
+		reg = <0x3 0x90c00000 0x0 0x1e0000>,
+		      <0x3 0x90600000 0x0 0x4000>;
+		reg-names = "mmio", "asc";
+		mboxes = <&aop_mbox>, <&aop_setup_mbox>;
+		mbox-names = "mbox", "setup";
+		iommus = <&aop_dart 0>;
+		apple,dma-range = <0x110 0x0 0x10 0x0>;
+
+		aop_audio: audio {
+			compatible = "apple,t8142-aop-audio", "apple,t8152-aop-audio";
+			/* hpai: leap-s RX0 (Linux channel 1, odd = DEV_TO_MEM). */
+			dmas = <&admac_base_ns 4>, <&admac_base_ns 5>,
+			       <&admac_base_ns 0>, <&admac_base_ns 1>,
+			       <&admac_leap_s 1>;
+			dma-names = "cout", "cin", "spkr", "sense", "hpai";
+			power-domains = <&ps_audio_mca0_m>, <&ps_audio_mca1_m>,
+					<&ps_audio_mca2_m>, <&ps_audio_mca3_m>,
+					<&ps_audio_mca4_m>, <&ps_audio_mca5_m>,
+					<&ps_audio_leap_s_a>, <&ps_audio_leap_rx0>,
+					<&ps_audio_leap_mca>;
+			power-domain-names = "mca0", "mca1", "mca2",
+					     "mca3", "mca4", "mca5",
+					     "leap_s_a", "leap_rx0", "leap_mca";
+			#sound-dai-cells = <1>;
+		};
+	};
+};
