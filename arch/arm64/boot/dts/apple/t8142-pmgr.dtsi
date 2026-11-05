@@ -23,6 +23,24 @@
 		label = "atc1-common";
 	};
 
+	ps_atc2_common: power-controller@2d8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2d8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2-common";
+		status = "disabled";
+	};
+
+	ps_atc3_common: power-controller@2e0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x2e0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3-common";
+		status = "disabled";
+	};
+
 	ps_apcie_gp: power-controller@2f0 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0x2f0 4>;
@@ -139,6 +157,15 @@
 		label = "nub-spmi-a0";
 	};
 
+	ps_nub_spmi_a1: power-controller@78 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x78 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "nub-spmi-a1";
+		status = "disabled";
+	};
+
 	ps_atc0_usb_aon: power-controller@c8 {
 		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
 		reg = <0xc8 4>;
@@ -171,5 +198,43 @@
 		#reset-cells = <0>;
 		power-domains = <&ps_atc1_common>, <&ps_atc1_usb_aon>;
 		label = "atc1-usb";
+	};
+
+	ps_atc2_usb_aon: power-controller@e8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xe8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc2-usb-aon";
+		status = "disabled";
+	};
+
+	ps_atc2_usb: power-controller@f0 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xf0 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc2_common>, <&ps_atc2_usb_aon>;
+		label = "atc2-usb";
+		status = "disabled";
+	};
+
+	ps_atc3_usb_aon: power-controller@f8 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0xf8 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		label = "atc3-usb-aon";
+		status = "disabled";
+	};
+
+	ps_atc3_usb: power-controller@100 {
+		compatible = "apple,t8142-pmgr-pwrstate", "apple,t8103-pmgr-pwrstate";
+		reg = <0x100 4>;
+		#power-domain-cells = <0>;
+		#reset-cells = <0>;
+		power-domains = <&ps_atc3_common>, <&ps_atc3_usb_aon>;
+		label = "atc3-usb";
+		status = "disabled";
 	};
 };
