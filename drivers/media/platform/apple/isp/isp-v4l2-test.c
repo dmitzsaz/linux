@@ -362,7 +362,7 @@ static void isp_test_meta_exposure(struct kunit *test)
 	isp->hw = &hw;
 	isp->frame_gain = 256;
 
-	/* fourth table entry: the section at 0x1870 */
+	/* third section offset, the section at 0x1870; no count is needed */
 	put_unaligned_le32(0x1870, virt + 0x1c);
 	put_unaligned_le32(32475, virt + 0x1870);
 	put_unaligned_le16(0x0800, virt + 0x1874);
@@ -393,8 +393,102 @@ static void isp_test_meta_exposure(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, isp->frame_gain, 600);
 }
 
+/* Rheia: the section count is checked before the offset table is used. */
+static void isp_test_meta_exposure_bounds(struct kunit *test)
+{
+	static const struct apple_isp_hw hw = {
+		.meta_exposure = true, .meta_rheia = true,
+	};
+	struct apple_isp *isp = isp_test_alloc(test);
+	u8 *virt = kunit_kzalloc(test, 0x100, GFP_KERNEL);
+	struct isp_surf meta = { .size = 0x100, .virt = virt };
+	static const u32 bad_counts[] = { 0, 2, U32_MAX, 60 };
+
+	KUNIT_ASSERT_NOT_NULL(test, virt);
+	isp->hw = &hw;
+	isp->frame_gain = 256;
+	/* Plausible exposure bytes must not validate a missing/truncated table. */
+	put_unaligned_le32(0x80, virt + 0x1c);
+	put_unaligned_le32(30000, virt + 0x80);
+	put_unaligned_le16(2048, virt + 0x84);
+	for (unsigned int i = 0; i < ARRAY_SIZE(bad_counts); i++) {
+		put_unaligned_le32(bad_counts[i], virt + 0x10);
+		isp_meta_read_exposure(isp, &meta);
+		KUNIT_EXPECT_EQ(test, isp->frame_gain, 256);
+		KUNIT_EXPECT_EQ(test, isp->frame_exposure_us, 0);
+	}
+	put_unaligned_le32(3, virt + 0x10);
+	/* The offset may not alias the table itself, even if it looks valid. */
+	put_unaligned_le32(0x40, virt + 0x14);
+	put_unaligned_le32(0x60, virt + 0x18);
+	put_unaligned_le32(0x14, virt + 0x1c);
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 256);
+	/* Even the count is outside a truncated buffer. */
+	meta.size = 0x10;
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 256);
+}
+
+static void isp_test_meta_analog_gain(struct kunit *test)
+{
+	static const struct apple_isp_hw hw = {
+		.meta_exposure = true, .meta_rheia = true,
+	};
+	struct apple_isp *isp = isp_test_alloc(test);
+	u8 *virt = kunit_kzalloc(test, 0x100, GFP_KERNEL);
+	struct isp_surf meta = { .size = 0x100, .virt = virt };
+
+	KUNIT_ASSERT_NOT_NULL(test, virt);
+	isp->hw = &hw;
+	put_unaligned_le32(3, virt + 0x10);
+	put_unaligned_le32(0x80, virt + 0x1c);
+	put_unaligned_le32(30000, virt + 0x80);
+	put_unaligned_le16(2048, virt + 0x84);
+	put_unaligned_le16(3253, virt + 0x86);
+	isp_meta_read_exposure(isp, &meta);
+	KUNIT_EXPECT_EQ(test, isp->frame_exposure_us, 30000);
+	KUNIT_EXPECT_EQ(test, isp->frame_gain, 2048);
+}
+
+static void isp_test_free_exposure_controls(void *ptr)
+{
+	v4l2_ctrl_handler_free(ptr);
+}
+
+static void isp_test_analog_gain_control(struct kunit *test)
+{
+	static const struct apple_isp_hw hw = {
+		.meta_exposure = true, .meta_rheia = true,
+	};
+	struct apple_isp *isp = isp_test_alloc(test);
+	u32 flags = V4L2_CTRL_FLAG_READ_ONLY | V4L2_CTRL_FLAG_VOLATILE;
+	int err;
+
+	isp->hw = &hw;
+	v4l2_ctrl_handler_init(&isp->ctrl_handler, 2);
+	err = kunit_add_action_or_reset(test, isp_test_free_exposure_controls,
+					&isp->ctrl_handler);
+	KUNIT_ASSERT_EQ(test, err, 0);
+	isp_init_exposure_ctrls(isp);
+	KUNIT_ASSERT_EQ(test, isp->ctrl_handler.error, 0);
+	KUNIT_ASSERT_NOT_NULL(test, isp->gain);
+	KUNIT_ASSERT_NOT_NULL(test, isp->exposure);
+	KUNIT_EXPECT_EQ(test, isp->gain->id, V4L2_CID_ANALOGUE_GAIN);
+	KUNIT_EXPECT_PTR_EQ(test, v4l2_ctrl_find(&isp->ctrl_handler, V4L2_CID_GAIN), NULL);
+	KUNIT_EXPECT_EQ(test, isp->gain->flags & flags, flags);
+	KUNIT_EXPECT_EQ(test, isp->exposure->flags & flags, flags);
+	isp->frame_gain = 2048;
+	isp->frame_exposure_us = 32475;
+	KUNIT_EXPECT_EQ(test, v4l2_ctrl_g_ctrl(isp->gain), 2048);
+	KUNIT_EXPECT_EQ(test, v4l2_ctrl_g_ctrl(isp->exposure), 325);
+}
+
 static struct kunit_case isp_v4l2_test_cases[] = {
 	KUNIT_CASE(isp_test_meta_exposure),
+	KUNIT_CASE(isp_test_meta_exposure_bounds),
+	KUNIT_CASE(isp_test_meta_analog_gain),
+	KUNIT_CASE(isp_test_analog_gain_control),
 	KUNIT_CASE(isp_test_imx958_last_lease_requeue),
 	KUNIT_CASE(isp_test_p010_report_defers_completion),
 	KUNIT_CASE(isp_test_p010_mode_selection),

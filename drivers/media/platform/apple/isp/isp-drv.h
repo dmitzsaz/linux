@@ -228,6 +228,12 @@ struct apple_isp_hw {
 
 	/* metadata buffers carry the frame's exposure report (H17 firmware) */
 	bool meta_exposure;
+	/*
+	 * Rheia metadata layout: the section count ahead of the offset table
+	 * is checked, and the analogue gain at +4 is reported instead of the
+	 * total gain at +6.
+	 */
+	bool meta_rheia;
 
 	/*
 	 * The firmware leaves its data segment changed when it stops, and
