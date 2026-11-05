@@ -5,7 +5,7 @@
 use crate::g17::fw::initdata::hal300 as abi;
 use abi::{Object, ObjectSpec};
 
-pub(crate) const OBJECTS: [ObjectSpec; 17] = [
+pub(crate) const OBJECTS: [ObjectSpec; 16] = [
     ObjectSpec {
         kind: Object::HardwareData,
         va: 0xfffffc2000400000,
@@ -61,12 +61,6 @@ pub(crate) const OBJECTS: [ObjectSpec; 17] = [
         aliases: [0x70040c0000, 0x0],
     },
     ObjectSpec {
-        kind: Object::SubmissionArena,
-        va: 0xfffffc2008000000,
-        size: 0x800000,
-        aliases: [0x7008000000, 0x0],
-    },
-    ObjectSpec {
         kind: Object::PoolDescriptors,
         va: 0xfffffc2001600000,
         size: 0x4000,
@@ -109,9 +103,6 @@ pub(crate) const OBJECTS: [ObjectSpec; 17] = [
         aliases: [0x0, 0x0],
     },
 ];
-
-pub(crate) const ARENA_UNK_50: u32 = 0x50;
-pub(crate) const ARENA_POOL_SLOT: u32 = 3;
 
 pub(crate) const PB_DESCRIPTORS: u64 = 0xfffffc2001838000;
 pub(crate) const PB_LOW: u64 = 0x7001838000;

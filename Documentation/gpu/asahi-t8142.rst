@@ -401,3 +401,14 @@ global requests. Matrix, ray-traversal, SCS and render-resource extensions remai
 unadvertised. Userspace timestamp-only commands must execute
 a real carrier dispatch: the driver reports a measured raw/record interval only
 after the normal post-maintenance completion witness.
+
+Optional submission-arena removal
+---------------------------------
+
+The arena-removal change omits the 8 MiB mapping at firmware VA
+0xfffffc2008000000, with application alias 0x7008000000. Every other GPU VA is
+explicitly fixed and remains unchanged; dynamic physical backing placement can
+change. Absence of an incoming graph pointer does not exclude firmware access
+through fixed or derived addresses. This removal requires its own hardware
+qualification and may be reverted independently of the complete typed startup
+layout, which preserves all seventeen original objects and arena contents.

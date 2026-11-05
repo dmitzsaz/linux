@@ -233,7 +233,7 @@ impl Prepared {
         }
         init.adopt_hal300(
             core::mem::take(&mut self.objects),
-            [hw::OBJECTS[15].va, hw::OBJECTS[16].va],
+            [hw::OBJECTS[14].va, hw::OBJECTS[15].va],
             hw::METRICS,
         )?;
         init.retain_mapping(metrics)?;
