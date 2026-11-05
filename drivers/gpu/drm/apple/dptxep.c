@@ -629,6 +629,23 @@ static int dptxport_call_set_link_rate(struct apple_epic_service *service,
 			ret = dcp_direct_crossbar_link(service->ep->dcp, false);
 			if (ret && service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 				return ret;
+			/*
+			 * Firmware 27 retrains the link after a modeset has shut
+			 * it down, asking again for the rate already configured.
+			 * The PHY treats an unchanged rate as a no-op, which
+			 * leaves its PLL and lanes as the shut-down link left
+			 * them and clock recovery fails on every lane. Stop the
+			 * link first so the retraining starts from a fresh PHY
+			 * link, as the first training did.
+			 */
+			if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			    phy_link_rate && dptx->link_rate == link_rate) {
+				dptx->phy_ops.dp.link_rate = 0;
+				dptx->phy_ops.dp.set_rate = 1;
+				ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
+				if (ret)
+					return ret;
+			}
 			dptx->phy_ops.dp.link_rate = phy_link_rate;
 			dptx->phy_ops.dp.set_rate = 1;
 			ret = phy_configure(dptx->atcphy, &dptx->phy_ops);
