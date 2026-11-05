@@ -34,6 +34,7 @@ properties:
       - const: apple,isp
 
   reg:
+    minItems: 3
     items:
       - description: Coprocessor control registers
       - description: Mailbox interrupt and doorbell registers
@@ -41,6 +42,7 @@ properties:
       - description: Capture watchdog registers
 
   reg-names:
+    minItems: 3
     items:
       - const: coproc
       - const: mbox
@@ -57,29 +59,37 @@ properties:
       - description: Third ISP DART stream
 
   power-domains:
-    items:
-      - description: ISP system domain
-      - description: ISP CPU domain
-      - description: ISP CPU core 0 domain
-      - description: ISP CPU core 1 domain
-      - description: ISP FE domain
-      - description: ISP DPRX domain
-      - description: ISP secure domain
-      - description: ISP STS0 domain
-      - description: ISP STS1 domain
-      - description: ISP Pearl domain
-      - description: ISP BE domain
-      - description: ISP CLR domain
-      - description: ISP CVD domain
-      - description: ISP CVM domain
+    minItems: 8
+    maxItems: 14
 
   memory-region:
-    maxItems: 1
-    description: Firmware heap region provided by the bootloader
+    minItems: 1
+    maxItems: 3
+    description:
+      Firmware main memory aperture, followed on T8142 by the resident text
+      and data segments supplied by the bootloader. An aperture without reg
+      reserves only IOVA space; the driver backs the gap after resident data.
 
   memory-region-names:
-    items:
-      - const: heap
+    oneOf:
+      - items:
+          - const: heap
+      - items:
+          - const: heap
+          - const: text
+          - const: data
+
+  apple,firmware-version:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Version of the operating system whose boot firmware loaded the ISP.
+
+  apple,firmware-compat:
+    $ref: /schemas/types.yaml#/definitions/uint32-array
+    minItems: 3
+    maxItems: 5
+    description: Firmware interface version supplied by the bootloader.
 
   apple,dart-vm-size:
     $ref: /schemas/types.yaml#/definitions/uint64
@@ -134,6 +144,68 @@ properties:
           - apple,crop
         additionalProperties: false
     additionalProperties: false
+
+allOf:
+  - if:
+      properties:
+        memory-region-names:
+          contains:
+            const: text
+    then:
+      properties:
+        memory-region:
+          minItems: 3
+    else:
+      properties:
+        memory-region:
+          maxItems: 1
+  - if:
+      properties:
+        compatible:
+          contains:
+            const: apple,t8142-isp
+    then:
+      properties:
+        power-domains:
+          minItems: 8
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP STS0 domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: First camera sensor domain
+            - description: Second camera sensor domain
+    else:
+      properties:
+        reg:
+          minItems: 4
+        reg-names:
+          minItems: 4
+        power-domains:
+          items:
+            - description: ISP system domain
+            - description: ISP CPU domain
+            - description: ISP CPU core 0 domain
+            - description: ISP CPU core 1 domain
+            - description: ISP FE domain
+            - description: ISP DPRX domain
+            - description: ISP secure domain
+            - description: ISP STS0 domain
+            - description: ISP STS1 domain
+            - description: ISP Pearl domain
+            - description: ISP BE domain
+            - description: ISP CLR domain
+            - description: ISP CVD domain
+            - description: ISP CVM domain
+        memory-region:
+          maxItems: 1
+        memory-region-names:
+          items:
+            - const: heap
 
 required:
   - compatible
