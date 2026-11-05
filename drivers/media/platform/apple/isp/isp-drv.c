@@ -941,7 +941,7 @@ static const struct apple_isp_hw apple_isp_hw_t8142 = {
 	.fw_mmio = apple_isp_fw_mmio_t8142,
 	.num_fw_mmio = ARRAY_SIZE(apple_isp_fw_mmio_t8142),
 	.boot_mode = 1,
-	.capture_meta_size = ISP_CAPTURE_META_SIZE_T8140,
+	.shared_size = 0xe900000,
 	.resident_fw = true,
 	/* The J813 IMX958 runs the xx24 setfile 2224_01, as T6040 does. */
 	.setfile_stride_fixup = true,
