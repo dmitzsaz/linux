@@ -16,6 +16,12 @@ struct State { entries: KVec<Option<Entry>>, bytes: usize }
 pub(super) struct Quarantine { #[pin] state: Mutex<State> }
 pub(super) struct Reservation { owner: Arc<Quarantine>, index: usize, bytes: usize }
 impl Quarantine {
+    pub(super) fn write(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        let state = self.state.lock();
+        let used = state.entries.iter().filter(|entry| entry.is_some()).count();
+        writeln!(f, "hal300_quarantine entries={}/{} backing_bytes={}/{}", used, ENTRIES, state.bytes, BYTE_LIMIT)
+    }
+
     pub(super) fn new() -> Result<Arc<Self>> {
         let mut entries = KVec::with_capacity(ENTRIES, GFP_KERNEL)?;
         for _ in 0..ENTRIES { entries.push(None, GFP_KERNEL)?; }
