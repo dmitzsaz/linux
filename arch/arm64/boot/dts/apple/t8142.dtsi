@@ -496,6 +496,15 @@
 			power-domains = <&ps_nub_spmi_a0>;
 		};
 
+		nub_spmi_a1: spmi@388a08000 {
+			compatible = "apple,t8142-spmi";
+			reg = <3 0x88a08000 0 0x4000>;
+			#address-cells = <2>;
+			#size-cells = <0>;
+			power-domains = <&ps_nub_spmi_a1>;
+			status = "disabled";
+		};
+
 		smc: smc@38c600000 {
 			compatible = "apple,t8142-smc", "apple,t8103-smc";
 			reg = <3 0x8c600000 0 0x4000>, <3 0x8de00000 0 0x120000>;
@@ -532,6 +541,26 @@
 				     <AIC_IRQ 636 IRQ_TYPE_LEVEL_HIGH>;
 			interrupt-names = "send-empty", "send-not-empty", "recv-empty", "recv-not-empty";
 			#mbox-cells = <0>;
+		};
+
+		pinctrl_aop: pinctrl@390824000 {
+			compatible = "apple,t8142-pinctrl", "apple,t8140-pinctrl", "apple,t8103-pinctrl";
+			reg = <0x3 0x90824000 0x0 0x4000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			gpio-ranges = <&pinctrl_aop 0 0 77>;
+			apple,npins = <77>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			interrupt-parent = <&aic>;
+			interrupts = <AIC_IRQ 480 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 481 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 482 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 483 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 484 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 485 IRQ_TYPE_LEVEL_HIGH>,
+				     <AIC_IRQ 486 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
 		};
 
 		mtp: mtp@394600000 {
@@ -797,6 +826,102 @@
 					reg = <1>;
 					atcphy1_usb: endpoint {
 						remote-endpoint = <&dwc3_1_ss>;
+					};
+				};
+			};
+		};
+
+		/*
+		 * ATC2 and ATC3 are wired by the board: Type-C USB/USB4 ports, or
+		 * a DisplayPort-only PHY feeding an HDMI converter.
+		 */
+		atcphy2: phy@413000000 {
+			compatible = "apple,t8142-atcphy";
+			reg = <4 0x13000000 0 0x4c000>,
+			      <4 0x13050000 0 0x8000>,
+			      <4 0x10000000 0 0x8000>,
+			      <4 0x12a90000 0 0x4000>,
+			      <4 0x12a84000 0 0x4000>;
+			reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler";
+			#phy-cells = <1>;
+			#reset-cells = <0>;
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc2_usb>;
+			status = "disabled";
+		};
+
+		dwc3_3: usb@41a280000 {
+			compatible = "apple,t8142-dwc3", "apple,t8103-dwc3";
+			reg = <4 0x1a280000 0 0xcd00>, <4 0x1a28cd00 0 0x4b00>;
+			reg-names = "dwc3-core", "dwc3-apple";
+			interrupts = <AIC_IRQ 1700 IRQ_TYPE_LEVEL_HIGH>;
+			dr_mode = "host";
+			usb-role-switch;
+			role-switch-default-mode = "host";
+			iommus = <&dwc3_3_dart_0 0>, <&dwc3_3_dart_1 1>;
+			power-domains = <&ps_atc3_usb>;
+			resets = <&atcphy3>;
+			phys = <&atcphy3 PHY_TYPE_USB2>, <&atcphy3 PHY_TYPE_USB3>;
+			phy-names = "usb2-phy", "usb3-phy";
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@1 {
+					reg = <1>;
+					dwc3_3_ss: endpoint {
+						remote-endpoint = <&atcphy3_usb>;
+					};
+				};
+			};
+		};
+
+		dwc3_3_dart_0: iommu@41af00000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <4 0x1af00000 0 0xc000>;
+			interrupts = <AIC_IRQ 1704 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc3_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+			status = "disabled";
+		};
+
+		dwc3_3_dart_1: iommu@41af80000 {
+			compatible = "apple,t8142-dart", "apple,t8110-dart";
+			reg = <4 0x1af80000 0 0xc000>;
+			interrupts = <AIC_IRQ 1704 IRQ_TYPE_LEVEL_HIGH>;
+			power-domains = <&ps_atc3_usb>;
+			#iommu-cells = <1>;
+			apple,dma-range = <0x100 0x4000 0 0xffff0000>;
+			status = "disabled";
+		};
+
+		atcphy3: phy@41b000000 {
+			compatible = "apple,t8142-atcphy";
+			reg = <4 0x1b000000 0 0x4c000>,
+			      <4 0x1b050000 0 0x8000>,
+			      <4 0x18000000 0 0x8000>,
+			      <4 0x1aa90000 0 0x4000>,
+			      <4 0x1aa84000 0 0x4000>;
+			reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler";
+			#phy-cells = <1>;
+			#reset-cells = <0>;
+			orientation-switch;
+			mode-switch;
+			power-domains = <&ps_atc3_usb>;
+			status = "disabled";
+
+			ports {
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				port@1 {
+					reg = <1>;
+					atcphy3_usb: endpoint {
+						remote-endpoint = <&dwc3_3_ss>;
 					};
 				};
 			};
