@@ -351,6 +351,21 @@
 			apple,pmc-pmgr = <31>;
 		};
 
+		/*
+		 * Device power state reports to the PMP (ADT iop-pmp-nub
+		 * ptd-range). Entries are added by the users of each device;
+		 * their reg is the index of the device's soc-device record:
+		 * GFX 12, DISP 15, DISPEXT0 16, DISPEXT1 17.
+		 */
+		pmp_report: pmp-report@3803c0000 {
+			compatible = "apple,t8142-pmp-v2-report";
+			reg = <0x3 0x803c0000 0x0 0x14000>;
+			power-domains = <&ps_pms_sram>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
 		pmgr: power-management@380700000 {
 			compatible = "apple,t8142-pmgr", "apple,t8103-pmgr", "syscon", "simple-mfd";
 			/* As on T8140: up to the ISP17a slots at +0x4000..+0x4060. */
