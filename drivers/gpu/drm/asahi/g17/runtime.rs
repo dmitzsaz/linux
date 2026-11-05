@@ -2413,6 +2413,7 @@ impl super::Firmware {
 
 impl Registry {
     pub(super) fn write_capacity(&self, f: &mut kernel::fmt::Formatter<'_>) -> kernel::fmt::Result {
+        if let Some(quarantine) = &self.quarantine { quarantine.write(f)?; }
         self.qids.write_capacity(f)?;
         self.admission.write_capacity(f)?;
         self.buffers.write_capacity(f)?;

@@ -14,7 +14,6 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use kernel::{
     device,
     prelude::*,
-    sync::Arc,
     time::{delay::fsleep, Delta},
 };
 

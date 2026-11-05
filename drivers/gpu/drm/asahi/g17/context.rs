@@ -422,11 +422,22 @@ impl Context {
             }
             return Ok(pool.clone());
         }
-        let reservation = self.quarantine.as_ref().map(|q| {
-            let bytes = self.render_blocks().checked_mul(super::fw::initdata::FREE_LIST_BLOCK_SIZE)
-                .and_then(|bytes| bytes.checked_add(4 * UAT_PGSZ)).ok_or(ENOSPC)?;
-            q.reserve(bytes)
-        }).transpose()?;
+        let reservation = self
+            .quarantine
+            .as_ref()
+            .map(|q| {
+                let bytes = self
+                    .render_blocks()
+                    .checked_mul(super::fw::initdata::FREE_LIST_BLOCK_SIZE)
+                    .and_then(|bytes| {
+                        bytes.checked_add(
+                            super::fw::freelist::TABLE_SIZE + 2 * super::fw::freelist::CONTROL_SIZE,
+                        )
+                    })
+                    .ok_or(ENOSPC)?;
+                q.reserve(bytes)
+            })
+            .transpose()?;
         let pool = Arc::new(
             RenderPool::new(alloc, ids, render_global, self.vm(), self.render_blocks())?,
             GFP_KERNEL,

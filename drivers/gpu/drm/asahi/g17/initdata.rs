@@ -1127,18 +1127,14 @@ impl InitData {
         Ok(())
     }
 
-    /// Whether device-control records with `opcode` are qualified for this firmware. On HAL300
-    /// the USC cache control and the three compute teardown records are: their kinds and
-    /// layouts match the native M5 publishers (submitReleaseResource 0x13, the free-list
-    /// releases 0x2e, processExitTimeoutHandler 0x29). Idle power and parameter-buffer replies
-    /// are not used on HAL300.
+    /// HAL300 retains scheduler pages; publishing HAL200 scheduler release would target
+    /// an unrelated HAL300 control. Other implemented controls keep their native layouts.
     pub(super) fn control_qualified(&self, opcode: super::fw::channels::DeviceControlOp) -> bool {
         use super::fw::channels::DeviceControlOp as Op;
         self.hal300.is_none()
             || matches!(
                 opcode,
-                Op::UscCacheInvalidate
-                    | Op::FreeListRelease
+                Op::FreeListRelease
                     | Op::ContextKill
                     | Op::TvbGrowReply
                     | Op::IdlePowerOff
@@ -1944,29 +1940,7 @@ impl InitData {
         fence(Ordering::SeqCst);
         producer_word.store(next, Ordering::Relaxed);
         fence(Ordering::SeqCst);
-        pr_info!(
-            "asahi: {:?} control slot {} kind {:#x}\n",
-            role,
-            producer,
-            kind
-        );
         Ok(next)
-    }
-
-    /// Withdraws the startup idle permission (region C +0x30), so later configuration refreshes
-    /// keep the GPU awake after the one startup descent and wake.
-    pub(super) fn clear_startup_idle_permission(&self) -> Result {
-        self.set_startup_idle_permission(0)
-    }
-
-    /// Host-owned region C +0x30 (startup idle permission), consumed by the coprocessors at their
-    /// next configuration refresh (a force-config snapshot makes that immediate).
-    pub(super) fn set_startup_idle_permission(&self, value: u32) -> Result {
-        self.object(self.region_c)?
-            .word(0x30)?
-            .store(value, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        Ok(())
     }
 
     /// Fills one empty host IOMapping record of the adopted HAL300 graph (allocation0 +0x640,
@@ -2024,16 +1998,8 @@ impl InitData {
     }
 }
 
-pub(super) const HAL300_RECOVERY_SUMMARY: usize = 0x4a90;
-/// The recovery report is the primary main configuration's fourth view (packed pointer at
-/// main +0x26c), bundle +0xc500 on HAL300.
-const HAL300_REPORT_VIEW: usize = 3;
-
 impl InitData {
-    /// Firmware addresses of the HAL300 recovery summary in status B and of the recovery report
-    /// view, after checking the report pointer the primary main configuration publishes.
-
-    /// Validate the serialized view before reading its retained host mapping.
+    /// Validate the view before reading its retained host mapping.
     fn recovery_view_words<const N: usize>(&self, view: usize, offset: usize) -> Result<[u32; N]> {
         let bundle = self.object(self.bundle)?;
         let extent = *abi::recovery::VIEW_EXTENTS.get(view).ok_or(EINVAL)?;

@@ -202,8 +202,6 @@ const ZLS_COMPRESS_DEPTH: u64 = 1 << 6;
 const ZLS_COMPRESS_STENCIL: u64 = 1 << 8;
 /// Bits of the main word a partial render sets for itself.
 const ZLS_PARTIAL_CLEAR: u64 = ZLS_COMPRESS_DEPTH | ZLS_COMPRESS_STENCIL | 0xf << 56;
-const ZLS_PARTIAL_DEPTH: u64 = 1 << 15 | 1 << 19;
-const ZLS_PARTIAL_STENCIL: u64 = 1 << 14 | 1 << 18;
 const ZLS_FORCE_LOAD_DEPTH: u64 = 0x8000;
 const ZLS_FORCE_LOAD_STENCIL: u64 = 0x4000;
 const ZLS_PARTIAL_STORE_MASK: u64 = 0xf0ff_ffff_ffff_febf;
