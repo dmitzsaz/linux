@@ -1,0 +1,11 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+
+&gpu_opp {
+	/* J704 has fourteen source performance states, including the off state. */
+	opp13 { opp-hz = /bits/ 64 <0>; opp-microvolt = <0>; };
+};
+
+&gpu {
+	/* Enabled only after the loader publishes a supported firmware profile. */
+	status = "disabled";
+};
