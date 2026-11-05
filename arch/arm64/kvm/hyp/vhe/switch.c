@@ -122,7 +122,7 @@ static void __activate_traps(struct kvm_vcpu *vcpu)
 
 	___activate_traps(vcpu, __compute_hcr(vcpu));
 
-	if (has_cntpoff()) {
+	if (has_cntpoff() && !static_branch_unlikely(&emulate_guest_timers)) {
 		struct timer_map map;
 
 		get_timer_map(vcpu, &map);
@@ -156,7 +156,7 @@ static void __deactivate_traps(struct kvm_vcpu *vcpu)
 
 	write_sysreg_hcr(HCR_HOST_VHE_FLAGS);
 
-	if (has_cntpoff()) {
+	if (has_cntpoff() && !static_branch_unlikely(&emulate_guest_timers)) {
 		struct timer_map map;
 		u64 val, offset;
 
@@ -275,6 +275,10 @@ static bool kvm_hyp_handle_timer(struct kvm_vcpu *vcpu, u64 *exit_code)
 	 * returning to the kernel if we can.
 	 */
 	if (!is_hyp_ctxt(vcpu))
+		return false;
+
+	/* The slow path handles every emulated timer bank, including vEL2. */
+	if (static_branch_unlikely(&emulate_guest_timers))
 		return false;
 
 	esr = kvm_vcpu_get_esr(vcpu);
