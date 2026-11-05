@@ -65,6 +65,8 @@ properties:
       - description:
           Shared global variables, preserved firmware data or text segment of
           the loaded GPU firmware
+      - description: Loaded GFX firmware TEXT, including its relocated DATA pointer
+      - description: Loaded GFX1 firmware TEXT, including its relocated DATA pointer
 
   memory-region-names:
     minItems: 3
@@ -75,6 +77,32 @@ properties:
       - enum: [hw-cal-a, shared-l2, fw-data]
       - enum: [hw-cal-b, fw-text, l2-pagetables, gfx-data]
       - enum: [globals, fw-data, fw-text, gfx1-data]
+      - const: fw-text
+      - const: fw1-text
+
+  apple,t8142-gpu-calibration:
+    $ref: /schemas/types.yaml#/definitions/uint8-array
+    minItems: 512
+    maxItems: 512
+    description: |
+      Owner-supplied T8142 HAL300 26A434 calibration record, in little endian.
+      The four u32 header fields are version (1), SoC ID (0x8142), enabled GPU
+      core mask and power sample period in milliseconds. The remaining 496
+      bytes are the 103 typed calibration fields of struct Calibration in
+      drivers/gpu/drm/asahi/g17/fw/initdata/hal300.rs, in declaration order.
+      These fields carry per-device power coefficients whose firmware meaning
+      is not fully known; they are not object offsets or write commands.
+      The maximum pstate and maximum frequency must agree with available OPPs.
+      The record belongs to the loaded firmware profile and physical device;
+      it must not contain firmware, a captured graph or per-boot addresses.
+      The boot loader installs the current device's record before enabling
+      the GPU. No calibration values are present in source device trees.
+
+  apple,power-sample-period:
+    $ref: /schemas/types.yaml#/definitions/uint32
+    minimum: 1
+    maximum: 10000
+    description: T8142 GPU power controller sample period in milliseconds
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -292,6 +320,7 @@ allOf:
             - description: GFX coprocessor mailbox
             - description: GFX1 coprocessor mailbox
         memory-region:
+          minItems: 6
           items:
             - description: GPU MMU TTBs
             - description: GPU MMU page tables
@@ -299,7 +328,10 @@ allOf:
             - description: Shared firmware kernel-window page tables
             - description: GFX firmware DATA segment
             - description: GFX1 firmware DATA segment
+            - description: Loaded GFX firmware TEXT segment
+            - description: Loaded GFX1 firmware TEXT segment
         memory-region-names:
+          minItems: 6
           items:
             - const: ttbs
             - const: pagetables
@@ -307,6 +339,8 @@ allOf:
             - const: shared-l2
             - const: gfx-data
             - const: gfx1-data
+            - const: fw-text
+            - const: fw1-text
       required:
         - power-domains
         - reg-names
@@ -435,6 +469,20 @@ allOf:
             - const: globals
       required:
         - apple,firmware-abi
+
+  - if:
+      required:
+        - apple,t8142-gpu-calibration
+    then:
+      properties:
+        compatible:
+          const: apple,agx-t8142
+        memory-region:
+          minItems: 8
+        memory-region-names:
+          minItems: 8
+      required:
+        - apple,power-sample-period
 
 additionalProperties: false
 
