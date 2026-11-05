@@ -98,6 +98,11 @@
 	};
 };
 
+/* The loader starts the kernel at EL2 with spin-table: no PSCI idle. */
+&cpuidle {
+	status = "okay";
+};
+
 &serial0 {
 	status = "okay";
 };
