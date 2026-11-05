@@ -284,13 +284,14 @@ dptxport_call_get_max_drive_settings(struct apple_epic_service *service,
 		return 0;
 	}
 
+	/*
+	 * Maximum voltage swing and pre-emphasis levels. Firmware 27 on
+	 * T8142 reads them at the same offsets as earlier firmware; a
+	 * zero in the first word stops it from raising the drive level
+	 * when the sink asks for more during clock recovery.
+	 */
 	reply->max_drive_settings[0] = cpu_to_le32(0x3);
 	reply->max_drive_settings[1] = cpu_to_le32(0x3);
-	if (service->ep->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-		/* Protocol-27 drive settings: type, voltage, pre-emphasis. */
-		reply->max_drive_settings[0] = cpu_to_le32(0);
-		memcpy(reply->_unk1, &reply->max_drive_settings[1], sizeof(__le32));
-	}
 
 	return 0;
 }
