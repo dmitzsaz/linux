@@ -94,3 +94,43 @@
 
 	};
 };
+
+&atcphy0 {
+	reg = <4 0x03000000 0 0x4c000>,
+	      <4 0x03050000 0 0x8000>,
+	      <4 0x00000000 0 0x8000>,
+	      <4 0x02a90000 0 0x4000>,
+	      <4 0x02a84000 0 0x4000>,
+	      <4 0x00020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
+
+&atcphy1 {
+	reg = <4 0x0b000000 0 0x4c000>,
+	      <4 0x0b050000 0 0x8000>,
+	      <4 0x08000000 0 0x8000>,
+	      <4 0x0aa90000 0 0x4000>,
+	      <4 0x0aa84000 0 0x4000>,
+	      <4 0x08020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
+
+&atcphy2 {
+	reg = <4 0x13000000 0 0x4c000>,
+	      <4 0x13050000 0 0x8000>,
+	      <4 0x10000000 0 0x8000>,
+	      <4 0x12a90000 0 0x4000>,
+	      <4 0x12a84000 0 0x4000>,
+	      <4 0x10020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
+
+&atcphy3 {
+	reg = <4 0x1b000000 0 0x4c000>,
+	      <4 0x1b050000 0 0x8000>,
+	      <4 0x18000000 0 0x8000>,
+	      <4 0x1aa90000 0 0x4000>,
+	      <4 0x1aa84000 0 0x4000>,
+	      <4 0x18020000 0 0x4000>;
+	reg-names = "core", "lpdptx", "axi2af", "usb2phy", "pipehandler", "lioa";
+};
