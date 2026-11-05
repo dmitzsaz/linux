@@ -318,6 +318,7 @@ impl Context {
     /// scheduler page and the work storage holding the job-list head. A retained
     /// physical queue keeps these after dropping the context itself.
     pub(crate) fn quarantine_pages(&self) {
+        if !self.is_published() { return; }
         if let Some(reservation) = &self.retained_pages { reservation.pages(self.retain_firmware_pages()); }
     }
     pub(crate) fn retain_firmware_pages(&self) -> FirmwarePages {
