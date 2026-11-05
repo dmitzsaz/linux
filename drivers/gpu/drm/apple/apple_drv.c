@@ -169,7 +169,8 @@ static int apple_drm_fbdev_probe(struct drm_fb_helper *helper,
 		if (t8132_ext_crtc(crtc))
 			continue;
 		dcp = platform_get_drvdata(to_apple_crtc(crtc)->dcp);
-		if (dcp->fw_compat == DCP_FIRMWARE_H17P) {
+		if (dcp->fw_compat == DCP_FIRMWARE_H17P ||
+		    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 			/*
 			 * H17P applies the stored fourth byte as straight alpha,
 			 * the H17G (M5) profile too: an XRGB console with X = 0
@@ -796,6 +797,7 @@ static int apple_connector_create(struct drm_device *drm,
 				  int connector_type, bool attach_fwnode)
 {
 	struct apple_connector *connector;
+	struct apple_dcp *dcp_data = platform_get_drvdata(dcp);
 	int ret;
 
 	connector = kzalloc_obj(*connector);
@@ -816,13 +818,14 @@ static int apple_connector_create(struct drm_device *drm,
 				 connector_type);
 	if (ret)
 		goto err_free;
-	ret = drm_connector_attach_vrr_capable_property(&connector->base);
-	if (ret)
-		goto err_cleanup;
-	ret = apple_connector_attach_hdr(&connector->base,
-					 dcp_fw_compat_is_desktop(dcp));
-	if (ret)
-		goto err_cleanup;
+	if (dcp_data->fw_compat != DCP_FIRMWARE_V_27_0) {
+		ret = drm_connector_attach_vrr_capable_property(&connector->base);
+		if (ret)
+			goto err_cleanup;
+		ret = apple_connector_attach_hdr(&connector->base, dcp_fw_compat_is_desktop(dcp));
+		if (ret)
+			goto err_cleanup;
+	}
 
 	connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 	connector->connected = false;
@@ -875,9 +878,11 @@ static int apple_probe_per_dcp(struct device *dev,
 	 * Interchange scanout has not been qualified with the H17P firmware
 	 * (T8140 and T8122): advertise linear framebuffers only there.
 	 */
-	supports_interchange = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
+	supports_interchange = (dcp_data->fw_compat != DCP_FIRMWARE_H17P &&
+				 dcp_data->fw_compat != DCP_FIRMWARE_V_27_0);
 	/* The H17P swap surface has no is_premultiplied flag. */
-	supports_premultiplied = dcp_data->fw_compat != DCP_FIRMWARE_H17P;
+	supports_premultiplied = (dcp_data->fw_compat != DCP_FIRMWARE_H17P &&
+				 dcp_data->fw_compat != DCP_FIRMWARE_V_27_0);
 	if (bitmap_empty(iomfb_surfaces, DCP_MAX_PLANES))
 		return dev_err_probe(dev, -EINVAL, "No usable display surfaces\n");
 
@@ -918,7 +923,8 @@ static int apple_probe_per_dcp(struct device *dev,
 							supports_l10r,
 							supports_xrgb2101010,
 							dcp_data->hw.iomfb_method_profile ==
-								DCP_IOMFB_METHODS_H17G,
+								DCP_IOMFB_METHODS_H17G ||
+							dcp_data->fw_compat == DCP_FIRMWARE_V_27_0,
 							plane_type, interchange,
 							supports_premultiplied);
 		}
@@ -948,7 +954,7 @@ static int apple_probe_per_dcp(struct device *dev,
 
 	drm_crtc_helper_add(&crtc->base, &apple_crtc_helper_funcs);
 	/* T8132 has no qualified CTM transaction. */
-	if (!iomfb_is_m4(dcp_data)) {
+	if (!iomfb_is_m4(dcp_data) && dcp_data->fw_compat != DCP_FIRMWARE_V_27_0) {
 		unsigned int gamma_size = dcp_gamma_lut_size(dcp);
 
 		drm_crtc_enable_color_mgmt(&crtc->base, 0, true, gamma_size);
@@ -1010,6 +1016,7 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		struct apple_encoder *enc;
 		unsigned int port_idx = idx % nr_ports;
 		bool secondary = idx >= nr_ports;
+		bool color_caps = true;
 		u32 mask = 0;
 
 		/* Only a failed T8122 dcpext could drive it: no connector. */
@@ -1039,12 +1046,19 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 			return ret;
 		}
 
-		ret = drm_connector_attach_vrr_capable_property(&connector->base);
-		if (ret)
-			return ret;
-		ret = apple_connector_attach_hdr(&connector->base, false);
-		if (ret)
-			return ret;
+		for (i = 0; i < num_dcp; i++)
+			if (dcp_typec_port_has_candidate(port_idx, dcp[i]) &&
+			    ((struct apple_dcp *)platform_get_drvdata(dcp[i]))->fw_compat ==
+			    DCP_FIRMWARE_V_27_0)
+				color_caps = false;
+		if (color_caps) {
+			ret = drm_connector_attach_vrr_capable_property(&connector->base);
+			if (ret)
+				return ret;
+			ret = apple_connector_attach_hdr(&connector->base, false);
+			if (ret)
+				return ret;
+		}
 
 		connector->base.polled = DRM_CONNECTOR_POLL_HPD;
 		connector->connected = false;
