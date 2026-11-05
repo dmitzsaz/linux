@@ -252,6 +252,21 @@ static const struct hw_info t8140_hw = {
 	.root_bus_only		= true,
 };
 
+/*
+ * T8142 has the T8140 port layout and SID-indexed RID table. The boot loader
+ * powers and trains the ports; the driver adopts a link that is up and keeps
+ * the loader's clock policy. Unlike T8140, downstream config space is open.
+ */
+static const struct hw_info t8142_hw = {
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.max_rid2sid		= 19,
+	.sid_indexed_rid2sid	= true,
+	.retain_clocks		= true,
+};
+
 static const struct hw_info t8103_pciec_hw = {
 	.port_msiaddr		= PORT_MSIADDR,
 	.port_perst		= PORT_PERST,
@@ -3942,6 +3957,7 @@ static const struct of_device_id apple_pcie_of_match[] = {
 	/* T8132 currently inherits controller and PHY setup from m1n1. */
 	{ .compatible = "apple,t8132-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
+	{ .compatible = "apple,t8142-pcie",	.data = &t8142_hw },
 	{ .compatible = "apple,t8140-pcie",	.data = &t8140_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
