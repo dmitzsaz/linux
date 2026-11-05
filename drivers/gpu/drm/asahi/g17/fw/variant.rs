@@ -34,6 +34,8 @@ pub(crate) enum InitGraph {
     G17P,
     /// One instance carrying both roles, with the 25G83 layouts ([`super::initdata::v25g83`]).
     V25G83,
+    /// Two coprocessors, HAL300 26A434.
+    Hal300,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -98,6 +100,11 @@ pub(crate) enum Firmware {
     /// One of these exact loaded images. The loader's `apple,firmware-version` is only
     /// a candidate-ordering hint because multiple OS releases can share an iBoot string.
     Identified(&'static [Build]),
+    /// Two independently identified images with relocated DATA pointers.
+    Pair {
+        images: &'static [[crate::fwid::FirmwareBuild; 1]; 2],
+        variant: &'static Variant,
+    },
 }
 
 /// The A18 Pro firmware (26A428).
@@ -167,4 +174,18 @@ const _: () = {
     assert!(super::queue::PointerBlock::valid_layout(&V26A428.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25G83.pointers));
     assert!(super::queue::PointerBlock::valid_layout(&V25F84.pointers));
+};
+
+/// T8142 HAL300 26A434.
+pub(crate) const V26A434: Variant = Variant {
+    graph: InitGraph::Hal300,
+    init_ack: InitAck::Message,
+    registration: QueueRegistration::Firmware,
+    mcache: false,
+    few_primitives: false,
+    ray_traversal: false,
+    fragment_busy: true,
+    programs: super::render::RegisterPrograms::G17G,
+    compute: super::compute::ComputeProgram::G17G,
+    ..V26A428
 };

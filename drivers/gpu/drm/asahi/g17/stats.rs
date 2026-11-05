@@ -35,6 +35,6 @@ impl Reader {
 pub(super) const fn max_age_ns(graph: InitGraph) -> u64 {
     match graph {
         InitGraph::V25G83 => 16_000_000,
-        InitGraph::G17P => 32_000_000,
+        InitGraph::G17P | InitGraph::Hal300 => 32_000_000,
     }
 }

@@ -114,6 +114,8 @@ pub(super) trait Queues {
 /// Live shared-memory operations. The handshake word uses aligned 32-bit accesses; transitions
 /// check the expected value, issue a full barrier, store the next value, then another barrier.
 pub(super) trait Memory {
+    /// HAL300 recovery keeps firmware-owned producer and timestamp state.
+    fn fail_all_policy(&self) -> bool { false }
     fn recovery_state(&self) -> Result<u32>;
     fn host_recovery(&self) -> Result<u32>;
     fn fault_sources(&self) -> Result<Sources>;

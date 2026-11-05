@@ -42,6 +42,7 @@ mod feed;
 mod fence;
 mod freelist;
 pub(crate) mod fw;
+pub(crate) mod hal300;
 pub(crate) mod hazard;
 mod ids;
 mod initdata;
@@ -405,6 +406,14 @@ impl rtkit::Operations for RoleOps {
             iova,
             map: CrashLogMap::FirmwareData(data_segment::DataSegmentLog::map(
                 &data.shared.dev,
+                if data.shared.variant.graph == fw::variant::InitGraph::Hal300 {
+                    match data.role {
+                        Role::Primary => c"gfx-data",
+                        Role::Secondary => c"gfx1-data",
+                    }
+                } else {
+                    c"fw-data"
+                },
                 iova,
                 size,
             )?),
@@ -653,6 +662,7 @@ struct Firmware {
     render_rings: Arc<kick::RenderRings>,
     render_ids: Arc<freelist::RenderIds>,
     init: initdata::InitData,
+    hal300: Option<hal300::Prepared>,
     _render_global: mmu::Vm,
     _pm_metrics: Arc<KernelObject>,
     uat: Arc<mmu::Uat>,
@@ -1216,11 +1226,17 @@ impl Gpu {
         let alternate = cfg.core_layout.cores.is_some_and(|(clusters, cores)| {
             clusters == id.num_clusters
                 && cores != active_cores
-                && cfg.core_layout.alternate_core_masks.is_some_and(|(slots, enabled)| {
-                    id.num_cores == slots
-                        && id.core_masks.len() == clusters as usize
-                        && id.core_masks.iter().all(|mask| mask.count_ones() == enabled)
-                })
+                && cfg
+                    .core_layout
+                    .alternate_core_masks
+                    .is_some_and(|(slots, enabled)| {
+                        id.num_cores == slots
+                            && id.core_masks.len() == clusters as usize
+                            && id
+                                .core_masks
+                                .iter()
+                                .all(|mask| mask.count_ones() == enabled)
+                    })
         });
         if cfg
             .core_layout
@@ -1331,6 +1347,24 @@ impl Gpu {
         let builds = match firmware {
             fw::variant::Firmware::Fixed(variant) => return Ok(variant),
             fw::variant::Firmware::Identified(builds) => builds,
+            fw::variant::Firmware::Pair { images, variant } => {
+                for (index, (text, data)) in
+                    [(c"fw-text", c"gfx-data"), (c"fw1-text", c"gfx1-data")]
+                        .into_iter()
+                        .enumerate()
+                {
+                    let text = hal300::region(dev.as_ref().as_ref(), text)?;
+                    let data = hal300::region(dev.as_ref().as_ref(), data)?;
+                    crate::fwid::identify_relocated(
+                        dev.as_ref().as_ref(),
+                        text,
+                        data,
+                        &images[index],
+                        0x23c,
+                    )?;
+                }
+                return Ok(variant);
+            }
         };
         let version = Self::os_firmware_version(dev);
         // iBoot strings can be shared by OS releases. Prefer the reported release's
@@ -1416,6 +1450,15 @@ impl Gpu {
             GFP_KERNEL,
         )?;
 
+        let is_hal300 = shared.variant.graph == fw::variant::InitGraph::Hal300;
+        let prepared = if is_hal300 {
+            let sgx = pdev.resource_by_name(c"sgx").ok_or(EINVAL)?.start() as u64;
+            let inputs = hal300::Inputs::load(dev, sgx, shared.active_cores)?;
+            Some(hal300::Prepared::new(dev, &uat, &inputs)?)
+        } else {
+            None
+        };
+
         // The firmware only samples the kernel lower root's top-level entries when it starts, so
         // everything it uses there must be mapped first.
         let pm_metrics = KernelObject::new(
@@ -1481,12 +1524,15 @@ impl Gpu {
                 render_rings: kick::RenderRings::new()?,
                 render_ids: Arc::new(freelist::RenderIds::new(), GFP_KERNEL)?,
                 init: initdata::InitData::new(),
+                hal300: prepared,
                 _render_global: render_global,
                 _pm_metrics: Arc::new(pm_metrics, GFP_KERNEL)?,
                 uat,
             }),
             GFP_KERNEL,
         )?;
+        let mut firmware = hal300::Session::new(firmware, is_hal300)?;
+        firmware.starting();
         let session = &mut *firmware;
         session.primary.boot()?;
         if let Some(secondary) = session.secondary.as_mut() {
@@ -1494,20 +1540,30 @@ impl Gpu {
         }
         // The firmware built its root and kernel-window tables while booting.
         session.uat.invalidate_reserved_tables();
-        let root_entries = match cfg.adopt_root_entries {
-            true => Some(session.uat.adopt_firmware_root_entries()?),
-            false => None,
+        let root_entries = if is_hal300 {
+            let l2 = hal300::region(dev.as_ref().as_ref(), c"shared-l2")?;
+            Some(session.uat.check_published_window(l2.start)?)
+        } else {
+            match cfg.adopt_root_entries {
+                true => Some(session.uat.adopt_firmware_root_entries()?),
+                false => None,
+            }
         };
-        session.init.build(
-            dev,
-            cfg,
-            &session.uat,
-            &session._render_global,
-            &session._pm_metrics,
-            shared.clusters,
-            shared.active_cores,
-            shared.variant,
-        )?;
+        if let Some(prepared) = session.hal300.as_mut() {
+            prepared.install(dev, &session.uat, &session._pm_metrics, &mut session.init)?;
+        } else {
+            session.init.build(
+                dev,
+                cfg,
+                &session.uat,
+                &session._render_global,
+                &session._pm_metrics,
+                shared.clusters,
+                shared.active_cores,
+                shared.variant,
+            )?;
+        }
+        session.hal300 = None;
         if let Some(root_entries) = root_entries {
             session.uat.confirm_firmware_root_entries(root_entries)?;
         }
@@ -1517,7 +1573,9 @@ impl Gpu {
             session.bridge.regs.clone(),
             shared.variant.registration,
         )?;
-        session.uat.mirror_secondary_root()?;
+        if !is_hal300 {
+            session.uat.mirror_secondary_root()?;
+        }
         if cfg.fabric_bridge {
             session.bridge.regs.enable_g17_gating()?;
         }
@@ -1542,7 +1600,9 @@ impl Gpu {
                 secondary.notify(MSG_POWER_ON_DONE)?;
             }
         }
-        if shared.variant.opening_record {
+        if is_hal300 {
+            hal300::finish_start(session)?;
+        } else if shared.variant.opening_record {
             Self::wait_for_opening(
                 dev,
                 &session.init,
@@ -1561,7 +1621,7 @@ impl Gpu {
             .uat
             .activate_render_context(&session._render_global)?;
         dev_dbg!(dev.as_ref(), "bring-up: firmware running\n");
-        Ok(firmware)
+        Ok(firmware.into_inner())
     }
 
     /// Waits for a firmware that sends no acknowledgment message to accept its

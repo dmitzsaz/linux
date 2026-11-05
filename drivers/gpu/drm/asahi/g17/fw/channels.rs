@@ -266,6 +266,7 @@ pub(crate) enum ControlRecord {
     SchedulerStateRelease(SchedulerStateRelease),
     FreeListRelease(FreeListRelease),
     ContextKill(ContextKill),
+    UscCacheInvalidate(UscCacheInvalidate),
 }
 
 impl ControlRecord {
@@ -276,6 +277,7 @@ impl ControlRecord {
             Self::SchedulerStateRelease(_) => DeviceControlOp::SchedulerStateRelease,
             Self::FreeListRelease(_) => DeviceControlOp::FreeListRelease,
             Self::ContextKill(_) => DeviceControlOp::ContextKill,
+            Self::UscCacheInvalidate(_) => DeviceControlOp::UscCacheInvalidate,
         }
     }
 
@@ -287,6 +289,7 @@ impl ControlRecord {
             Self::SchedulerStateRelease(record) => core::ptr::from_ref(record).cast(),
             Self::FreeListRelease(record) => core::ptr::from_ref(record).cast(),
             Self::ContextKill(record) => core::ptr::from_ref(record).cast(),
+            Self::UscCacheInvalidate(record) => core::ptr::from_ref(record).cast(),
         };
         // SAFETY: Each variant has a statically checked size of 0x40 bytes,
         // contains only initialized integer fields with no implicit padding,
@@ -309,6 +312,8 @@ pub(crate) enum DeviceControlOp {
     FreeListRelease = 0x2e,
     /// Stop the queues named by a closed logical scheduler.
     ContextKill = 0x29,
+    /// Invalidate one USC cache domain of an application context.
+    UscCacheInvalidate = 0x33,
 }
 
 impl DeviceControlOp {
@@ -585,5 +590,30 @@ mod tests {
     fn an_unrecognized_type_7_layout_stays_unknown() {
         assert_eq!(record(&[7, 1, 2, 128, 0x300]).decode(), Ok(Event::Unknown(7)));
         assert_eq!(record(&[7, 1, 2, 9, 0x301]).decode(), Ok(Event::Unknown(7)));
+    }
+}
+
+/// HAL300 USC instruction-cache invalidation for one application context.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct UscCacheInvalidate {
+    opcode: u32,
+    domain: u32,
+    context: u32,
+    reserved: [u8; 0x34],
+}
+static_assert!(size_of::<UscCacheInvalidate>() == DEVICE_CONTROL_RECORD_SIZE);
+
+impl UscCacheInvalidate {
+    /// Domains in the order of the native selectors.
+    pub(crate) const DOMAINS: [u32; 3] = [2, 0, 1];
+
+    pub(crate) const fn new(domain: u32, context: u32) -> Self {
+        Self {
+            opcode: DeviceControlOp::UscCacheInvalidate as u32,
+            domain,
+            context,
+            reserved: [0; 0x34],
+        }
     }
 }
