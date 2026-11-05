@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: GPL-2.0+ OR MIT
+/* J704 IMX958 camera. The loader supplies the resident firmware mappings. */
+
+/ {
+	aliases {
+		isp = &isp;
+	};
+
+	reserved-memory {
+		/* IOVA only: the host backs main memory after resident DATA. */
+		isp_heap: isp-heap {
+			iommu-addresses = <&isp 0 0 0 0x1700000>;
+		};
+	};
+};
+
+&isp {
+	status = "okay";
+	power-domains = <&ps_isp_sys>, <&ps_isp_cpu>, <&ps_isp_cpu_core0>,
+			<&ps_isp_fe>, <&ps_isp_dprx>, <&ps_isp_sts0>,
+			<&ps_isp_be>, <&ps_isp_clr>, <&ps_ispsens0>, <&ps_ispsens1>;
+	memory-region = <&isp_heap>;
+	memory-region-names = "heap";
+	apple,dart-vm-size = /bits/ 64 <0xee000000>;
+	apple,platform-id = <0x3a>;
+
+	sensor-presets {
+		/* 1920x1080 */
+		preset0 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1920 1080>;
+			apple,crop = <0 0 1920 1080>;
+		};
+		/* 1280x720 */
+		preset1 {
+			apple,config-index = <5>;
+			apple,input-size = <1920 2160>;
+			apple,output-size = <1280 720>;
+			apple,crop = <0 0 1280 720>;
+		};
+	};
+};
+
+&isp_dart0 {
+	status = "okay";
+};
+
+&isp_dart1 {
+	status = "okay";
+};
+
+&isp_dart2 {
+	status = "okay";
+};
