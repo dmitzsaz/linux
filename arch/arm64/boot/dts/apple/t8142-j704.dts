@@ -360,6 +360,11 @@
 
 &ps_st0_aus5 {
 	status = "okay";
+	/*
+	 * The boot loader trains the APCIe links; the kernel cannot bring the
+	 * controller back from a power-off, so it stays on through sleep.
+	 */
+	apple,sleep-retained;
 };
 
 &apcie_dart0 {
