@@ -3647,7 +3647,7 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	    DCP_IOMFB_METHODS_H17P_EXTERNAL) {
 		dev_dbg(dcp->dev, "inheriting the bootloader's display mode\n");
 		complete_set_digital_out_mode(dcp, NULL, cookie);
-	} else if (mode->vrr &&
+	} else if (DCP_FW_VER < DCP_FW_VERSION(27, 0, 0) && mode->vrr &&
 		   dcp->hw.iomfb_method_profile !=
 		   DCP_IOMFB_METHODS_H17P_EXTERNAL)
 		dcp_set_adaptive_sync(dcp,
@@ -3698,9 +3698,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 			dev_info(dcp->dev, "set_digital_out_mode returned %#x\n",
 				 READ_ONCE(cookie->status));
 	}
+	if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0) &&
+	    READ_ONCE(cookie->status)) {
+		kref_put(&cookie->refcount, release_wait_cookie);
+		return -EREMOTEIO;
+	}
 	kref_put(&cookie->refcount, release_wait_cookie);
-	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled;
-	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL)
+	dcp->vrr_enabled = mode->vrr && crtc_state->vrr_enabled &&
+			   dcp->fw_compat != DCP_FIRMWARE_V_27_0;
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		dcp_external_hdr_hints(dcp, dcp->output_pq);
 
 	return 0;
@@ -3954,7 +3961,9 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 			mat.matrix[0] = mat.matrix[4] = mat.matrix[8] = 1LLU << 32;
 		}
 
-#if DCP_FW_H17(DCP_FW_VER)
+#if DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0)
+		do_swap(dcp, NULL, NULL);
+#elif DCP_FW_H17(DCP_FW_VER)
 		iomfb_set_matrix(dcp, false, &mat, dcp_pre_swap_a428, NULL);
 #elif DCP_FW_DESKTOP_26(DCP_FW_VER)
 		dcp->desktop->gamma_pending = dcp_gamma_update(dcp, crtc_state);
