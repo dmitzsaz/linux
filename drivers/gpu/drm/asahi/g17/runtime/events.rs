@@ -130,6 +130,7 @@ impl recovery::Host for Service<'_> {
 }
 
 impl recovery::Memory for Service<'_> {
+    fn native_recovery(&self) -> bool { self.firmware.init.is_hal300() }
     fn recovery_state(&self) -> Result<u32> {
         self.firmware.init.recovery_state()
     }
@@ -251,6 +252,70 @@ impl recovery::Queues for Service<'_> {
     }
     fn rescan_compute(&mut self) -> Result {
         self.firmware.scan_compute(None, self.deferred)
+    }
+    fn fail_qid_owners(&mut self, qids: u128, error: Error) -> usize {
+        const MAX_VMS: usize = 64;
+        let mut statuses: [Option<Arc<VmStatus>>; MAX_VMS] = core::array::from_fn(|_| None);
+        let mut count = 0;
+        let mut unresolved = false;
+        for qid in 0..128u8 {
+            if qids & (1u128 << qid) == 0 {
+                continue;
+            }
+            let mut found = false;
+            recovery::Queues::visit_owners(self, qid, &mut |status| {
+                found = true;
+                if statuses[..count].iter().flatten().any(|known| Arc::ptr_eq(known, status)) {
+                    return;
+                }
+                if let Some(slot) = statuses.get_mut(count) {
+                    *slot = Some(status.clone());
+                    count += 1;
+                } else { unresolved = true; }
+            });
+            unresolved |= !found;
+        }
+        if unresolved { return 0; }
+        for status in statuses[..count].iter().flatten() {
+            status.record(error);
+            let result = self
+                .firmware
+                .settle_render_vm(status, error, self.deferred)
+                .and_then(|()| self.firmware.queues.fail_compute_vm(status, error, self.deferred));
+            self.settlement_error = self.settlement_error.or(result.err());
+        }
+        count
+    }
+    fn render_qids(&self) -> u128 {
+        self.firmware.queues.render_qids_mask()
+    }
+    fn scrub_render_tpc(&mut self, qids: u128) -> usize {
+        self.firmware.queues.scrub_render_tpc(qids)
+    }
+    fn fail_all_in_flight(&mut self, error: Error) {
+        // Distinct VMs owning any retained render pair or compute queue.
+        const MAX_VMS: usize = 64;
+        let mut statuses: [Option<Arc<VmStatus>>; MAX_VMS] = core::array::from_fn(|_| None);
+        let mut count = 0;
+        for qid in 0..128u8 {
+            recovery::Queues::visit_owners(self, qid, &mut |status| {
+                if statuses[..count].iter().flatten().any(|known| Arc::ptr_eq(known, status)) {
+                    return;
+                }
+                if let Some(slot) = statuses.get_mut(count) {
+                    *slot = Some(status.clone());
+                    count += 1;
+                }
+            });
+        }
+        for status in statuses[..count].iter().flatten() {
+            status.record(error);
+            let result = self
+                .firmware
+                .settle_render_vm(status, error, self.deferred)
+                .and_then(|()| self.firmware.queues.fail_compute_vm(status, error, self.deferred));
+            self.settlement_error = self.settlement_error.or(result.err());
+        }
     }
     fn release_retired_compute(&mut self) {
         let result = self.firmware.release_compute_witnesses(self.deferred);
