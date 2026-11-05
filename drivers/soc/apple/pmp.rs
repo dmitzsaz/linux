@@ -638,8 +638,14 @@ impl rtkit::Operations for PmpData {
     }
 
     fn crashed(data: <Self::Data as ForeignOwnable>::Borrowed<'_>, _crashlog: Option<&[u8]>) {
+        // SRAM status and device ACKs can survive a firmware crash.
+        // SAFETY: the owner was registered before starting this RTKit session.
+        unsafe { bindings::apple_pmp_report_fail_owner(data.dev.as_raw()) };
         data.fail_display(EIO);
-        dev_err!(data.dev, "PMP firmware crashed");
+        dev_err!(
+            data.dev,
+            "PMP firmware crashed; DCS/fabric control lost, reboot required"
+        );
     }
 }
 
@@ -750,6 +756,9 @@ impl platform::Driver for PmpDriver {
             unsafe { pdev.dma_set_mask_and_coherent(mask)? };
         }
         let data = PmpData::new(pdev)?;
+        // Publish health before RTKit can crash, even before the report probes.
+        // SAFETY: registration is managed by this bound device's devres.
+        to_result(unsafe { bindings::apple_pmp_report_register_owner(dev.as_raw()) })?;
         let pmp_mmio = data.pmp_mmio.access(pdev.as_ref())?.as_view();
         let asc_mmio = data.asc_mmio.access(pdev.as_ref())?.as_view();
         let node = dev.fwnode().ok_or(EIO)?;
@@ -814,6 +823,8 @@ impl platform::Driver for PmpDriver {
     }
 
     fn unbind<'bound>(_dev: &'bound platform::Device<Core<'_>>, this: Pin<&Self::Data<'bound>>) {
+        // SAFETY: the managed owner stays registered until devres teardown.
+        unsafe { bindings::apple_pmp_report_fail_owner(this.0.dev.as_raw()) };
         this.0.fail_display(ENODEV);
     }
 }

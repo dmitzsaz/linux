@@ -92,6 +92,8 @@ config APPLE_PMP_REPORT_START_KUNIT_TEST
 	depends on APPLE_PMP_REPORT && KUNIT=y
 	default KUNIT_ALL_TESTS
 	help
+	  Also check that an RTKit crash or owner removal invalidates stale
+	  report acknowledgments and stops deferred report writes.
 	  Injects faults into the start of a halted PMP (APPLE_PMP_REPORT):
 	  failed checks, a PMP driver that does not bind, a PMP that does not
 	  report ready or acknowledge its startup requests, consumers that
