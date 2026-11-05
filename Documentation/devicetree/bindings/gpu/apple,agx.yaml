@@ -21,6 +21,7 @@ properties:
           - apple,agx-t6041
           - apple,agx-t8132
           - apple,agx-t8140
+          - apple,agx-t8142
       - items:
           - enum:
               - apple,agx-g13c
@@ -72,8 +73,8 @@ properties:
       - const: pagetables
       - const: handoff
       - enum: [hw-cal-a, shared-l2, fw-data]
-      - enum: [hw-cal-b, fw-text, l2-pagetables]
-      - enum: [globals, fw-data, fw-text]
+      - enum: [hw-cal-b, fw-text, l2-pagetables, gfx-data]
+      - enum: [globals, fw-data, fw-text, gfx1-data]
 
   apple,clpc:
     $ref: /schemas/types.yaml#/definitions/phandle
@@ -275,6 +276,46 @@ allOf:
       properties:
         compatible:
           contains:
+            const: apple,agx-t8142
+    then:
+      properties:
+        reg:
+          items:
+            - description: GFX coprocessor control registers
+            - description: GPU block MMIO registers
+        reg-names:
+          items:
+            - const: asc
+            - const: sgx
+        mboxes:
+          items:
+            - description: GFX coprocessor mailbox
+            - description: GFX1 coprocessor mailbox
+        memory-region:
+          items:
+            - description: GPU MMU TTBs
+            - description: GPU MMU page tables
+            - description: Shared VM management handoff
+            - description: Shared firmware kernel-window page tables
+            - description: GFX firmware DATA segment
+            - description: GFX1 firmware DATA segment
+        memory-region-names:
+          items:
+            - const: ttbs
+            - const: pagetables
+            - const: handoff
+            - const: shared-l2
+            - const: gfx-data
+            - const: gfx1-data
+      required:
+        - power-domains
+        - reg-names
+        - memory-region-names
+        - operating-points-v2
+  - if:
+      properties:
+        compatible:
+          contains:
             const: apple,agx-t6040
     then:
       properties:
@@ -369,6 +410,7 @@ allOf:
                 - apple,agx-t6041
                 - apple,agx-t8132
                 - apple,agx-t8140
+                - apple,agx-t8142
     then:
       properties:
         reg:
