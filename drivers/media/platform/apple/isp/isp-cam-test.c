@@ -5,6 +5,30 @@
 #include <kunit/device.h>
 #include "isp-ipc.h"
 
+static void isp_test_p010_sensor_support(struct kunit *test)
+{
+	struct apple_isp_hw hw = { .fw_abi = ISP_FW_ABI_H17 };
+	struct apple_isp *isp = kunit_kzalloc(test, sizeof(*isp), GFP_KERNEL);
+	struct isp_format fmt = { .version = 0x958 };
+
+	KUNIT_ASSERT_NOT_NULL(test, isp);
+	isp->hw = &hw;
+	isp->fmts[0] = fmt;
+
+	/* The same sensor/protocol works across ISP generations. */
+	hw.gen = ISP_GEN_T6040;
+	KUNIT_EXPECT_TRUE(test, isp_supports_p010(isp));
+	hw.gen = ISP_GEN_T8142;
+	KUNIT_EXPECT_TRUE(test, isp_supports_p010(isp));
+	hw.gen = ISP_GEN_T8140;
+	KUNIT_EXPECT_TRUE(test, isp_supports_p010(isp));
+	isp->fmts[0].version = 0x558;
+	KUNIT_EXPECT_FALSE(test, isp_supports_p010(isp));
+	isp->fmts[0].version = 0x958;
+	hw.fw_abi = ISP_FW_ABI_LEGACY;
+	KUNIT_EXPECT_FALSE(test, isp_supports_p010(isp));
+}
+
 static void isp_test_sensor_geometry(struct kunit *test)
 {
 	struct cmd_ch_camera_config config = {
@@ -662,6 +686,7 @@ static struct kunit_case isp_cam_test_cases[] = {
 	KUNIT_CASE(isp_test_optional_setfile_continues_setup),
 	KUNIT_CASE(isp_test_command_ack_failures),
 	KUNIT_CASE(isp_test_sensor_geometry),
+	KUNIT_CASE(isp_test_p010_sensor_support),
 	KUNIT_CASE(isp_test_sensor_config_list),
 	KUNIT_CASE(isp_test_sensor_config_failure),
 	KUNIT_CASE(isp_test_preview_stream),
