@@ -39,6 +39,15 @@ enum ycc_change {
 	YCC_INTERLACED,
 	YCC_REPEAT,
 	YCC_RGB_UNSAFE,
+	YCC_TIMING_ID,
+	YCC_TIMING_SCORE,
+	YCC_TIMING_NO_VIRTUAL,
+	YCC_TIMING_DUP_VIRTUAL,
+	YCC_TIMING_DUP_HORIZ,
+	YCC_TIMING_DUP_VERT,
+	YCC_TIMING_HORIZ_ACTIVE,
+	YCC_TIMING_VERT_RATE,
+	YCC_TIMING_NO_HRATE,
 };
 
 struct ycc_blob {
@@ -135,9 +144,13 @@ static void ycc_rgb(struct ycc_blob *b, bool pq)
 	ycc_bool(b, "IsVirtual", false);
 }
 
-static void ycc_dimension(struct ycc_blob *b, bool vertical, u32 active, u32 rate)
+static void ycc_dimension(struct ycc_blob *b, bool vertical, u32 active, u32 rate,
+			  enum ycc_change change)
 {
 	bool uhd = active == 3840 || active == 4096;
+	bool missing = !vertical && change == YCC_TIMING_NO_HRATE;
+	bool duplicate = vertical ? change == YCC_TIMING_VERT_RATE :
+		change == YCC_TIMING_HORIZ_ACTIVE;
 	u32 total = vertical ? (active == 2160 ? 2250 : 1125) :
 		uhd ? (rate == 50U << 16 ? 5280 : 4400) : 2200;
 	u32 porch = vertical ? (active == 2160 ? 8 : 4) :
@@ -150,14 +163,17 @@ static void ycc_dimension(struct ycc_blob *b, bool vertical, u32 active, u32 rat
 		sync = vertical ? 5 : 32;
 	}
 	ycc_key(b, vertical ? "VerticalAttributes" : "HorizontalAttributes");
-	ycc_tag(b, 1, 7);
+	ycc_tag(b, 1, 7 - missing + duplicate);
 	ycc_int(b, "Active", active);
 	ycc_int(b, "Total", total);
 	ycc_int(b, "FrontPorch", porch);
 	ycc_int(b, "SyncWidth", sync);
-	ycc_int(b, "PreciseSyncRate", vertical ? rate : 0);
+	if (!missing)
+		ycc_int(b, "PreciseSyncRate", vertical ? rate : 0);
 	ycc_int(b, "SyncPolarity", 1);
 	ycc_int(b, "PixelRepetition", 0);
+	if (duplicate)
+		ycc_int(b, vertical ? "PreciseSyncRate" : "Active", vertical ? rate - 1 : 3839);
 }
 
 static void ycc_timing(struct ycc_blob *b, u32 id, u32 width, u32 rate,
@@ -167,17 +183,21 @@ static void ycc_timing(struct ycc_blob *b, u32 id, u32 width, u32 rate,
 	bool unsafe = change == YCC_UNSAFE || change == YCC_OUTPUT_UNSAFE ||
 		change == YCC_RGB_UNSAFE;
 	bool dsc = change == YCC_DSC || change == YCC_OUTPUT_DSC;
+	bool missing_virtual = change == YCC_TIMING_NO_VIRTUAL;
+	bool extra = change >= YCC_TIMING_ID && change <= YCC_TIMING_DUP_VERT &&
+		!missing_virtual;
 
-	ycc_tag(b, 1, 10 + encoding);
+	ycc_tag(b, 1, 10 + encoding - missing_virtual + extra);
 	ycc_int(b, "ID", id);
 	ycc_int(b, "Score", id);
-	ycc_bool(b, "IsVirtual", false);
+	if (!missing_virtual)
+		ycc_bool(b, "IsVirtual", false);
 	ycc_bool(b, "IsPreferred", rgb && rate == 30U << 16);
 	ycc_bool(b, "IsInterlaced", change == YCC_INTERLACED);
-	ycc_dimension(b, false, width, rate);
+	ycc_dimension(b, false, width, rate, change);
 	if (change == YCC_REPEAT)
 		put_unaligned_le64(1, b->data + b->size - 8);
-	ycc_dimension(b, true, width >= 3840 ? 2160 : 1080, rate);
+	ycc_dimension(b, true, width >= 3840 ? 2160 : 1080, rate, change);
 	ycc_key(b, "ColorModes");
 	ycc_tag(b, 2, rgb + ycc + pq);
 	if (rgb)
@@ -203,6 +223,16 @@ static void ycc_timing(struct ycc_blob *b, u32 id, u32 width, u32 rate,
 	}
 	if (encoding)
 		ycc_int(b, "ValidPixelEncodings", change == YCC_WRONG_ENCODING ? 8 : 2);
+	if (change == YCC_TIMING_ID)
+		ycc_int(b, "ID", 28);
+	if (change == YCC_TIMING_SCORE)
+		ycc_int(b, "Score", 1);
+	if (change == YCC_TIMING_DUP_VIRTUAL)
+		ycc_bool(b, "IsVirtual", false);
+	if (change == YCC_TIMING_DUP_HORIZ)
+		ycc_dimension(b, false, width, rate, YCC_NORMAL);
+	if (change == YCC_TIMING_DUP_VERT)
+		ycc_dimension(b, true, 2160, rate, YCC_NORMAL);
 }
 
 static struct ycc_blob *ycc_begin(struct kunit *test, unsigned int count)
@@ -353,12 +383,36 @@ static void dcp_ycc_truncated_test(struct kunit *test)
 	}
 }
 
+static void dcp_ycc_timing_identity_test(struct kunit *test)
+{
+	enum ycc_change change;
+	unsigned int rgb;
+
+	for (change = YCC_TIMING_ID; change <= YCC_TIMING_NO_HRATE; change++) {
+		for (rgb = 0; rgb < 2; rgb++) {
+			struct ycc_blob *b = ycc_begin(test, 1);
+			struct dcp_display_mode *m;
+			unsigned int count;
+
+			KUNIT_ASSERT_NOT_NULL(test, b);
+			ycc_timing(b, 147, 3840, 60U << 16, change, rgb, true, false);
+			m = ycc_parse(test, b, true, &count);
+			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, m);
+			KUNIT_EXPECT_EQ_MSG(test, count, rgb, "change=%d rgb=%u", change, rgb);
+			if (count)
+				KUNIT_EXPECT_EQ(test, m[0].color_mode_id, 176U);
+			kfree(m);
+		}
+	}
+}
+
 static struct kunit_case dcp_ycc_cases[] = {
 	KUNIT_CASE(dcp_ycc_catalog_test),
 	KUNIT_CASE(dcp_ycc_restrictions_test),
 	KUNIT_CASE(dcp_ycc_rgb_hdr_test),
 	KUNIT_CASE(dcp_ycc_unsafe_rgb_test),
 	KUNIT_CASE(dcp_ycc_truncated_test),
+	KUNIT_CASE(dcp_ycc_timing_identity_test),
 	{}
 };
 
