@@ -69,15 +69,20 @@ static unsigned int dropped_test_refs(struct drm_framebuffer *fb)
 	return kref_read(&fb->base.refcount);
 }
 
-/* As iomfb_atomic_start() and the accepted submit reply of dcp_swapped(). */
+/* As iomfb_atomic_start(), followed by acceptance unless the reply is held. */
 static void dropped_test_start(struct apple_dcp *dcp, struct iomfb_transaction *transaction)
 {
 	struct dropped_present *p = container_of(transaction, struct dropped_present, transaction);
 
 	dcp->iomfb.next_scanout = p->scanout;
-	p->started = dcp_present_begin_h17p(&dcp->present_state_h17p, p->swap_id) &&
-		     dcp_present_submit_h17p(&dcp->present_state_h17p, p->swap_id, true);
-	dcp_swap_watchdog_arm(dcp);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		dcp->early_complete_v27 = false;
+	p->started = dcp_present_begin_h17p(&dcp->present_state_h17p, p->swap_id);
+	if (!p->started || p->defer_reply)
+		return;
+	p->started = dcp_present_submit_h17p(&dcp->present_state_h17p, p->swap_id, true);
+	if (p->started)
+		dcp_swap_watchdog_arm(dcp);
 }
 
 /* As iomfb_atomic_release(). */
@@ -191,7 +196,7 @@ static struct dropped_test *dropped_test_external(struct kunit *test)
 				 DCP_FIRMWARE_H17P, DCP_IOMFB_METHODS_H17P_EXTERNAL);
 }
 
-/* Queue present @i and let the queue send it; the firmware accepts it. */
+/* Queue present @i and let the queue send it; @defer_reply holds acceptance. */
 static void dropped_test_present(struct kunit *test, struct dropped_test *t, unsigned int i,
 				 struct drm_framebuffer *fb)
 {
@@ -542,6 +547,9 @@ static void sdk27_nested_batch_completion_test(struct kunit *test)
 	t->present[0].defer_reply = true;
 	dropped_test_present(test, t, 0, &t->fb[1]);
 	scoped_guard(mutex, &dcp->iomfb.lock) {
+		KUNIT_ASSERT_TRUE(test, dcp->present_state_h17p.pending);
+		KUNIT_ASSERT_FALSE(test, dcp->present_state_h17p.accepted);
+		KUNIT_ASSERT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
 		KUNIT_ASSERT_EQ(test, iomfb_v27_deliver_completion(dcp, DROPPED_SWAP_ID, true), 0);
 		KUNIT_EXPECT_TRUE(test, dcp->early_complete_v27);
 		KUNIT_EXPECT_TRUE(test, dcp->present_state_h17p.pending);
@@ -553,6 +561,7 @@ static void sdk27_nested_batch_completion_test(struct kunit *test)
 		KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
 		KUNIT_EXPECT_TRUE(test, t->present[0].transaction.completed);
 		KUNIT_EXPECT_PTR_EQ(test, dcp->iomfb.scanout, t->present[0].scanout);
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
 	}
 	KUNIT_EXPECT_EQ(test, dropped_test_refs(&t->fb[0]), 1);
 }
@@ -566,12 +575,17 @@ static void sdk27_rejected_nested_completion_test(struct kunit *test)
 	t->present[0].defer_reply = true;
 	dropped_test_present(test, t, 0, &t->fb[1]);
 	scoped_guard(mutex, &dcp->iomfb.lock) {
+		KUNIT_ASSERT_TRUE(test, dcp->present_state_h17p.pending);
+		KUNIT_ASSERT_FALSE(test, dcp->present_state_h17p.accepted);
+		KUNIT_ASSERT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
 		KUNIT_ASSERT_EQ(test, iomfb_v27_deliver_completion(dcp, DROPPED_SWAP_ID, false), 0);
+		KUNIT_EXPECT_TRUE(test, dcp->early_complete_v27);
 		iomfb_v27_deliver_submit_reply(dcp, DROPPED_SWAP_ID, 1);
 		KUNIT_EXPECT_FALSE(test, dcp->present_state_h17p.pending);
 		KUNIT_EXPECT_FALSE(test, t->present[0].transaction.completed);
 		KUNIT_EXPECT_EQ(test, dropped_test_refs(&t->fb[0]), 2);
 		KUNIT_EXPECT_FALSE(test, delayed_work_pending(&dcp->swap_watchdog_wq));
+		KUNIT_EXPECT_FALSE(test, READ_ONCE(dcp->crashed));
 	}
 }
 
