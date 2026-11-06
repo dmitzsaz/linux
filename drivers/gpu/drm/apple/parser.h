@@ -211,6 +211,9 @@ u64 dcp_modes_transfer_begin(struct apple_dcp *dcp);
 int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 		      u64 generation);
 
+int dcp_modes_set_preferred_v27(struct apple_dcp *dcp, const void *blob, size_t len,
+			      u64 generation);
+
 int parse_array_count(const struct dcp_parse_ctx *handle, u32 *count);
 
 /* Caller serializes readers against replacement. */

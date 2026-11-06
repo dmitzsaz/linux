@@ -1507,13 +1507,21 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	bool preferred_catalog = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 		!strcmp(req->key, "PreferredTimingElements");
 
-	if (preferred_catalog) {
+	bool preferred_external = preferred_catalog &&
+		dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+
+	if (preferred_catalog && !preferred_external) {
 		guard(mutex)(&dcp->modes_lock);
 		if (dcp->full_catalog_v27)
 			return true;
 	}
 	if (full_catalog || preferred_catalog) {
-		ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
+		if (preferred_external)
+			ret = dcp_modes_set_preferred_v27(dcp, dcp->chunks.data,
+						  dcp->chunks.length,
+						  dcp->chunks.modes_generation);
+		else
+			ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
 			if (ret == -ESTALE) {
 				kfree(dcp->chunks.data);
@@ -1529,7 +1537,7 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 			if (dcp->chunks.modes_generation == dcp->modes_generation && dcp->nr_modes)
 				dcp->full_catalog_v27 = true;
 		}
-		if (!READ_ONCE(dcp->nr_modes))
+		if (!preferred_external && !READ_ONCE(dcp->nr_modes))
 			dev_warn(dcp->dev, "Timing catalog without valid modes!\n");
 		dcp_180hz_notify(dcp);
 		dcp_firmware_metadata_timing(dcp);
