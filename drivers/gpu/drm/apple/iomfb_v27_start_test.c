@@ -121,6 +121,7 @@ static void v27_external_cleanup(void *data)
 	cancel_work_sync(&t->dcp.external_stop_work);
 	cancel_work_sync(&t->dcp.vblank_wq);
 	cancel_work_sync(&t->connector.hotplug_wq);
+	cancel_work_sync(&t->connector.bl_sync_wq);
 	kfree(t->dcp.preferred_timings_v27);
 	if (t->dcp.modes != t->modes)
 		kfree(t->dcp.modes);
@@ -158,6 +159,7 @@ static struct v27_external_test *v27_external_setup(struct kunit *test, bool fix
 	INIT_WORK(&dcp->external_stop_work, v27_external_stop);
 	INIT_WORK(&dcp->vblank_wq, v27_external_noop);
 	INIT_WORK(&t->connector.hotplug_wq, v27_external_noop);
+	INIT_WORK(&t->connector.bl_sync_wq, v27_external_noop);
 	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, v27_external_cleanup, t), 0);
 	dcp->connector = &t->connector;
 	dcp->external_cable = true;
@@ -364,6 +366,64 @@ static void v27_external_initial_replug(struct kunit *test)
 	KUNIT_EXPECT_TRUE(test, dcp->external_mode_valid);
 	KUNIT_EXPECT_TRUE(test, t->connector.connected);
 	KUNIT_EXPECT_EQ(test, t->calls, 2U);
+}
+
+static void v27_external_dpms_discovery_hold(struct kunit *test)
+{
+	struct v27_external_test *t = v27_external_setup(test, false);
+	struct apple_dcp *dcp = &t->dcp;
+
+	dcp->external_running = false;
+	dcp->external_power_attempted = true;
+	dcp->external_stopped = true;
+	dcp->external_crtc_generation = dcp->external_generation;
+	dcp_external_queue_initial_mode(dcp);
+	dcp_external_modeset_work(&dcp->external_modeset_work);
+	KUNIT_EXPECT_EQ(test, t->calls, 0U);
+	KUNIT_EXPECT_FALSE(test, t->connector.connected);
+	KUNIT_EXPECT_TRUE(test, dcp->iomfb.presentation_paused);
+}
+
+static void v27_external_yield_fences(struct kunit *test)
+{
+	unsigned int failure;
+
+	for (failure = 0; failure < 2; failure++) {
+		struct v27_external_test *t = v27_external_setup(test, true);
+		struct apple_dcp *dcp = &t->dcp;
+		u64 generation = dcp->external_generation;
+
+		/* The stop was acknowledged, or failed and retained its session. */
+		dcp->external_power_attempted = true;
+		dcp->external_stopped = !failure;
+		dcp->external_running = !!failure;
+		dcp->external_crtc_generation = generation;
+		dcp->external_error = failure ? -EIO : 0;
+		dcp->hdmi_yielded = true;
+		dcp->modes_admitted = true;
+		dcp->full_catalog_v27 = true;
+		dcp->metadata.attributes_valid = true;
+		dcp->metadata.timing_valid = true;
+		mutex_init(&dcp->dcpavserv.lock);
+		init_completion(&dcp->dcpavserv.enable_completion);
+		INIT_WORK(&dcp->dcpavserv.close_wq, v27_external_noop);
+		INIT_DELAYED_WORK(&dcp->typec_reconnect_wq, v27_external_noop);
+		INIT_DELAYED_WORK(&dcp->placeholder_edid_wq, v27_external_noop);
+
+		KUNIT_EXPECT_EQ(test, dcp_hdmi_yield_link(dcp), failure ? -EIO : 0);
+		KUNIT_EXPECT_GT(test, dcp->external_generation, generation);
+		KUNIT_EXPECT_EQ(test, dcp->external_rx_generation, dcp->external_generation);
+		KUNIT_EXPECT_TRUE(test, dcp->external_physically_absent);
+		KUNIT_EXPECT_FALSE(test, dcp->external_cable);
+		KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
+		KUNIT_EXPECT_FALSE(test, dcp->full_catalog_v27);
+		KUNIT_EXPECT_FALSE(test, dcp->metadata.attributes_valid);
+		KUNIT_EXPECT_FALSE(test, dcp->metadata.timing_valid);
+		KUNIT_EXPECT_EQ(test, dcp->fixed_link_held, !!failure);
+		if (failure)
+			KUNIT_EXPECT_FALSE(test, dcp->hdmi_yielded);
+		KUNIT_EXPECT_EQ(test, t->calls, 0U);
+	}
 }
 
 static void v27_external_catalog_during_replacement(struct kunit *test)
@@ -674,6 +734,8 @@ static struct kunit_case v27_start_cases[] = {
 	KUNIT_CASE(v27_external_short_hpd),
 	KUNIT_CASE(v27_external_untimed_hpd),
 	KUNIT_CASE(v27_external_initial_replug),
+	KUNIT_CASE(v27_external_dpms_discovery_hold),
+	KUNIT_CASE(v27_external_yield_fences),
 	KUNIT_CASE(v27_external_catalog_during_replacement),
 	KUNIT_CASE(v27_external_initial_retry_bound),
 	KUNIT_CASE(v27_external_preferred_catalog),

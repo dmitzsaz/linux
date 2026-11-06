@@ -441,7 +441,187 @@ int main(void) {
  puts("PASS FW27 initial mode, native clock, cache/status, transient/final HPD, detach/catalog/suspend fences, stale stop and replay");
 }
 '''
-    return prefix + production + tests
+    return takeover_fixture(root, prefix + production + tests)
+
+
+def takeover_fixture(root, unit):
+    """Use the real yield/stop/attach path, with firmware calls at its boundary."""
+    apple = root / 'drivers/gpu/drm/apple'
+    source = (apple / 'dcp.c').read_text()
+    epoch = (apple / 'dcp-metadata-epoch.h').read_text().replace('#include <linux/types.h>', '')
+    unit = unit.replace('struct apple_dcp {', epoch + r'''
+struct dcp_metadata_state {
+ int lock;
+ struct dcp_metadata_epoch epoch;
+ struct dcp_metadata_ticket catalog_ticket,attributes_ticket,timing_ticket;
+ bool attributes_valid,timing_valid,hpd_seen;
+};
+struct dcp_rate_state {
+ u64 connection_sequence,sequence;
+ struct { bool valid; } rate,lanes;
+};
+struct apple_dcp {''', 1)
+    unit = unit.replace('int iomfb_method_profile; } hw;', 'int iomfb_method_profile; bool sink_metadata_edid; } hw;', 1)
+    unit = unit.replace('struct { bool connected; } dptxport[1];', r'''
+ struct { bool connected,enabled; void *service; } dptxport[1];
+ struct dcp_metadata_state metadata;
+ struct dcp_rate_state rate_proof;
+ void *avep;
+ bool hdmi_yielded,placeholder_retried;''', 1)
+    old = block(unit, 'static void dcp_firmware_metadata_connection(')
+    metadata = '\n'.join(block(source, marker) for marker in (
+        'static bool dcp_sink_metadata(', 'bool dcp_firmware_metadata_enabled(',
+        'static void dcp_desktop_metadata_new_sink(', 'void dcp_firmware_metadata_connection(',
+        'static bool dcp_firmware_metadata_recoverable(', 'static bool dcp_firmware_metadata_physical(',
+        'static bool dcp_firmware_metadata_matches('))
+    unit = unit.replace(old, 'u64 dcp_hdmi_attachment_generation(struct apple_dcp *dcp);\n' + metadata, 1)
+    unit = unit.replace(block(unit, 'static int dcp_external_link_locked('),
+                        'static int dcp_external_link_locked(struct apple_dcp *d);', 1)
+    unit = unit.replace(block(unit, 'static int dcp_external_stop_locked('),
+                        'static int dcp_external_stop_locked(struct apple_dcp *d,u64 g);', 1)
+    unit = unit.replace(block(unit, 'static int iomfb_external_power_h17p('), r'''
+static int stop_error,settle_error,hpd_error,release_error;
+static unsigned settles,hpd_calls,releases,links;
+static bool takeover,fence_observed;
+static int iomfb_external_power_h17p(struct apple_dcp *d,bool on) {
+ if(on){assert(!d->connector->connected);powers++;return 0;}
+ stops++;assert(d->iomfb.presentation_paused);
+ return stop_error;
+}''', 1)
+    unit = unit.replace('assert(powers==1&&!d->external_mode_valid);',
+                        'assert(powers&&!d->external_mode_valid);', 1)
+    boundary = r'''
+#define DCP_EXTERNAL_STOP_RETRIES 3
+#define DCP_SWAP_WATCHDOG_MS 1000
+#define DCP_FIRMWARE_V_26_6_DESKTOP 266
+#define system_dfl_wq 0
+#define dev_warn(...) ((void)0)
+#undef dev_err
+static void host_log(const char *format,...) { (void)format; }
+#define dev_err(dev,format,...) ((void)(dev),host_log(format,##__VA_ARGS__))
+#define dptx_service_available(p) ((p)->enabled)
+#define platform_device apple_dcp
+#define platform_get_drvdata(p) (p)
+static bool dcp_is_typec_output(struct apple_dcp *d) { return !!d->active_typec_route; }
+static int dcp_desktop_dptx_connect(struct apple_dcp *d,u32 p)
+{ (void)d;(void)p;assert(false);return -EINVAL; }
+static void dcp_typec_attach_locked(struct apple_dcp *d) { (void)d;assert(false); }
+static int dcp_dptx_connect_attached(struct apple_dcp *d,u32 p)
+{ (void)d;(void)p;assert(false);return -EINVAL; }
+static int iomfb_queue_settle(struct apple_dcp *d,int timeout) {
+ (void)timeout;settles++;
+ if(takeover) {
+  /* The real disconnect fences A413 before it waits for firmware. */
+  assert(d->external_physically_absent&&!d->external_mode_valid&&!d->mode_state.valid);
+  assert(!d->typec_cable_connected&&!d->metadata.epoch.connected);
+  assert(!d->metadata.attributes_valid&&!d->metadata.timing_valid);
+  assert(!dcp_firmware_metadata_matches(d,d->metadata.catalog_ticket));
+  fence_observed=true;
+ }
+ return settle_error;
+}
+static int dptxport_set_hpd(void *s,bool high)
+{ assert(s&&!high);hpd_calls++;return hpd_error; }
+static int dptxport_release_display(void *s)
+{ assert(s);releases++;return release_error; }
+static void av_service_disconnect(struct apple_dcp *d) { (void)d; }
+static void mod_delayed_work(int q,struct delayed_work *w,int delay)
+{ (void)q;(void)delay;schedule_work(&w->work); }
+static void msleep(int ms) { (void)ms; }
+static void disconnected_hpd_event(struct apple_connector *c) { c->connected=false; }
+static int dcp_external_disconnect(struct apple_dcp *d,bool physical);
+static int dcp_dptx_disconnect(struct apple_dcp *d,u32 port)
+{ assert(!port);return dcp_external_disconnect(d,false); }
+static int dcp_dptx_connect_raw(struct apple_dcp *d,u32 port,bool *retryable,
+                              void *session,bool cable,bool resume) {
+ assert(!port&&retryable&&!session&&!cable&&!resume);
+ if(d->dptxport[0].connected)return 0;
+ links++;
+ if(takeover) {
+  assert(d->active_typec_route&&d->external_cable&&!d->external_physically_absent);
+  assert(d->external_generation!=d->external_crtc_generation);
+  assert(!d->modes_admitted&&!d->full_catalog_v27&&!d->nr_preferred_timings_v27);
+  assert(!dcp_firmware_metadata_matches(d,d->metadata.catalog_ticket));
+ }
+ d->dptxport[0].connected=true;return 0;
+}
+'''
+    production = '\n'.join(block(source, marker) for marker in (
+        'static void dcp_external_publish_generation(', 'static int dcp_external_link_locked(',
+        'static int dcp_external_stop_locked(', 'static int dcp_external_disconnect(',
+        'int dcp_hdmi_yield_link(', 'int dcp_dptx_connect_oob('))
+    tests = r'''
+static void active_hdmi(void) {
+ static struct dcp_timing_id preference={46,2560,1440};
+ init(true);takeover=false;stop_error=settle_error=hpd_error=release_error=0;
+ settles=hpd_calls=releases=links=0;fence_observed=false;
+ dcp_external_hotplug(&d,true);drain_initial();assert(con.connected&&rpcs==1);
+ d.external_crtc_generation=d.external_generation;
+ d.dptxport[0].connected=d.dptxport[0].enabled=true;
+ d.dptxport[0].service=&d;
+ d.typec_generation=12;
+ d.metadata.epoch=(struct dcp_metadata_epoch){.generation=12,.connected=true,.associated_once=true};
+ d.rate_proof.connection_sequence=17;
+ d.metadata.catalog_ticket=d.metadata.attributes_ticket=d.metadata.timing_ticket=
+  (struct dcp_metadata_ticket){.generation=12,.connection_sequence=17,.associated=true};
+ d.metadata.attributes_valid=d.metadata.timing_valid=d.metadata.hpd_seen=true;
+ d.full_catalog_v27=true;
+ d.preferred_timings_v27=&preference;
+ d.nr_preferred_timings_v27=1;
+ /* The output's GPIO is already low; it does not end this firmware session. */
+ d.hdmi_yielded=true;takeover=true;links=0;
+}
+static void takeover_checks(void) {
+ active_hdmi();u64 generation=d.external_generation,catalog=d.modes_generation;
+ assert(!dcp_hdmi_yield_link(&d));
+ assert(fence_observed&&stops==1&&hpd_calls==1&&releases==1);
+ assert(!d.external_cable&&d.external_physically_absent&&d.external_stopped);
+ assert(d.external_generation>generation&&d.external_rx_generation==d.external_generation);
+ assert(!d.modes_admitted&&!d.full_catalog_v27&&!d.nr_preferred_timings_v27);
+ assert(d.modes_generation>catalog&&!dcp_firmware_metadata_matches(&d,d.metadata.catalog_ticket));
+ /* The mux activation completed: the following event is the real OOB attach. */
+ d.active_typec_route=&d;
+ assert(!dcp_dptx_connect_oob(&d,0)&&links==1);
+ assert(d.external_generation>d.external_crtc_generation&&d.typec_generation>12);
+ assert(d.metadata.epoch.connected&&!d.metadata.attributes_valid&&!d.metadata.timing_valid);
+ assert(!dcp_firmware_metadata_matches(&d,d.metadata.catalog_ticket));
+ /* Neither old IDs nor an HPD high may apply the old sink's mode. */
+ dcp_external_hotplug(&d,true);drain_initial();assert(rpcs==1&&powers==1);
+ assert(!con.connected&&!d.external_mode_valid);
+ /* Model a fresh complete catalog at the parser boundary, with distinct IDs. */
+ modes[2].timing_mode_id=446;modes[2].color_mode_id=449;
+ d.modes_admitted=true;d.full_catalog_v27=true;
+ dcp_external_queue_initial_mode(&d);drain_initial();
+ assert(rpcs==2&&powers==2&&con.connected&&d.external_mode_valid);
+ assert(d.external_mode.timing_mode_id==446&&d.external_mode.color_mode_id==449);
+ /* A real same-cable DPMS stop retains its epoch and waits for atomic enable. */
+ active_hdmi();takeover=false;d.hdmi_yielded=false;
+ generation=d.external_generation;
+ assert(!dcp_external_disconnect(&d,false));
+ assert(d.external_cable&&d.external_generation==generation&&d.external_stopped);
+ dcp_external_hotplug(&d,true);drain_initial();assert(rpcs==1&&powers==1);
+ /* Failed/deferred teardown is fenced, attempted once, and never becomes A413. */
+ for(unsigned fault=0;fault<4;fault++) {
+  active_hdmi();generation=d.external_generation;
+  if(fault==0)stop_error=-EIO;
+  if(fault==1)settle_error=-ETIMEDOUT;
+  if(fault==2)hpd_error=-EIO;
+  if(fault==3)release_error=-EIO;
+  assert(dcp_hdmi_yield_link(&d)==(fault==1?-ETIMEDOUT:-EIO));
+  assert(fence_observed&&d.fixed_link_held&&!d.hdmi_yielded&&!d.active_typec_route);
+  assert(!d.external_cable&&d.external_physically_absent&&d.external_generation>generation);
+  assert(!d.modes_admitted&&!d.metadata.attributes_valid&&!d.metadata.timing_valid);
+  assert(settles==1+(fault>=2)&&stops==(fault!=1));
+  assert(hpd_calls==(fault>=2)&&releases==(fault==3));
+  dcp_external_hotplug(&d,true);dcp_external_queue_initial_mode(&d);drain_initial();
+  assert(rpcs==1&&powers==1&&!con.connected&&!links);
+ }
+ puts("PASS real FW27 HDMI yield/stop/OOB attach: new A413, revoked metadata/catalog, DPMS hold and failed-stop fences");
+}
+int main(void) { transaction_checks();takeover_checks(); }
+'''
+    unit = unit.replace('int main(void)', 'static void transaction_checks(void)', 1)
+    return unit + boundary + production + tests
 
 
 def catalog_fixture(root, catalog_only=False):
@@ -780,9 +960,11 @@ int main(void) {
 '''
 
 
-def mutations(unit, output):
+def mutations(unit, output, root):
     """A compile failure is never a kill; every mutation must hit an assertion."""
     enable = block(unit, 'VISIBLE_IF_KUNIT void dcp_enable_typec_work(')
+    yield_link = block(unit, 'int dcp_hdmi_yield_link(')
+    disconnect = block(unit, 'static int dcp_external_disconnect(')
     cases = [
         ('missing-probe-disable', 'disable_work(&dcp->external_modeset_work);', ''),
         ('missing-bind-enable', 'enable_work(&dcp->external_modeset_work);', ''),
@@ -795,6 +977,19 @@ def mutations(unit, output):
         ('lose-new-catalog-replay', 'if (ret == -ESTALE && connected && retry_initial)',
          'if (false && ret == -ESTALE && connected && retry_initial)'),
         ('largest-area-as-native', ' ||\n\t\t    !dcp_external_native_mode(dcp, m)', ''),
+        ('yield-keeps-old-attachment', 'ret = dcp_external_disconnect(dcp, true);',
+         'ret = dcp_dptx_disconnect(dcp, 0);'),
+        ('yield-keeps-old-catalog', yield_link,
+         yield_link.replace('dcp_modes_begin_attachment(dcp);', '(void)0;')),
+        ('remove-dpms-hold',
+         '(dcp->external_power_attempted && dcp->external_stopped &&\n'
+         '\t\t     dcp->external_generation == dcp->external_crtc_generation)', 'false'),
+        ('lose-yield-failure-reservation', yield_link,
+         yield_link.replace('WRITE_ONCE(dcp->fixed_link_held, true);', '(void)0;')),
+        ('unfenced-yield-stop', disconnect, disconnect.replace(
+            'WRITE_ONCE(dcp->external_physically_absent, true);', '(void)0;')),
+        ('yield-keeps-metadata', disconnect, disconnect.replace(
+            'dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);', '(void)0;')),
     ]
     results = []
     for name, old, new in cases:
@@ -810,6 +1005,26 @@ def mutations(unit, output):
             print(f'PASS mutation caught: {name}')
         else:
             raise AssertionError(f'mutation survived: {name}')
+    # Compile the actual deployed parent yield body, adapting only its old void
+    # return contract. This control must fail at runtime, never at compilation.
+    parent = subprocess.check_output(
+        ['git', '-C', str(root), 'show', 'cdd87cb8:drivers/gpu/drm/apple/dcp.c'], text=True)
+    old_yield = block(parent, 'void dcp_hdmi_yield_link(')
+    old_yield = old_yield.replace('void dcp_hdmi_yield_link(', 'int dcp_hdmi_yield_link(', 1)
+    old_yield = old_yield[:-1] + '\treturn ret;\n}'
+    name = 'parent-cdd-yield'
+    try:
+        run_unit(name, unit.replace(yield_link, old_yield, 1), output,
+                 extra=('-Wno-unused-function',))
+    except subprocess.CalledProcessError as error:
+        log = output / name / 'case-0.log'
+        assert log.exists(), 'parent compile failure is not a regression kill'
+        detail = log.read_text()
+        assert error.returncode == -6 and 'Assertion failed:' in detail, detail
+        results.append({'name': name, 'returncode': error.returncode, 'assertion': detail.strip()})
+        print('PASS actual cdd87cb8 yield rejected by takeover assertions')
+    else:
+        raise AssertionError('actual parent yield survived the regression')
     (output / 'mutations.json').write_text(json.dumps(results, indent=2) + '\n')
 
 
@@ -823,5 +1038,5 @@ if __name__ == '__main__':
     unit = transaction(args.source)
     run_unit('external-mode', unit, output, extra=('-Wno-unused-function',))
     if args.mutations:
-        mutations(unit, output)
+        mutations(unit, output, args.source)
     print(f'PASS: {output}')

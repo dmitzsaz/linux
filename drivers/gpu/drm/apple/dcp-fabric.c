@@ -1837,6 +1837,7 @@ dcp_typec_take_hdmi_pipeline_locked(struct apple_dcp_typec_port *port)
 	lockdep_assert_held(&dcp_typec_fabric_lock);
 	list_for_each_entry(route, &port->routes, port_link) {
 		struct apple_dcp *dcp = route->dcp;
+		int ret;
 
 		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 || !dcp->fixed_phy ||
 		    !dcp->hdmi_hpd || route->tunnel || READ_ONCE(dcp->hdmi_yielded) ||
@@ -1847,7 +1848,9 @@ dcp_typec_take_hdmi_pipeline_locked(struct apple_dcp_typec_port *port)
 			 port->connector_np);
 		WRITE_ONCE(dcp->hdmi_yielded, true);
 		cancel_delayed_work(&dcp->hdmi_start_wq);
-		dcp_hdmi_yield_link(dcp);
+		ret = dcp_hdmi_yield_link(dcp);
+		if (ret)
+			return ERR_PTR(ret);
 		WRITE_ONCE(dcp->fixed_link_held, false);
 		WRITE_ONCE(dcp->fixed_sink_present, false);
 		return dcp_typec_free_route(port);
@@ -2114,6 +2117,8 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 		best = dcp_typec_free_route(port);
 		if (!best && hpd)
 			best = dcp_typec_take_hdmi_pipeline_locked(port);
+		if (IS_ERR(best))
+			return PTR_ERR(best);
 		/* Every pipeline is driving another port's display. */
 		if (!best)
 			return hpd ? dcp_typec_port_busy(port, route->dcp) : -ENOSPC;
