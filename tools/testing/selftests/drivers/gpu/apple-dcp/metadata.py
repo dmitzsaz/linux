@@ -29,6 +29,8 @@ def fixture(root):
     readiness = (apple / 'dcp-180hz.c').read_text()
     f = rate.parser_fixture(root)
     prefix, production, _ = external_mode.catalog_fixture(root)
+    if 'hdmi_generation' in f['epoch']:
+        prefix += '\n#define DCP_METADATA_HDMI_RECEIPT 1\n'
     blobs = ''
     prefix = prefix.replace('static u32 metadata_id;', '')
     # Use the full production hardware declaration and initializers, including
@@ -356,12 +358,12 @@ int main(int argc,char **argv) {
   init(true,false);attach();recover();
   for(unsigned attr=0;attr<2;attr++) {
    start(attr?attributes:timing,attr?sizeof(attributes):sizeof(timing),0);
-   physical_edge();assert(!edid_ok());
-   assert(!finish(attr?"DisplayAttributes":"TimingElements"));assert(!edid_ok());recover();
+   physical_edge();assert(!ready()&&!edid_ok());
+   assert(!finish(attr?"DisplayAttributes":"TimingElements"));assert(!ready()&&!edid_ok());recover();
   }
   /* A short converter IRQ pulse leaves the physical metadata receipt intact. */
   assert(!dcp_hdmi_record_hpd_edge(&d,0,NSEC_PER_SEC));
-  assert(dcp_hdmi_record_hpd_edge(&d,1,NSEC_PER_SEC+2*NSEC_PER_MSEC));assert(edid_ok());
+  assert(dcp_hdmi_record_hpd_edge(&d,1,NSEC_PER_SEC+2*NSEC_PER_MSEC));assert(ready()&&edid_ok());
   for(unsigned event=0;event<3;event++) {
    allocation_event=event==0?lose_during_alloc:event==1?replace_during_alloc:hdmi_during_alloc;
    u64 generation;const struct drm_edid *edid=dcp_firmware_edid(&d,&generation);
@@ -393,6 +395,60 @@ int main(int argc,char **argv) {
   dcp_firmware_metadata_connection(&d,99,false);assert(!edid_ok());
   attrs();publish_catalog();assert(edid_ok()&&d.metadata.epoch.generation==generation+1);
  }
+#ifdef DCP_METADATA_HDMI_RECEIPT
+ if(!only||only==7)for(unsigned fixed=0;fixed<2;fixed++) {
+  init(fixed,false);attach();recover();
+  /* Preserve both the complete receipt and physical attachment across A413. */
+  struct dcp_metadata_ticket receipt=d.metadata.catalog_ticket;
+  u64 sequence=d.rate_proof.connection_sequence,generation=d.modes_generation;
+  modeset();assert(ready()&&edid_ok());
+  assert(d.metadata.catalog_ticket.hdmi_generation==receipt.hdmi_generation);
+  assert(d.rate_proof.connection_sequence==sequence&&d.modes_generation==generation);
+  for(unsigned us=500;us<=2000;us*=2) {
+   assert(!dcp_hdmi_record_hpd_edge(&d,0,NSEC_PER_SEC));
+   assert(dcp_hdmi_record_hpd_edge(&d,1,NSEC_PER_SEC+(u64)us*1000));
+   assert(ready()&&edid_ok());
+  }
+  /* A long physical edge has no accompanying firmware HPD-low callback. */
+  physical_edge();
+  assert(d.rate_proof.connection_sequence==sequence&&d.typec_generation==receipt.generation);
+  if(!fixed) {
+   /* An unrelated fixed HDMI sink cannot revoke the active Type-C receipt. */
+   assert(ready()&&edid_ok());dcp_modes_transfer_begin(&d);
+   assert(d.modes_admitted&&d.full_catalog_v27&&ready()&&edid_ok());
+   continue;
+  }
+  assert(d.modes_admitted&&d.full_catalog_v27); /* Lazy validation has not run. */
+  assert(!ready()&&!edid_ok());
+  hpd(true);assert(!ready()&&!edid_ok());
+  dcp_modes_transfer_begin(&d); /* The actual attachment validation path. */
+  assert(!d.modes_admitted&&!d.full_catalog_v27&&d.nr_modes);
+  assert(!ready()&&!edid_ok());
+  /* Neither a high announcement, fresh attributes nor a preference is a catalog. */
+  hpd(true);attrs();pref();assert(!ready()&&!edid_ok());
+  for(unsigned bad=1;bad<=4;bad++) {
+   start(timing,sizeof(timing),bad);finish("TimingElements");assert(!ready());
+  }
+  assert(send("TimingElements",empty,sizeof(empty)));assert(!ready());
+  start(timing,sizeof(timing),0);physical_edge();assert(!ready());
+  assert(!finish("TimingElements"));assert(!ready());
+  attrs();pref();assert(!ready());
+  /* Fresh START/CHUNK/END is the only producer that restores readiness. */
+  publish_catalog();assert(ready()&&edid_ok());
+  assert(d.modes_admitted&&d.full_catalog_v27);
+  assert(d.metadata.catalog_ticket.hdmi_generation==dcp_hdmi_attachment_generation(&d));
+  modeset();assert(ready()&&edid_ok());
+ }
+ if(!only||only==8) {
+  /* Test lazy validation separately so the old source fails at both points. */
+  init(true,false);attach();recover();physical_edge();
+  dcp_modes_transfer_begin(&d);
+  assert(!d.modes_admitted&&!d.full_catalog_v27&&d.nr_modes);
+  assert(!ready()&&!edid_ok());
+  hpd(true);attrs();pref();assert(!ready());
+  publish_catalog();assert(ready()&&edid_ok());
+ }
+#endif
  cleanup();puts("PASS production M5 profile/probe, real property/EDID lifecycle, readiness, stale fences, A413 bounce and desktop control");
 }
 '''
@@ -410,20 +466,34 @@ def expect_assertion(name, unit, output, case):
     raise AssertionError(f'negative control survived: {name}')
 
 
-def baseline(root, ref, output):
-    """Run the actual old source, then only its one-line profile correction."""
+def baseline_fixture(root, ref):
+    """Extract the selected source without changing any production body."""
     with tempfile.TemporaryDirectory(prefix='dcp-metadata-baseline-') as directory:
         archive = subprocess.run(['git', '-C', str(root), 'archive', ref,
                                   'drivers/gpu/drm/apple', 'include/drm'],
                                  check=True, capture_output=True)
         subprocess.run(['tar', '-xf', '-', '-C', directory], input=archive.stdout, check=True)
-        unit = fixture(Path(directory))
+        return fixture(Path(directory))
+
+
+def baseline(root, ref, output):
+    """Run the actual old source, then only its one-line profile correction."""
+    unit = baseline_fixture(root, ref)
     results = [expect_assertion('actual-baseline', unit, output, '1')]
     profile = block(unit, 'static const struct apple_dcp_hw_data apple_dcp_hw_t8142_external =')
     assert '.sink_metadata_edid = true,' in profile
     corrected = profile.replace('.sink_metadata_edid = true,', '')
     results.append(expect_assertion('baseline-profile-only', unit.replace(profile, corrected, 1), output, '1'))
     (output / 'baseline.json').write_text(json.dumps({'ref': ref, 'results': results}, indent=2) + '\n')
+
+
+def readiness_baseline(root, ref, output):
+    """The actual 792 producer must fail the HDMI readiness regression."""
+    unit = baseline_fixture(root, ref)
+    assert '#define DCP_METADATA_HDMI_RECEIPT 1' in unit
+    results = [expect_assertion('actual-readiness-baseline-before', unit, output, '7'),
+               expect_assertion('actual-readiness-baseline-after', unit, output, '8')]
+    (output / 'readiness-baseline.json').write_text(json.dumps({'ref': ref, 'results': results}, indent=2) + '\n')
 
 
 def mutations(unit, output):
@@ -434,6 +504,7 @@ def mutations(unit, output):
          'if (true)\n\t\treturn dcp_metadata_matches', '1'),
         ('no-metadata-connection-fence', 'ticket.connection_sequence == dcp->rate_proof.connection_sequence &&', '', '3'),
         ('no-metadata-hdmi-fence', 'ticket.hdmi_generation == dcp_hdmi_attachment_generation(dcp)', 'true', '5'),
+        ('no-catalog-hdmi-fence', 'ticket->hdmi_generation != dcp_hdmi_attachment_generation(dcp)', 'false', '7'),
         ('no-catalog-connection-fence', 'dcp->metadata.catalog_connection_sequence == dcp->rate_proof.connection_sequence', 'true', '3'),
         ('retag-preferred-timing', 'ticket = dcp->metadata.catalog_ticket;', 'ticket = dcp->chunks.metadata_ticket;', '3'),
         ('no-edid-snapshot-fence', 'generation == dcp->metadata.snapshot_sequence', 'true', '5'),
@@ -451,6 +522,7 @@ if __name__ == '__main__':
     parser.add_argument('--output', type=Path)
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--old-ref', help='compile and reject this baseline and its profile-only fix')
+    parser.add_argument('--readiness-old-ref', help='compile and reject the fixed HDMI readiness baseline')
     args = parser.parse_args()
     output = args.output or Path(tempfile.mkdtemp(prefix='apple-dcp-metadata-'))
     unit = fixture(args.source)
@@ -459,4 +531,6 @@ if __name__ == '__main__':
         mutations(unit, output)
     if args.old_ref:
         baseline(args.source, args.old_ref, output)
+    if args.readiness_old_ref:
+        readiness_baseline(args.source, args.readiness_old_ref, output)
     print(f'PASS: {output}')

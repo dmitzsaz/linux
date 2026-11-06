@@ -109,7 +109,11 @@ execute. The legacy rate fixtures explicitly exclude FW27-only HDMI/preference
 helpers; their physical link/service proofs are separate controls.
 Run python3 metadata.py --mutations --old-ref 358d78e54f3 to compile the actual
 baseline (which fails catalog association), its profile-only correction (which
-fails replug EDID recovery), and seven assertion-based stale-fence controls.
+fails replug EDID recovery), and eight assertion-based stale-fence controls.
+Add --readiness-old-ref 79260c13faef to compile and reject the actual HDMI
+readiness baseline both before and after lazy attachment validation. The real
+producer tests require a fresh complete current catalog to recover, while
+preserving Type-C independence, converter IRQ pulses and successful A413 bounce.
 No negative control counts a compilation failure as a successful rejection.
 
 Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
