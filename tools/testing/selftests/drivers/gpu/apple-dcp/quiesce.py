@@ -88,6 +88,8 @@ static int dcp_typec_route_deactivate(struct apple_dcp_typec_route *r) { deactiv
 static void dcp_typec_port_attach(struct apple_dcp_typec_port *p) { (void)p; }
 static int gpiod_get_value_cansleep(void *p) { (void)p;return 0; }
 static int dcp_dptx_connect(struct apple_dcp *d,unsigned n) { (void)d;(void)n;return 0; }
+/* These SAFE/role fixtures have no fixed sink. */
+static int dcp_fixed_output_select(struct apple_dcp *d) { (void)d;assert(!"no fixed sink in this fixture");return -EINVAL; }
 static bool dcp_typec_route_available(struct apple_dcp_typec_route *r) { return !r->selected; }
 static int dcp_typec_route_activate(struct apple_dcp_typec_route *r,void *x) { (void)x;r->selected=true;return 0; }
 struct tps6598x;
@@ -121,7 +123,10 @@ static void gpiod_set_value_cansleep(void *p,int v) { (void)p;assert(v==1);gpio_
 '''.replace('REMOVE_RETURN','void' if parent else 'int')
  policy=block(mux,'bool typec_mux_safe_after_role(')+'\n' if 'bool typec_mux_safe_after_role(' in mux else ''
  functions=policy+'\n'.join(block(mux, marker) for marker in ('static void typec_mux_unlock(', 'void typec_mux_abort(', 'int typec_mux_begin(', 'int typec_mux_apply(', 'int typec_mux_end(', 'int typec_mux_prepare(')) if not parent else block((reference/'drivers/usb/typec/mux.c').read_text(),'int typec_mux_prepare(')+'\n'
- functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'+block(dcp,'static int dcp_typec_route_finish(')+'\n'+block(dcp,'static void dcp_typec_route_commit(')+'\n'
+ functions+=block(mux,'int typec_mux_set(')+'\n'+block(dcp,'static int dcp_typec_route_prepare(')+'\n'
+ functions+='\n'.join(block(dcp, marker) for marker in (
+  'static int dcp_typec_route_release(', 'static int dcp_typec_connect_fixed(',
+  'static int dcp_typec_route_finish(', 'static void dcp_typec_route_commit('))+'\n'
  functions+=fabric_rebalance(dcp)
  if 'static bool tps6598x_safe_after_role(' in core:
   functions+=block(core,'static bool tps6598x_safe_after_role(')+'\n'
