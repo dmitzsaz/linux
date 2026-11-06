@@ -151,10 +151,17 @@ void kvm_timer_cpu_down(void);
 #define CNTKCTL_VALID_BITS	(BIT(17) | GENMASK_ULL(9, 0))
 
 DECLARE_STATIC_KEY_FALSE(broken_cntvoff_key);
+DECLARE_STATIC_KEY_FALSE(emulated_timers_key);
 
 static inline bool has_broken_cntvoff(void)
 {
 	return static_branch_unlikely(&broken_cntvoff_key);
+}
+
+/* No guest timer is ever loaded into the hardware */
+static inline bool has_emulated_timers(void)
+{
+	return static_branch_unlikely(&emulated_timers_key);
 }
 
 static inline bool has_cntpoff(void)
