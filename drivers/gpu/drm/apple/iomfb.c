@@ -2009,7 +2009,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	struct apple_connector *ready = NULL;
 	struct dcp_display_mode *modes;
-	struct dcp_metadata_ticket rate_ticket = {};
+	struct dcp_metadata_ticket catalog_ticket = {};
 	u64 rate_service_epoch = 0;
 	unsigned int nr_modes = 0, i;
 	unsigned long flags;
@@ -2024,12 +2024,13 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			return -ESTALE;
 	}
 
-	if (h17p_external && dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
-	    dcp->chunks.payload_complete &&
+	if (h17p_external && dcp->chunks.payload_complete &&
 	    dcp->chunks.mode_ticket.associated) {
-		ctx->automatic_1080p180_rgb8 = true;
-		rate_ticket = dcp->chunks.mode_ticket;
-		rate_service_epoch = dcp->chunks.av_service_epoch;
+		catalog_ticket = dcp->chunks.mode_ticket;
+		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0) {
+			ctx->automatic_1080p180_rgb8 = true;
+			rate_service_epoch = dcp->chunks.av_service_epoch;
+		}
 	}
 	if (!h17p_external) {
 		ret = parse_array_count(ctx, &entries);
@@ -2055,7 +2056,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	} else {
 		for (i = 0; i < nr_modes; i++)
 			if (modes[i].automatic_rgb8_quirk) {
-				modes[i].unsafe_rgb8_ticket = rate_ticket;
+				modes[i].unsafe_rgb8_ticket = catalog_ticket;
 				modes[i].unsafe_rgb8_service_epoch = rate_service_epoch;
 				modes[i].automatic_connection_sequence = dcp->chunks.automatic_connection_sequence;
 				modes[i].automatic_service_pending = dcp->chunks.automatic_service_pending;
@@ -2080,7 +2081,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	dcp->nr_modes = nr_modes;
 	dcp_modes_retag_preferred_v27(dcp);
 	/* Only a complete receipt for a current cable is that cable's catalogue. */
-	dcp->metadata.catalog_ticket = rate_ticket;
+	dcp->metadata.catalog_ticket = catalog_ticket;
 	dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
 	dcp->metadata.catalog_connection_sequence =
 		dcp->chunks.automatic_connection_sequence;
