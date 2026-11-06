@@ -533,8 +533,8 @@ static int dcp_dptx_disconnect_oob(struct platform_device *device, u32 port)
 	assert(device == display->dev && !port);
 	guard(mutex)(&display->external_lock);
 	disconnects++;
-	if (disconnect_error)
-		return disconnect_error;
+	if (disconnect_error || activate_disconnect_error)
+		return disconnect_error ?: activate_disconnect_error;
 	display->external_stopped = true;
 	display->external_cable = false;
 	display->typec_cable_connected = false;
@@ -850,6 +850,43 @@ int main(int argc, char **argv)
 	port.owner = &route;
 	host_list_append(&port.routes, &route.port_link, &route);
 	host_list_append(&dcp_typec_ports, &port.link, &port);
+	if (!strncmp(name, "idle-fixed-", 11)) {
+		/* An old HDMI CRTC stopped with its logical attachment retained. */
+		gpio = 0;
+		dcp.active_typec_route = NULL;
+		dcp.typec_connector = NULL;
+		dcp.connector = &fixed_connector;
+		dcp.hdmi_yielded = false;
+		dcp.fixed_sink_present = false;
+		dcp.phy = &fixed_phy;
+		dcp.dptx_phy = dcp.fixed_dptx_phy;
+		dcp.fixed_route_selected = fixed_mux.held = true;
+		dcp.external_power_attempted = true;
+		dcp.external_cable = dcp.external_stopped = true;
+		dcp.dptxport[0].connected = false;
+		route.selected = typec_mux.held = false;
+		port.owner = NULL;
+		if (!strcmp(name, "idle-fixed-stop-failure"))
+			activate_disconnect_error = -ETIMEDOUT;
+		if (!strcmp(name, "idle-fixed-mux-failure"))
+			typec_select_error = -EBUSY;
+		scoped_guard(mutex, &dcp_typec_fabric_lock)
+			ret = dcp_typec_route_activate(&route, &typec_mux);
+		if (activate_disconnect_error) {
+			assert(ret == -ETIMEDOUT && !dcp.active_typec_route);
+			assert(fixed_mux.held && !typec_mux.held && !route.selected);
+		} else {
+			/* OOB attach must see a new cable, not the old CRTC's DPMS wake. */
+			assert(!dcp.external_cable && !dcp.typec_cable_connected);
+			assert(ret == (typec_select_error ?: 0));
+			assert(route.selected == !typec_select_error);
+			assert(typec_mux.held == !typec_select_error);
+			assert(fixed_mux.held == !!typec_select_error);
+		}
+		assert(disconnects == 1 && !typec_connects);
+		printf("PASS idle fixed attachment retired before route selection: %s\n", name);
+		return 0;
+	}
 	if (!strcmp(name, "yield-failure")) {
 		/* HDMI is logically active even though its GPIO has gone low. */
 		gpio = 0;
@@ -1149,7 +1186,8 @@ HANDBACK_CASES = ('safe', 'hpd', 'exit', 'select-failure', 'hpd-select-failure',
          'recovery-hpd-high', 'recovery-hpd-high-fixed-error',
          'recovery-hpd-high-mux-error', 'recovery-hpd-high-disconnect-error',
          'recovery-competing-allocator', 'recovery-low-to-waiter',
-         'recovery-teardown-error', 'yield-failure')
+         'recovery-teardown-error', 'yield-failure', 'idle-fixed-attach',
+         'idle-fixed-stop-failure', 'idle-fixed-mux-failure')
 
 
 def handback(root, fabric=None):
