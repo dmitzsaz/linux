@@ -54,6 +54,8 @@ before connector publication, status failures, repeated-pair reuse, fixed-HDMI
 and Type-C transient/final HPD, stale stop revocation, physical detach, catalog
 and suspend fences, and discovery replay after enabling work. Run it with
 ./run.sh --group fw27. The corresponding KUnit cases are in apple-dcp-v27-start.
+The host fixture executes the production work initialization and enable/disable
+paths, including pending cancellation, disabled enqueue rejection and replay.
 The native timing IDs/clock fixture follows the old boot-36 log; it is synthetic,
 not a captured binary TimingElements catalog.
 
