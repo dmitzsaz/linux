@@ -1802,6 +1802,11 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 }
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
+	/* A fixed sink's HPD inside A413 is settled with the transaction result. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    !READ_ONCE(dcp->active_typec_route) && READ_ONCE(dcp->mode_state.changing))
+		return;
 	/* H17P external catalogs are fenced by their connection receipt. */
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
@@ -1993,6 +1998,8 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	/* RX lifetime is drained before connector cleanup; work rechecks ownership. */
 	if (ready)
 		dcp_queue_hotplug(ready);
+	if (!ret)
+		dcp_external_queue_initial_mode(dcp);
 	return ret;
 }
 
@@ -2790,6 +2797,141 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
+/* Firmware preference supplies the native geometry; start at its lowest clock. */
+int dcp_external_initial_mode(struct apple_dcp *dcp, struct drm_crtc_state *state,
+			     u64 *generation)
+{
+	const struct dcp_display_mode *native = NULL, *best = NULL;
+	unsigned int i;
+
+	guard(mutex)(&dcp->modes_lock);
+	if (!dcp->connector || !dcp_modes_for_connector(dcp, dcp->connector))
+		return -ENODATA;
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->sdr_usable || m->automatic_rgb8_quirk)
+			continue;
+		if (!native ||
+		    (m->firmware_preferred && !native->firmware_preferred) ||
+		    (m->firmware_preferred == native->firmware_preferred &&
+		     (u64)m->mode.hdisplay * m->mode.vdisplay >
+		     (u64)native->mode.hdisplay * native->mode.vdisplay))
+			native = m;
+	}
+	if (!native)
+		return -ENODATA;
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->sdr_usable || m->automatic_rgb8_quirk ||
+		    m->mode.hdisplay != native->mode.hdisplay ||
+		    m->mode.vdisplay != native->mode.vdisplay)
+			continue;
+		if (!best || m->mode.clock < best->mode.clock)
+			best = m;
+	}
+	state->mode = best->mode;
+	*generation = dcp->modes_generation;
+	return 0;
+}
+
+/*
+ * Firmware 27 may report HPD low/high inside A413. RX records the latest value
+ * without tearing down the transaction. Only its successful reply, a current
+ * catalog and the final attachment state establish a mode or publish a sink.
+ */
+int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
+			 u64 generation)
+{
+	unsigned int action = DCP_HOTPLUG_NONE;
+	unsigned long flags;
+	bool connected, fixed, fixed_held;
+	int ret;
+
+	lockdep_assert_held(&dcp->external_lock);
+	scoped_guard(mutex, &dcp->modes_lock) {
+		if (generation != dcp->modes_generation || !dcp->modes_admitted) {
+			dcp->external_mode_valid = false;
+			dcp_mode_invalidate(&dcp->mode_state);
+			return -ESTALE;
+		}
+	}
+	fixed = !READ_ONCE(dcp->active_typec_route) && dcp->fixed_phy;
+	fixed_held = READ_ONCE(dcp->fixed_link_held);
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		if (READ_ONCE(dcp->external_physically_absent) || READ_ONCE(dcp->quiescing) ||
+		    !READ_ONCE(dcp->typec_work_enabled) || !dcp->external_fw_connected ||
+		    dcp->external_hotplug_generation != dcp->external_generation) {
+			dcp->external_mode_valid = false;
+			dcp_mode_invalidate(&dcp->mode_state);
+			return -ENOLINK;
+		}
+		if (!READ_ONCE(dcp->mode_state.valid))
+			dcp->external_mode_valid = false;
+		/* Do not lend the fixed pipe while A413 momentarily lowers HPD. */
+		if (fixed)
+			WRITE_ONCE(dcp->fixed_link_held, true);
+		dcp_mode_begin(&dcp->mode_state);
+	}
+	ret = iomfb_modeset_v27(dcp, state);
+
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		scoped_guard(mutex, &dcp->modes_lock) {
+			if (generation != dcp->modes_generation || !dcp->modes_admitted)
+				ret = -ESTALE;
+		}
+		connected = dcp->external_hotplug_generation == dcp->external_generation &&
+			    dcp->external_fw_connected && dcp->external_cable &&
+			    !READ_ONCE(dcp->external_physically_absent) &&
+			    !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->crashed) &&
+			    READ_ONCE(dcp->typec_work_enabled);
+		if (!connected && !ret)
+			ret = -ENOLINK;
+		dcp->external_hotplug_pending = false;
+		spin_lock_irqsave(&dcp->mode_state.lock, flags);
+		if (dcp->mode_state.invalidated && !ret)
+			ret = -ENOLINK;
+		dcp->mode_state.changing = false;
+		dcp->mode_state.hotplug_pending = false;
+		spin_unlock_irqrestore(&dcp->mode_state.lock, flags);
+		if (fixed) {
+			WRITE_ONCE(dcp->fixed_link_held, fixed_held);
+			/* Only the final unplug ends the fixed sink's catalog epoch. */
+			if (!connected)
+				dcp_modes_begin_attachment(dcp);
+		}
+		dcp->external_mode_valid = !ret;
+		if (!ret) {
+			dcp_firmware_metadata_hotplug(dcp, true);
+			apple_connector_edid_set_live(dcp->connector, true);
+			dcp->external_mode = dcp->mode;
+			dcp->external_mode_generation = dcp->external_generation;
+			dcp->external_mode_catalog_generation = generation;
+			dcp->iomfb.presentation_paused = false;
+		} else if (!connected) {
+			dcp_firmware_metadata_hotplug(dcp, false);
+			apple_connector_edid_set_live(dcp->connector, false);
+			if (READ_ONCE(dcp->active_typec_route)) {
+				dcp->external_stop_generation = dcp->external_rx_generation;
+				schedule_work(&dcp->external_stop_work);
+			}
+		}
+		/* Publish the connector only after recording the established pair. */
+		spin_lock_irqsave(&dcp->mode_state.lock, flags);
+		if (!connected || !ret)
+			action = dcp_mode_apply_hotplug(&dcp->mode_state, connected && !ret,
+						 dcp->connector ?
+						 &dcp->connector->connected : NULL);
+		dcp->mode_state.valid = !ret;
+		spin_unlock_irqrestore(&dcp->mode_state.lock, flags);
+	}
+	if (ret && dcp->connector && READ_ONCE(dcp->connector->connected))
+		action |= DCP_HOTPLUG_NOTIFY;
+	dcp_handle_hotplug_actions(dcp, action);
+	return ret;
+}
+
 int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 			    struct drm_atomic_commit *commit)
 {
@@ -2814,7 +2956,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	guard(mutex)(&dcp->external_lock);
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    (!dcp->external_running || dcp->external_error || READ_ONCE(dcp->quiescing) ||
-	     READ_ONCE(dcp->crashed) || READ_ONCE(dcp->iomfb.presentation_paused))) {
+	     READ_ONCE(dcp->crashed) ||
+	     (dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	      READ_ONCE(dcp->iomfb.presentation_paused)))) {
 		/*
 		 * The pipe of this CRTC did not start, so it has no link and its
 		 * old mode is gone with it: the hotplug worker sets it up again
@@ -2849,6 +2993,15 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	if (!dcp->pq_requested)
 		dcp_hdr_infoframe_stop(dcp);
 	dcp_hdr_metadata_forget(dcp);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		ret = dcp_external_modeset(dcp, crtc_state, dcp_modes_transfer_begin(dcp));
+		if (!ret && dcp_is_typec_output(dcp)) {
+			scoped_guard(mutex, &dcp->hpd_mutex)
+				dcp->crtc_unplugs = dcp->typec_unplugs;
+		}
+		return ret;
+	}
 	dcp_mode_begin(&dcp->mode_state);
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:

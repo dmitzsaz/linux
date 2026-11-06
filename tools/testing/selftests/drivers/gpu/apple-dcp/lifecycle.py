@@ -109,6 +109,8 @@ typedef uint32_t u32; typedef uint64_t u64;
 #define TYPEC_THUNDERBOLT_SWITCH_OFF 0
 #define TYPEC_ACCESSORY_NONE 0
 #define DCP_HOTPLUG_NOTIFY 1
+#define DCP_FIRMWARE_V_27_0 27
+struct mode_state { bool changing; };
 struct work_struct { bool pending; };
 struct delayed_work { struct work_struct work; };
 static int system_freezable_wq, system_dfl_wq;
@@ -139,7 +141,10 @@ struct apple_dcp {
  bool external_hotplug_pending, external_hotplug_connected, quiescing;
  u64 external_generation, external_rx_generation, external_crtc_generation;
  u64 external_stop_generation, typec_generation;
- int external_error, mode_state; void *avep;
+ int external_error; struct mode_state mode_state; void *avep;
+ bool external_mode_valid, external_fw_connected;
+ u64 external_hotplug_generation;
+ void *active_typec_route;
  struct dcp_announce announce;
  /* T6030 external processors only; an H17P display is never one. */
  bool external_native; int external_retries; struct delayed_work external_retry_wq;
@@ -158,7 +163,9 @@ static int __attribute__((unused)) dcp_dptx_connect(struct apple_dcp *d, u32 por
 static int settle_error, power_error, hpd_error, release_error;
 static int settles, powers, releases, detaches, notices;
 static bool dcp_is_external_h17p(struct apple_dcp *d) { (void)d; return true; }
-static unsigned dcp_mode_hotplug(int *mode, bool connected, bool *sink)
+static void dcp_mode_invalidate(struct mode_state *s) { (void)s; }
+static void dcp_external_queue_initial_mode(struct apple_dcp *d) { (void)d; assert(!"firmware-27 in H17P fixture"); }
+static unsigned dcp_mode_hotplug(struct mode_state *mode, bool connected, bool *sink)
 { (void)mode; if (sink) *sink = connected; return 1; }
 static void dcp_handle_hotplug_actions(struct apple_dcp *d, unsigned act)
 { (void)d; notices += !!act; }
@@ -540,7 +547,7 @@ def bounce(root):
 
     swap(' struct { bool connected; void *service; } dptxport[1];',
          ' struct { bool connected, closed, tile_hint; void *service, *atcphy; int linkcfg_completion; } dptxport[1];\n'
-         ' void *phy, *dev, *active_typec_route;\n'
+         ' void *phy, *dev;\n'
          ' int dptx_die, dptx_phy, dptx_dfp_port, connector_type;\n'
          ' bool external, external_link_ready, crashed;\n'
          ' bool typec_work_enabled;' + ('' if '\n int fw_compat;' in unit else ' int fw_compat;') +

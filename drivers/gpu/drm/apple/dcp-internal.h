@@ -421,6 +421,15 @@ struct apple_dcp {
 	/* iomfb.lock: epoch used by receive-side deferred stop requests. */
 	u64 external_rx_generation;
 	u64 external_stop_generation;
+	/* iomfb.lock: latest firmware HPD, including callbacks during A413. */
+	u64 external_hotplug_generation;
+	bool external_fw_connected;
+	/* external_lock: only a successfully established pair may skip A413. */
+	bool external_mode_valid;
+	u64 external_mode_generation;
+	u64 external_mode_catalog_generation;
+	struct dcp_set_digital_out_mode_req external_mode;
+	struct work_struct external_modeset_work;
 	bool external_cable;
 	/* RX tombstone: initially unknown; only physical OOB events change it. */
 	bool external_physically_absent;
@@ -944,6 +953,11 @@ void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 void dcp_drm_crtc_page_flip(struct apple_dcp *dcp, ktime_t now);
 void dcp_handle_hotplug_actions(struct apple_dcp *dcp, unsigned int action);
 bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected);
+void dcp_external_queue_initial_mode(struct apple_dcp *dcp);
+int dcp_external_initial_mode(struct apple_dcp *dcp, struct drm_crtc_state *state,
+			     u64 *generation);
+int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
+			 u64 generation);
 void dcp_announce_arm(struct apple_dcp *dcp);
 void dcp_announce_work(struct work_struct *work);
 void dcp_external_crtc_released(struct apple_dcp *dcp);
