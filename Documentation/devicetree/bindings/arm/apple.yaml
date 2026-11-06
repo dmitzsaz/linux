@@ -110,6 +110,7 @@ description: |
   Devices based on the "M5" SoC:
 
   - MacBook Air (13-inch, M5, 2026)
+  - MacBook Pro (14-inch, M5, 2025)
 
   Devices based on the "M6" SoC:
 
@@ -365,7 +366,9 @@ properties:
 
       - description: Apple M5 SoC based platforms
         items:
-          - const: apple,j813  # MacBook Air (13-inch, M5, 2026)
+          - enum:
+              - apple,j704  # MacBook Pro (14-inch, M5, 2025)
+              - apple,j813  # MacBook Air (13-inch, M5, 2026)
           - const: apple,t8142
           - const: apple,arm-platform
 
