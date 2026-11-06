@@ -192,6 +192,9 @@ typedef uint64_t u64;
 #define WRITE_ONCE(x, v) ((x) = (v))
 #define DCP_FIRMWARE_V_27_0 27
 #define DCP_FIRMWARE_V_26_6_DESKTOP 26
+#define DCP_FIRMWARE_V_14_7 14
+#define DCP_FIRMWARE_V_12_3 12
+#define DCP_FIRMWARE_V_13_5 13
 #define DCP_FIRMWARE_H17P 25
 #define DRM_MODE_CONNECTOR_USB 1
 #define DRM_MODE_CONNECTOR_HDMIA 2
@@ -203,6 +206,10 @@ typedef uint64_t u64;
 #define DP_STATUS_HPD_STATE 1
 #define DP_STATUS_IRQ_HPD 2
 #define MUX_IDLE_DISCONNECT -1
+#define BIT(n) (1U << (n))
+#define container_of(p, t, m) ((t *)((char *)(p) - offsetof(t, m)))
+#define spin_lock_irqsave(p, f) ((void)(p), (f) = 0)
+#define spin_unlock_irqrestore(p, f) ((void)(p), (void)(f))
 
 struct host_mutex {
 	bool held;
@@ -240,11 +247,30 @@ static void host_unlock(struct host_guard *guard)
 
 struct list_head {
 	void *entry;
+	struct list_head *next;
 };
+
+static void host_list_append(struct list_head *head, struct list_head *link, void *entry)
+{
+	struct list_head *tail = head;
+
+	while (tail->next)
+		tail = tail->next;
+	tail->next = link;
+	link->entry = entry;
+	if (!head->entry)
+		head->entry = entry;
+}
+
+static void *host_list_next(const struct list_head *link)
+{
+	return link->next ? link->next->entry : NULL;
+}
 
 #define list_for_each_entry(p, h, m) \
 	for (__typeof__(p) item = (h)->entry; \
-	     (void)offsetof(__typeof__(*item), m), ((p) = item); item = NULL)
+	     ((p) = item); item = host_list_next(&item->m))
+#define list_empty(h) (!(h)->entry)
 
 struct phy {
 	int id;
@@ -252,6 +278,11 @@ struct phy {
 
 struct mux_control {
 	bool held;
+	struct host_mux_chip *chip;
+};
+
+struct host_mux_chip {
+	struct mux_control *mux;
 };
 
 struct platform_device {
@@ -295,10 +326,26 @@ struct typec_mux_dev {
 
 struct apple_dcp_typec_route;
 
+struct drm_crtc {
+	u32 index;
+};
+
+struct apple_crtc {
+	struct drm_crtc base;
+};
+
 struct apple_dcp {
 	struct platform_device *dev;
+	struct apple_crtc *crtc;
+	struct dcp_fabric_pipeline fabric;
+	struct dcp_fabric_presence hdmi_presence;
+	int hdmi_presence_lock;
+	unsigned int nr_typec_routes;
+	bool fixed_sink_present, fixed_link_held, external;
+	struct apple_dcp *peer_owner;
 	int fw_compat;
 	struct host_mutex external_lock, tb_lock, hpd_mutex, modes_lock;
+	int hdmi_start_wq;
 	int external_error;
 	bool external_power_attempted, external_stopped, external_cable;
 	bool external_physically_absent;
@@ -325,21 +372,25 @@ struct apple_dcp {
 HANDBACK_MOCKS = r'''// SPDX-License-Identifier: GPL-2.0-only OR MIT
 /* Firmware, mux and publication leaves, with lock and ownership assertions. */
 static struct host_mutex dcp_typec_fabric_lock;
+static struct list_head dcp_typec_ports;
+static bool typec_follow_crtc = true;
 static unsigned int dcp_hybrid_fails;
 static struct apple_dcp *display;
 static int select_error, deselect_error, disconnect_error, connect_error;
-static int selects, deselects, disconnects, connects, errors, capacity, retired;
+static int typec_select_error, activate_disconnect_error;
+static int selects, deselects, disconnects, connects, errors, retired;
+static int typec_selects, fixed_deselects, typec_connects;
 static int metadata_ends, metadata_starts, external_publications;
 static bool selection_under_external_lock;
 
-static void handback_error(const char *message, int error)
+static void handback_error(const char *message, ...)
 {
-	assert(message && error);
+	assert(message);
 	errors++;
 }
 
-#define dev_err(d, message, error) ((void)(d), handback_error(message, error))
-#define dev_warn(d, message, error) ((void)(d), handback_error(message, error))
+#define dev_err(d, ...) ((void)(d), handback_error(__VA_ARGS__))
+#define dev_warn(d, ...) ((void)(d), handback_error(__VA_ARGS__))
 #define dev_info(...) ((void)0)
 #define dev_info_once(...) ((void)0)
 
@@ -365,11 +416,27 @@ static int mux_control_select(struct mux_control *mux, unsigned int index)
 
 static int mux_control_deselect(struct mux_control *mux)
 {
-	assert(display->external_lock.held && display->tb_lock.held);
+	assert(dcp_typec_fabric_lock.held);
 	assert(mux->held);
 	mux->held = false;
+	if (mux == display->fixed_xbar) {
+		fixed_deselects++;
+		return 0;
+	}
+	assert(display->external_lock.held && display->tb_lock.held);
 	deselects++;
 	return deselect_error;
+}
+
+static int mux_control_try_select(struct mux_control *mux, unsigned int index)
+{
+	assert(dcp_typec_fabric_lock.held && !display->active_typec_route);
+	assert(!mux->held && !display->fixed_route_selected && index == 0);
+	typec_selects++;
+	if (typec_select_error)
+		return typec_select_error;
+	mux->held = true;
+	return 0;
 }
 
 static bool dcp_is_external_h17p(struct apple_dcp *dcp)
@@ -391,7 +458,7 @@ static void dcp_peer_release_26_6(struct apple_dcp *dcp)
 static void dcp_firmware_metadata_connection(struct apple_dcp *dcp,
 					     u64 generation, bool live)
 {
-	assert(dcp->external_lock.held && generation == dcp->typec_generation);
+	assert(generation == dcp->typec_generation);
 	if (live)
 		metadata_starts++;
 	else
@@ -553,11 +620,7 @@ static void dcp_announce_end(int *announce)
 	(void)announce;
 }
 
-static void dcp_typec_pipeline_freed(void)
-{
-	assert(dcp_typec_fabric_lock.held);
-	capacity++;
-}
+
 
 static bool dcp_typec_keep_order(void)
 {
@@ -571,43 +634,29 @@ static void dcp_typec_rebalance_locked(void *port, unsigned int mask)
 	assert(!"no rebalance on this single-pipeline fixture");
 }
 
-static struct apple_dcp_typec_route *
-dcp_typec_free_route(struct apple_dcp_typec_port *port)
-{
-	(void)port;
-	assert(!"no new Type-C connection in this fixture");
-	return NULL;
-}
 
-static struct apple_dcp_typec_route *
-dcp_typec_take_hdmi_pipeline_locked(struct apple_dcp_typec_port *port)
-{
-	return dcp_typec_free_route(port);
-}
 
-static int dcp_typec_port_busy(struct apple_dcp_typec_port *port, struct apple_dcp *dcp)
-{
-	(void)port;
-	(void)dcp;
-	assert(!"no busy route in this fixture");
-	return -ENOSPC;
-}
+static struct apple_dcp_typec_route *dcp_typec_free_route(struct apple_dcp_typec_port *port);
 
-static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
-				    struct mux_control *mux)
-{
-	(void)route;
-	(void)mux;
-	assert(!"no route acquisition in this fixture");
-	return -EINVAL;
-}
+
+
+
+
+
 
 static int dcp_dptx_connect_oob(struct platform_device *device, u32 port)
 {
-	(void)device;
-	(void)port;
-	assert(!"no Type-C connect in this fixture");
-	return -EINVAL;
+	struct apple_dcp_typec_route *route = display->active_typec_route;
+
+	assert(device == display->dev && !port && route && route->selected);
+	assert(route->xbar->held && !display->fixed_route_selected);
+	assert(display->phy == route->phy && display->dptx_phy == route->dptx_phy);
+	assert(display->typec_connector == route->port->connector);
+	assert(display->connector == display->typec_connector);
+	assert(display->typec_connector->dcp == device && display->typec_cable_connected);
+	display->dptxport[0].connected = true;
+	typec_connects++;
+	return 0;
 }
 
 static void dcp_retrain_oob(struct apple_connector *connector)
@@ -637,6 +686,84 @@ static int dcp_dptx_recover_irq(struct apple_dcp *dcp)
 
 static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 				 struct typec_mux_state *state);
+
+static int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
+{
+	assert(dcp_typec_fabric_lock.held && dcp == display && !port);
+	guard(mutex)(&dcp->external_lock);
+	return activate_disconnect_error;
+}
+
+static void apple_connector_edid_set_live(struct apple_connector *connector, bool live)
+{
+	assert(connector && !live);
+}
+
+static unsigned int drm_crtc_index(struct drm_crtc *crtc)
+{
+	return crtc->index;
+}
+
+static bool dcp_typec_ordered_dual_stream(void)
+{
+	return false;
+}
+
+static bool dcp_typec_hybrid_first(void)
+{
+	return false;
+}
+
+static bool dcp_hdmi_settle_enabled(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	return false;
+}
+
+static bool iomfb_v14_7_external_failed(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	return false;
+}
+
+static bool dcpext_scanout_terminal(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	return false;
+}
+
+static bool dcp_tb_services_ready(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	assert(!"no tunnel service query in this fixture");
+	return false;
+}
+
+static u8 dcp_route_tunnel_clock_blocked(struct apple_dcp_typec_route *route)
+{
+	(void)route;
+	return 0;
+}
+
+static int of_property_read_string(void *node, const char *name, const char **value)
+{
+	(void)node;
+	(void)name;
+	*value = NULL;
+	return -ENOENT;
+}
+
+static void cancel_delayed_work(int *work)
+{
+	(void)work;
+	assert(!"no live fixed sink to yield in this fixture");
+}
+
+static void dcp_hdmi_yield_link(struct apple_dcp *dcp)
+{
+	(void)dcp;
+	assert(!"no live fixed sink to yield in this fixture");
+}
 '''
 
 
@@ -645,6 +772,7 @@ HANDBACK_ASSERTIONS = r'''// SPDX-License-Identifier: GPL-2.0-only OR MIT
 int main(int argc, char **argv)
 {
 	struct platform_device device = {};
+	struct apple_crtc crtc = {};
 	struct phy typec_phy = { .id = 1 }, fixed_phy = { .id = 2 };
 	struct mux_control typec_mux = { .held = true }, fixed_mux = {};
 	struct encoder encoder = { .possible_crtcs = 1 };
@@ -658,6 +786,8 @@ int main(int argc, char **argv)
 	int gpio = 1;
 	struct apple_dcp dcp = {
 		.dev = &device,
+		.crtc = &crtc,
+		.nr_typec_routes = 1,
 		.fw_compat = DCP_FIRMWARE_V_27_0,
 		.hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
 		.active = true,
@@ -683,6 +813,7 @@ int main(int argc, char **argv)
 		.fixed_connector_type = DRM_MODE_CONNECTOR_HDMIA,
 	};
 	struct apple_dcp_typec_port port = {
+		.connector = &typec_connector,
 		.hpd = true,
 		.dp_wanted = true,
 		.dp_hpd = true,
@@ -712,7 +843,123 @@ int main(int argc, char **argv)
 	dcp.active_typec_route = &route;
 	dcp.dptxport[0].connected = true;
 	port.owner = &route;
-	port.routes.entry = &route;
+	host_list_append(&port.routes, &route.port_link, &route);
+	host_list_append(&dcp_typec_ports, &port.link, &port);
+
+	if (!strncmp(name, "recovery-", 9)) {
+		struct phy next_phy = { .id = 3 };
+		struct mux_control next_mux = {};
+		struct apple_connector next_connector = { .candidate_crtcs = 1 };
+		struct apple_dcp_typec_port next_port = {
+			.connector = &next_connector,
+			.dp_wanted = true,
+			.dp_hpd = true,
+		};
+		struct apple_dcp_typec_route next_route = {
+			.dcp = &dcp,
+			.port = &next_port,
+			.phy = &next_phy,
+			.dptx_phy = 3,
+			.xbar = &next_mux,
+		};
+		struct typec_mux_dev next_provider = { .data = &next_route };
+
+		host_list_append(&next_port.routes, &next_route.port_link, &next_route);
+		/* Put the retained owner second: reservations must scan every port. */
+		dcp_typec_ports = (struct list_head){};
+		port.link = (struct list_head){};
+		host_list_append(&dcp_typec_ports, &next_port.link, &next_port);
+		host_list_append(&dcp_typec_ports, &port.link, &port);
+		state = (struct typec_mux_state){
+			.mode = TYPEC_DP_STATE_A, .alt = &alt, .data = &dp,
+		};
+		select_error = -EIO;
+		if (!strcmp(name, "recovery-teardown-error"))
+			deselect_error = -EIO;
+		assert(dcp_typec_route_finish(&mux, &state) == -EIO);
+		assert(port.owner == &route && !port.safe_pending && !port.applied_valid);
+		assert(dcp.hdmi_yielded && !fixed_mux.held && !typec_mux.held);
+		assert(!connects && !typec_connects && !next_port.owner);
+		if (deselect_error) {
+			assert(dcp.active_typec_route == &route && route.deactivate_error == -EIO);
+			dp.status = DP_STATUS_HPD_STATE;
+			assert(dcp_typec_route_finish(&mux, &state) == -EIO);
+			assert(!port.applied_valid && !typec_selects && !typec_connects);
+			puts("PASS an unproven crossbar teardown cannot acknowledge HPD-high");
+			return 0;
+		}
+		assert(!dcp.active_typec_route && !route.selected && !dcp.typec_connector);
+		assert(!dcp.fixed_route_selected && retired == 1 && selects == 1);
+		if (strcmp(name, "recovery-hpd-high")) {
+			guard(mutex)(&dcp_typec_fabric_lock);
+			assert(!dcp_typec_route_available(&next_route));
+			assert(!dcp_typec_free_route(&next_port));
+			assert(dcp.fabric.owned && !dcp.fabric.fixed_busy);
+			assert(dcp.fabric.presence == DCP_FABRIC_ABSENT);
+			/* Another capacity event must not allocate the reserved pipeline. */
+			dcp_typec_pipeline_freed();
+			assert(!next_port.owner && !typec_connects && !typec_selects);
+		}
+
+		select_error = 0;
+		if (!strcmp(name, "recovery-low-to-waiter")) {
+			/* A real HPD-low retry completes release and wakes the other port. */
+			gpio = 0;
+			assert(!dcp_typec_route_finish(&mux, &state));
+			assert(!port.owner && port.applied_valid);
+			assert(next_port.owner == &next_route && next_route.selected);
+			assert(dcp.active_typec_route == &next_route && next_mux.held);
+			assert(typec_connects == 1 && !typec_mux.held && !connects);
+			dp.status = DP_STATUS_HPD_STATE;
+			assert(dcp_typec_route_finish(&mux, &state) == -ENOSPC);
+			assert(!port.owner && !port.applied_valid && typec_connects == 1);
+			/* The competitor leaves: real capacity wakeup reacquires the original. */
+			dp.status = 0;
+			assert(!dcp_typec_route_finish(&next_provider, &state));
+			assert(!next_port.owner && port.owner == &route && route.selected);
+			assert(dcp.active_typec_route == &route && typec_mux.held);
+			assert(typec_connects == 2 && !next_mux.held && !connects);
+			assert(retired == 4 && dcp.modes_generation == 7);
+			puts("PASS production allocation, capacity wakeup and later reacquisition");
+			return 0;
+		}
+		if (!strcmp(name, "recovery-hpd-high-fixed-error"))
+			select_error = -EIO;
+		if (!strcmp(name, "recovery-hpd-high-mux-error"))
+			typec_select_error = -EBUSY;
+		if (!strcmp(name, "recovery-hpd-high-disconnect-error"))
+			activate_disconnect_error = -ETIMEDOUT;
+		dp.status = DP_STATUS_HPD_STATE;
+		ret = dcp_typec_route_finish(&mux, &state);
+		if (typec_select_error || activate_disconnect_error) {
+			assert(ret == (typec_select_error ?: activate_disconnect_error));
+			assert(port.owner == &route && !port.applied_valid);
+			assert(!route.selected && !dcp.active_typec_route && !typec_connects);
+			{
+				guard(mutex)(&dcp_typec_fabric_lock);
+				assert(!dcp_typec_route_available(&next_route));
+				assert(!dcp_typec_free_route(&next_port));
+			}
+			typec_select_error = activate_disconnect_error = 0;
+			/* Only this next mux event retries the failed acquisition. */
+			ret = dcp_typec_route_finish(&mux, &state);
+		}
+		assert(!ret && port.applied_valid && port.hpd);
+		assert(port.owner == &route && route.selected && dcp.active_typec_route == &route);
+		assert(typec_mux.held && !fixed_mux.held && !dcp.fixed_route_selected);
+		assert(dcp.phy == &typec_phy && dcp.dptx_phy == 1);
+		assert(dcp.typec_connector == &typec_connector && typec_connector.dcp == &device);
+		assert(typec_connects == 1 && !connects && dcp.hdmi_yielded);
+		assert(retired == 2 && dcp.modes_generation == 5);
+		assert(!route.deactivate_xbar_done && !route.deactivate_error);
+		{
+			guard(mutex)(&dcp_typec_fabric_lock);
+			assert(!dcp_typec_route_available(&next_route));
+			assert(!dcp_typec_free_route(&next_port));
+		}
+		printf("PASS production HPD-high reacquisition: %s\n", name);
+		return 0;
+	}
 
 	if (!strcmp(name, "not-yielded"))
 		dcp.hdmi_yielded = false;
@@ -773,7 +1020,7 @@ int main(int argc, char **argv)
 			assert(deselects == 1 && retired == 2 && disconnects == 1);
 		}
 		assert(ret == connect_error);
-		assert(!port.owner && !port.safe_pending && capacity == 1);
+		assert(!port.owner && !port.safe_pending && !typec_connects);
 		assert(connects == 1 && !dcp.hdmi_yielded);
 		assert(selects >= 1 && !dcp.typec_connector);
 		assert(dcp.phy == &fixed_phy && dcp.dptx_phy == 2);
@@ -843,7 +1090,7 @@ int main(int argc, char **argv)
 	dcp_typec_route_commit(&mux, &state);
 	assert(!port.owner && !port.safe_pending && !port.safe_finish_ready);
 	assert(port.applied_valid && port.preferred_route == &route);
-	assert(capacity == 1 && !dcp.hdmi_yielded);
+	assert(!typec_connects && !dcp.hdmi_yielded);
 	if (!gpio || !dcp.active || select_error) {
 		assert(!connects && retired == 1 && !external_publications);
 		assert(!select_error || (errors == 1 && !dcp.fixed_route_selected));
@@ -858,7 +1105,7 @@ int main(int argc, char **argv)
 	int attempts = connects;
 
 	dcp_typec_route_commit(&mux, &state);
-	assert(connects == attempts && capacity == 1);
+	assert(connects == attempts && !typec_connects);
 	assert(!dcp.external_lock.held && !dcp.tb_lock.held && !dcp.hpd_mutex.held);
 	printf("PASS production SAFE handback: %s\n", name);
 	return 0;
@@ -869,7 +1116,11 @@ int main(int argc, char **argv)
 HANDBACK_CASES = ('safe', 'hpd', 'exit', 'select-failure', 'hpd-select-failure',
          'disconnect-failure', 'deactivate-failure', 'connect-failure',
          'safe-connect-failure', 'absent', 'hpd-rise', 'late-select-failure',
-         'inactive', 'no-fixed-mux', 'not-yielded', 'route-move', 'desktop')
+         'inactive', 'no-fixed-mux', 'not-yielded', 'route-move', 'desktop',
+         'recovery-hpd-high', 'recovery-hpd-high-fixed-error',
+         'recovery-hpd-high-mux-error', 'recovery-hpd-high-disconnect-error',
+         'recovery-competing-allocator', 'recovery-low-to-waiter',
+         'recovery-teardown-error')
 
 
 def handback(root, fabric=None):
@@ -879,11 +1130,19 @@ def handback(root, fabric=None):
     dcp = (apple / 'dcp.c').read_text()
     core = (apple / 'dcp-fabric-core.h').read_text()
     effects = (apple / 'dcp-fabric-effects.h').read_text()
-    unit = HANDBACK_PREFIX + '\n'
+    # The real pipeline type is embedded by the host DCP boundary below.
+    prefix, dcp_struct = HANDBACK_PREFIX.split('struct apple_dcp {', 1)
+    unit = prefix + '#include <limits.h>\n'
+    for marker in ('enum dcp_fabric_presence_state {',
+                   'struct dcp_fabric_presence {', 'struct dcp_fabric_pipeline {'):
+        unit += block(core, marker) + ';\n'
+    unit += 'struct apple_dcp {' + dcp_struct + '\n'
     for source, marker in (
         (core, 'struct dcp_fabric_route {'),
         (core, 'struct dcp_fabric_plan {'),
         (core, 'struct dcp_fabric_port {'),
+        (core, 'struct dcp_fabric_policy {'),
+        (core, 'enum dcp_fabric_capacity_action {'),
         (core, 'enum dcp_fabric_fixed_step {'),
         (fabric, 'struct apple_dcp_typec_port {'),
         ((apple / 'dcp-fabric.h').read_text(),
@@ -894,10 +1153,33 @@ def handback(root, fabric=None):
     unit += HANDBACK_MOCKS + '\n'
     for source, markers in (
         ((apple / 'dcp-fabric-core.c').read_text(),
-         ('unsigned int dcp_fabric_fixed_steps(',)),
+         ('unsigned int dcp_fabric_fixed_steps(',
+          'enum dcp_fabric_capacity_action dcp_fabric_capacity_action(',
+          'bool dcp_fabric_fixed_busy(', 'bool dcp_fabric_available(',
+          'unsigned int dcp_fabric_score(', 'bool dcp_fabric_waiting(',
+          'struct dcp_fabric_route *\ndcp_fabric_free_route(',
+          'u32 dcp_fabric_connector_mask(')),
         (effects, ('static inline int dcp_fabric_run_fixed(',)),
         ((apple / 'iomfb.c').read_text(), ('bool dcp_modes_end_typec(',)),
         (fabric, ('bool dcp_is_typec_output(',
+                  'bool dcp_typec_follows_crtc(',
+                  'static bool dcp_typec_narrows(',
+                  'static bool dcp_typec_port_follows(',
+                  'static bool dcp_typec_safe_held(',
+                  'static bool dcp_typec_route_fixed_output_busy(',
+                  'static bool dcp_typec_route_busy(',
+                  'static enum dcp_fabric_presence_state dcp_hdmi_presence(',
+                  'static bool dcp_typec_route_available(',
+                  'static bool dcp_typec_tunnel_held(',
+                  'static struct apple_dcp_typec_route *\ndcp_fabric_real_route(',
+                  'static void dcp_fabric_snapshot_port(',
+                  'static struct apple_dcp_typec_route *\ndcp_typec_free_route(',
+                  'static struct apple_dcp_typec_route *\ndcp_typec_take_hdmi_pipeline_locked(',
+                  'static int dcp_typec_port_busy(',
+                  'static int dcp_typec_route_activate(',
+                  'static void dcp_typec_port_attach(',
+                  'static void dcp_typec_route_waiting(',
+                  'static void dcp_typec_pipeline_freed(',
                   'static void dcp_fixed_restore_phy(',
                   'static int dcp_fixed_select_mux(',)),
     ):
@@ -946,6 +1228,7 @@ def handback_mutations(unit, output, cases):
     apply = block(unit, 'static int dcp_typec_route_apply(')
     deactivate = block(unit, 'static int dcp_typec_route_deactivate(')
     retire = block(unit, 'bool dcp_modes_end_typec(')
+    held = block(unit, 'static bool dcp_typec_safe_held(')
     changes = (
         ('keep-yielded', release, release.replace(
             'WRITE_ONCE(dcp->hdmi_yielded, false);', '(void)0;')),
@@ -973,6 +1256,21 @@ def handback_mutations(unit, output, cases):
             '\tdcp_typec_connect_fixed(port->owner->dcp);')),
         ('omit-final-unyield', 'WRITE_ONCE(released->hdmi_yielded, false);',
          '(void)0;'),
+        ('invisible-retained-owner', held, held.replace(
+            'port->safe_pending || dcp->fw_compat == DCP_FIRMWARE_V_27_0',
+            'port->safe_pending')),
+        ('skip-hpd-high-reactivation',
+         'ret = dcp_typec_route_activate(owner, owner->xbar);', 'ret = 0;'),
+        ('ignore-reactivation-error', apply, apply.replace(
+            'ret = dcp_typec_route_activate(owner, owner->xbar);\n'
+            '\t\t\tif (ret)\n\t\t\t\treturn ret;',
+            'ret = dcp_typec_route_activate(owner, owner->xbar);\n\t\t\tret = 0;')),
+        ('never-recover-retained-owner',
+         'ret = dcp_typec_route_activate(owner, owner->xbar);',
+         'ret = -EAGAIN;'),
+        ('accept-unproven-teardown', apply, apply.replace(
+            'if (owner->deactivate_error)\n\t\t\treturn owner->deactivate_error;',
+            'if (false)\n\t\t\treturn owner->deactivate_error;')),
     )
     results = []
     for name, old, new in changes:
@@ -986,6 +1284,7 @@ def main():
     parser.add_argument('--output', type=Path)
     parser.add_argument('--mutations', action='store_true')
     parser.add_argument('--old-ref', help='negative control: only the fabric from this local ref')
+    parser.add_argument('--review-ref', help='negative controls: the reviewed stale-owner fabric')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[6]
     output = args.output or Path(tempfile.mkdtemp(prefix='dcp-handback-'))
@@ -1000,6 +1299,13 @@ def main():
             cwd=root, text=True)
         old, _ = handback(root, fabric)
         handback_killed('old-handback', old, output, (('safe',),))
+    if args.review_ref:
+        fabric = subprocess.check_output(
+            ['git', 'show', args.review_ref + ':drivers/gpu/drm/apple/dcp-fabric.c'],
+            cwd=root, text=True)
+        old, _ = handback(root, fabric)
+        for case in ('recovery-hpd-high', 'recovery-competing-allocator'):
+            handback_killed('review-' + case, old, output, ((case,),))
 
 
 if __name__ == '__main__':

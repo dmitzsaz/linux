@@ -258,13 +258,14 @@ static bool dcp_typec_route_fixed_output_busy(struct apple_dcp_typec_route *rout
 				     gpiod_get_value_cansleep(dcp->hdmi_hpd));
 }
 
-/* A port in SAFE retains this pipeline until the mux set phase completes. */
+/* SAFE and a failed FW27 handback retain their owner's pipeline reservation. */
 static bool dcp_typec_safe_held(struct apple_dcp *dcp)
 {
 	struct apple_dcp_typec_port *port;
 
 	list_for_each_entry(port, &dcp_typec_ports, link)
-		if (port->safe_pending && port->owner && port->owner->dcp == dcp)
+		if (port->owner && port->owner->dcp == dcp &&
+		    (port->safe_pending || dcp->fw_compat == DCP_FIRMWARE_V_27_0))
 			return true;
 	return false;
 }
@@ -2028,6 +2029,25 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 	if (port->owner && port->owner->tunnel) {
 		port->applied_valid = false;
 		return 0;
+	}
+
+	/*
+	 * Fixed selection may have failed after fully releasing the Type-C
+	 * route. Its retained owner reserves the pipeline, but HPD returning
+	 * needs the mux, PHY and connector activated again before reconnect.
+	 */
+	if (hpd && port->owner && port->owner->dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		struct apple_dcp_typec_route *owner = port->owner;
+
+		if (owner->deactivate_error)
+			return owner->deactivate_error;
+		if (!owner->selected) {
+			if (READ_ONCE(owner->dcp->active_typec_route))
+				return -EBUSY;
+			ret = dcp_typec_route_activate(owner, owner->xbar);
+			if (ret)
+				return ret;
+		}
 	}
 
 	/*
