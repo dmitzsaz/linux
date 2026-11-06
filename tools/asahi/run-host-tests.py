@@ -119,6 +119,7 @@ ASAHI_TESTS = {
     'g17-compute-deadline-tests.py': [([], PASS)],
     'g17-compute-growth-deadline-tests.py': [([], PASS)],
     'g17-firmware-selection-tests.py': [([], PASS)],
+    'gpu-frame-timing-tests.py': [([], PASS)],
     'g17-growth-gate-tests.py': [([], PASS)],
     'g17-growth-tests.py': [([], PASS)],
     'g17-owner-release-order-tests.py': [([], PASS)],
