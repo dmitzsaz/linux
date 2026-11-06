@@ -2544,16 +2544,33 @@ static int dcp_desktop_dptx_disconnect_oob(struct apple_dcp *dcp, u32 port)
  * up without a sink and the firmware sees no change.
  */
 /* The HDMI display gives its pipeline up: report it gone, release its link. */
-void dcp_hdmi_yield_link(struct apple_dcp *dcp)
+int dcp_hdmi_yield_link(struct apple_dcp *dcp)
 {
 	int tries = 5, ret;
 
 	disconnected_hpd_event(dcp->connector);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp_is_external_h17p(dcp)) {
+		/*
+		 * The next output has a different sink, even when HDMI HPD was
+		 * already low. Retire its attachment before Type-C connects, or
+		 * the initial-mode worker mistakes it for the old CRTC's DPMS wake.
+		 * Fence in-flight replies before waiting for the stopped session.
+		 */
+		ret = dcp_external_disconnect(dcp, true);
+		dcp_modes_begin_attachment(dcp);
+		if (ret) {
+			/* Failed teardown still owns the hardware; do not lend it. */
+			WRITE_ONCE(dcp->fixed_link_held, true);
+			WRITE_ONCE(dcp->hdmi_yielded, false);
+		}
+		return ret;
+	}
 	/* A link the firmware keeps retrying is released between attempts. */
 	while ((ret = dcp_dptx_disconnect(dcp, 0)) && --tries)
 		msleep(600);
 	if (ret)
 		dev_warn(dcp->dev, "HDMI link not released: %d\n", ret);
+	return ret;
 }
 
 irqreturn_t dcp_desktop_dp2hdmi_hpd(struct apple_dcp *dcp)
