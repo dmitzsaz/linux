@@ -231,6 +231,7 @@ static __attribute__((unused)) unsigned long int_sqrt(unsigned long x)
 #define DRM_MODE_FLAG_NHSYNC 2
 #define DRM_MODE_FLAG_PVSYNC 4
 #define DRM_MODE_FLAG_NVSYNC 8
+#define DRM_MODE_CONNECTOR_HDMIA 11
 #define cpu_to_le16(v) (v)
 #define cpu_to_le32(v) (v)
 #define cpu_to_be16(v) __builtin_bswap16(v)

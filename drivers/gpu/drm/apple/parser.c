@@ -481,6 +481,7 @@ struct timing_color_ids {
 struct timing_color_restrictions {
 	struct timing_color_ids unsafe;
 	struct timing_color_ids dsc_required;
+	bool ycbcr420;
 };
 
 static bool timing_color_contains(const struct timing_color_ids *ids, u32 id)
@@ -522,6 +523,7 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 {
 	struct iterator it;
 	bool unsafe_seen = false, dsc_seen = false, colors_seen = false;
+	bool encodings_seen = false;
 	int ret;
 
 	ret = iterator_begin(handle, &it, true);
@@ -543,6 +545,15 @@ static int parse_timing_color_restrictions(struct dcp_parse_ctx *handle,
 		} else if (!strcmp(key, "ColorModes")) {
 			ret = colors_seen ? -EINVAL : skip(handle);
 			colors_seen = true;
+		} else if (handle->fw27_hdmi_ycbcr420 &&
+			   !strcmp(key, "ValidPixelEncodings")) {
+			s64 encodings;
+
+			ret = encodings_seen ? -EINVAL :
+				parse_int_bound(handle, &encodings, 0, U32_MAX);
+			if (!ret)
+				limits->ycbcr420 = encodings & (1U << DCP_COLOR_FORMAT_YCBCR420);
+			encodings_seen = true;
 		} else {
 			ret = skip(handle);
 		}
@@ -593,6 +604,64 @@ static void collect_pq_mode(struct dcp_color_mode *pq, unsigned int *best_rank,
 	*best_rank = rank;
 }
 
+static bool sdr_ycbcr8(const struct color_mode *color, enum dcp_color_format encoding)
+{
+	return color->id >= 0 && color->id <= U32_MAX && color->score >= 0 &&
+	       color->depth == 8 && color->pixel_encoding == encoding &&
+	       color->dynamic_range == DCP_COLOR_YCBCR_RANGE_LIMITED &&
+	       color->eotf == DCP_EOTF_SDR_GAMMA &&
+	       color->colorimetry == DCP_COLORIMETRY_BT709;
+}
+
+/* Validate the converter's output without turning it into an A413 command. */
+static bool parse_sdr_420_output(struct dcp_parse_ctx handle, u32 *id)
+{
+	static const char * const fields[] = {
+		"ID", "Score", "Depth", "PixelEncoding", "DynamicRange", "EOTF", "Colorimetry",
+	};
+	struct color_mode color = {};
+	s64 *values[] = { &color.id, &color.score, &color.depth, &color.pixel_encoding,
+			 &color.dynamic_range, &color.eotf, &color.colorimetry };
+	bool virtual_seen = false, is_virtual = true;
+	unsigned int seen = 0;
+	struct iterator it;
+	int ret;
+
+	if (iterator_begin(&handle, &it, true))
+		return false;
+	for (; it.idx < it.len; it.idx++) {
+		char *key = parse_string(&handle);
+		unsigned int field;
+
+		if (IS_ERR(key))
+			return false;
+		for (field = 0; field < ARRAY_SIZE(fields); field++)
+			if (!strcmp(key, fields[field]))
+				break;
+		if (field < ARRAY_SIZE(fields)) {
+			ret = seen & (1U << field) ? -EINVAL :
+				parse_int(&handle, values[field]);
+			seen |= 1U << field;
+		} else if (!strcmp(key, "IsVirtual")) {
+			ret = virtual_seen ? -EINVAL : parse_bool(&handle, &is_virtual);
+			virtual_seen = true;
+		} else if (!strcmp(key, "DownstreamFormat")) {
+			/* Another conversion stage is not described by this policy. */
+			ret = -EINVAL;
+		} else {
+			ret = skip(&handle);
+		}
+		kfree(key);
+		if (ret)
+			return false;
+	}
+	if (seen != (1U << ARRAY_SIZE(fields)) - 1 || !virtual_seen || is_virtual ||
+	    !sdr_ycbcr8(&color, DCP_COLOR_FORMAT_YCBCR420))
+		return false;
+	*id = color.id;
+	return true;
+}
+
 static int parse_color_modes(struct dcp_parse_ctx *handle,
 			     struct dcp_display_mode *out, bool external_sdr,
 			     const struct timing_color_restrictions *limits,
@@ -620,6 +689,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		static const char * const fields[] = { "Colorimetry", "Depth", "DynamicRange", "EOTF", "ID", "PixelEncoding", "Score", "IsVirtual" };
 		unsigned int seen = 0;
 		bool is_virtual = true;
+		bool ambiguous = false, output_seen = false, output_valid = false;
+		bool ycbcr420 = external_sdr && handle->fw27_hdmi_ycbcr420 && limits->ycbcr420;
+		u32 output_id = 0;
 		struct color_mode cmode = {
 			.colorimetry = -1,
 			.depth = -1,
@@ -638,12 +710,16 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			char *key = parse_string(it.handle);
 			unsigned int field;
 
-			if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-				for (field = 0; field < 8; field++)
-					if (!strcmp(key, fields[field])) {
-						handle->ambiguous_180hz |= !!(seen & (1U << field));
-						seen |= 1U << field;
-					}
+			if (!IS_ERR(key) && (handle->automatic_1080p180_rgb8 || ycbcr420)) {
+				for (field = 0; field < ARRAY_SIZE(fields); field++) {
+					if (strcmp(key, fields[field]))
+						continue;
+					ambiguous |= !!(seen & (1U << field));
+					seen |= 1U << field;
+				}
+				if (handle->automatic_1080p180_rgb8)
+					handle->ambiguous_180hz |= ambiguous;
+			}
 
 			if (IS_ERR(key))
 				ret = PTR_ERR(key);
@@ -663,8 +739,14 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				ret = parse_int(it.handle, &cmode.pixel_encoding);
 			else if (!strcmp(key, "Score"))
 				ret = parse_int(it.handle, &cmode.score);
-			else
+			else if (ycbcr420 && !strcmp(key, "DownstreamFormat")) {
+				output_valid = !output_seen &&
+					parse_sdr_420_output(*it.handle, &output_id);
+				output_seen = true;
 				ret = skip(it.handle);
+			} else {
+				ret = skip(it.handle);
+			}
 
 			if (!IS_ERR_OR_NULL(key))
 				kfree(key);
@@ -723,6 +805,18 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				}
 				continue;
 			}
+			/*
+			 * A413 selects the outer color ID; firmware owns the nested
+			 * HDMI conversion. Keep this in SDR, behind usable RGB, and
+			 * admit only the matching BT.709 8-bit limited-range pair.
+			 */
+			if (ycbcr420 && !ambiguous &&
+			    seen == (1U << ARRAY_SIZE(fields)) - 1 && output_valid &&
+			    output_id != cmode.id &&
+			    sdr_ycbcr8(&cmode, DCP_COLOR_FORMAT_YCBCR422) &&
+			    !timing_color_contains(&limits->unsafe, output_id) &&
+			    !timing_color_contains(&limits->dsc_required, output_id))
+				fill_color_mode(&out->sdr, &cmode);
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -886,6 +980,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			return ret;
 		}
 	}
+	/* The fallback is representable only as progressive, unrepeated scanout. */
+	if (external_sdr && out->sdr.score >= 0 &&
+	    (!have_interlaced || interlaced || notch_height ||
+	     horiz.pixel_repetition != 0 || vert.pixel_repetition != 0))
+		out->sdr.score = -1;
 	/*
 	 * Never replace a normal candidate or create a timing/color pairing.
 	 * Only the bounded automatic policy may publish or use this candidate.
