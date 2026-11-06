@@ -473,7 +473,7 @@ struct apple_dcp {
  struct dcp_hdmi *hdmi;
  struct { bool changing; } mode_state;
  void *active_typec_route,*fixed_phy,*dev;
- bool quiescing,placeholder_retried,typec_cable_connected,external_cable;
+ bool quiescing,placeholder_retried,typec_cable_connected,external_cable,external_physically_absent;
  u64 typec_generation;
  struct { int lock; u64 epoch; bool enabled; void *service; } dcpavserv;
  int width_mm,height_mm,notch_height,fixed_connector_type,external_held;
@@ -664,8 +664,11 @@ static bool dcp_180hz_link_current(struct apple_dcp *d,const struct dcp_display_
                             'static inline bool dcp_property_size_valid(')
     for marker in ('void dcp_firmware_metadata_connection(',
                    'static void dcp_firmware_metadata_present_locked(',
-                   'void dcp_firmware_metadata_hotplug(', 'void dcp_firmware_metadata_begin('):
-        production += '\n' + block(dcp, marker)
+                   'void dcp_firmware_metadata_hotplug(',
+                   'static bool dcp_firmware_metadata_recoverable(',
+                   'static bool dcp_firmware_metadata_physical(', 'void dcp_firmware_metadata_begin('):
+        if marker in dcp:
+            production += '\n' + block(dcp, marker)
     for marker in ('static u8 dcpep_cb_prop_start(', 'static u8 dcpep_cb_prop_chunk('):
         production += '\n' + block(template, marker)
     for marker in ('static bool dcp_catalog_current(', 'bool dcp_external_modes_ready('):

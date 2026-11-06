@@ -1405,20 +1405,6 @@ static u8 dcpep_cb_prop_start(struct apple_dcp *dcp, u32 *length)
 		dcp->chunks.automatic_service_pending =
 			!dcp->dcpavserv.enabled && !dcp->dcpavserv.service;
 		dcp_firmware_metadata_begin(dcp);
-		{
-			unsigned long flags;
-
-			spin_lock_irqsave(&dcp->metadata.lock, flags);
-			dcp->chunks.automatic_connection_sequence = dcp->rate_proof.connection_sequence;
-			dcp->chunks.mode_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
-			dcp->chunks.mode_ticket.associated =
-				dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
-				(READ_ONCE(dcp->typec_cable_connected) ||
-				 (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-				  !READ_ONCE(dcp->active_typec_route) &&
-				  READ_ONCE(dcp->external_cable)));
-			spin_unlock_irqrestore(&dcp->metadata.lock, flags);
-		}
 		mutex_unlock(&dcp->dcpavserv.lock);
 	} else {
 		dcp_firmware_metadata_begin(dcp);
