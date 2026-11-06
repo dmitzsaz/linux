@@ -661,10 +661,6 @@ struct apple_dcp {
 
 	/* Workqueue for sending vblank events when a dcp swap is not possible */
 	struct work_struct vblank_wq;
-	/* Firmware-27 external pipe: preferred mode at connect, see iomfb.c. */
-	struct work_struct ext_early_mode_wq;
-	/* Serializes that work's mode set with the CRTC's. */
-	struct mutex ext_modeset_lock;
 
 	/* Completes a Type-C swap that DCP dropped, and recovers the pipe. */
 	struct delayed_work swap_watchdog_wq;
@@ -942,7 +938,6 @@ bool iomfb_queue_drain(struct apple_dcp *dcp, unsigned long timeout);
 int iomfb_queue_settle(struct apple_dcp *dcp, unsigned long timeout);
 void iomfb_pause_presentation(struct apple_dcp *dcp, bool pause);
 int iomfb_external_power_h17p(struct apple_dcp *dcp, bool on);
-void dcp_ext_early_mode_work(struct work_struct *work);
 int iomfb_queue(struct apple_dcp *dcp, struct iomfb_transaction *transaction);
 void iomfb_queue_crc_h17p(struct apple_dcp *dcp, u32 swap_id);
 

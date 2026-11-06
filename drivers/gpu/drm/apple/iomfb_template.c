@@ -2681,12 +2681,6 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (!*connected)
 		WRITE_ONCE(dcp->ext_backlight, false);
 
-#if (DCP_FW_H17(DCP_FW_VER) && DCP_FW_VER >= DCP_FW_VERSION(27, 0, 0))
-	/* Use the link trained at connect, see dcp_ext_early_mode_work(). */
-	if (*connected && dcp_is_external_h17p(dcp) && dcp->nr_modes &&
-	    !READ_ONCE(dcp->mode_state.valid))
-		schedule_work(&dcp->ext_early_mode_wq);
-#endif
 	if (dcp_external_hotplug(dcp, !!(*connected)))
 		return;
 

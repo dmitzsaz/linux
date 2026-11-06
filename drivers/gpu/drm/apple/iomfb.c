@@ -2873,8 +2873,7 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 		ret = iomfb_modeset_h17p(dcp, crtc_state);
 		break;
 	case DCP_FIRMWARE_V_27_0:
-		scoped_guard(mutex, &dcp->ext_modeset_lock)
-			ret = iomfb_modeset_v27(dcp, crtc_state);
+		ret = iomfb_modeset_v27(dcp, crtc_state);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
@@ -2895,66 +2894,6 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	dcp_handle_hotplug_actions(dcp, action);
 
 	return ret;
-}
-
-/*
- * Firmware 27 trains the link of an external display when it connects and
- * keeps it while a mode follows soon. A compositor sets its mode seconds
- * later; by then the sink may have let the idle link go, and the mode set
- * must retrain it, which fails on T8142. Set a mode as soon as the
- * firmware reports the display, on the link it has just trained, as the
- * J704 external display path that drove these displays did. The mode state is left alone, so the compositor's mode set follows
- * on the link this one established.
- */
-void dcp_ext_early_mode_work(struct work_struct *work)
-{
-	struct apple_dcp *dcp = container_of(work, struct apple_dcp, ext_early_mode_wq);
-	struct drm_crtc_state state = {};
-	bool found = false;
-	int ret;
-
-	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->mode_state.valid) ||
-	    READ_ONCE(dcp->mode_state.changing))
-		return;
-	/*
-	 * The display's native resolution (the mode DRM prefers) at its lowest
-	 * pixel clock, 60 Hz on a high-refresh monitor, as that path used: it
-	 * fits the link whatever lane count training settled on, and the
-	 * compositor raises the refresh rate afterwards.
-	 */
-	scoped_guard(mutex, &dcp->modes_lock) {
-		const struct drm_display_mode *res = NULL, *best = NULL;
-
-		for (unsigned int i = 0; i < dcp->nr_modes && !res; i++)
-			if (dcp->modes[i].mode.type & DRM_MODE_TYPE_PREFERRED)
-				res = &dcp->modes[i].mode;
-		if (!res && dcp->nr_modes)
-			res = &dcp->modes[0].mode;
-		for (unsigned int i = 0; res && i < dcp->nr_modes; i++) {
-			const struct drm_display_mode *m = &dcp->modes[i].mode;
-
-			if (m->hdisplay != res->hdisplay || m->vdisplay != res->vdisplay)
-				continue;
-			if (!best || m->clock < best->clock)
-				best = m;
-		}
-		if (best) {
-			drm_mode_copy(&state.mode, best);
-			found = true;
-		}
-	}
-	if (!found)
-		return;
-	scoped_guard(mutex, &dcp->ext_modeset_lock) {
-		/* The CRTC's own mode set may have run meanwhile. */
-		if (READ_ONCE(dcp->mode_state.valid))
-			return;
-		ret = iomfb_external_power_h17p(dcp, true);
-		if (!ret)
-			ret = iomfb_modeset_v27(dcp, &state);
-	}
-	dev_info(dcp->dev, "external display: mode " DRM_MODE_FMT
-		 " set at connect: %d\n", DRM_MODE_ARG(&state.mode), ret);
 }
 
 bool dcp_crtc_needs_route_start(struct apple_dcp *dcp)
