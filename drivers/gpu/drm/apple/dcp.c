@@ -622,7 +622,7 @@ static void dcp_firmware_metadata_present_locked(struct apple_dcp *dcp)
 	dcp->metadata.hpd_seen = true;
 	/*
 	 * Fresh proof may precede HPD assertion after a same-cable loss.
-	 * Keep invalidated firmware metadata and old receipt tickets revoked.
+	 * Old receipts stay revoked; FW27 can recover from fresh transfers.
 	 */
 	if ((READ_ONCE(dcp->typec_cable_connected) ||
 	     (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
@@ -703,12 +703,68 @@ void dcp_firmware_metadata_hotplug(struct apple_dcp *dcp, bool connected)
 		dcp_180hz_notify(dcp);
 }
 
+/* FW27 can describe a replacement sink; older firmware keeps its sticky epoch. */
+static bool dcp_firmware_metadata_recoverable(struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	       dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL;
+}
+
+static bool dcp_firmware_metadata_physical(struct apple_dcp *dcp)
+{
+	return dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
+	       !READ_ONCE(dcp->quiescing) && !READ_ONCE(dcp->external_physically_absent) &&
+	       (READ_ONCE(dcp->typec_cable_connected) ||
+		(!READ_ONCE(dcp->active_typec_route) && READ_ONCE(dcp->external_cable)));
+}
+
+static bool dcp_firmware_metadata_matches(struct apple_dcp *dcp,
+					  struct dcp_metadata_ticket ticket)
+{
+	if (!dcp_firmware_metadata_recoverable(dcp))
+		return dcp_metadata_matches(&dcp->metadata.epoch, ticket);
+
+	/* Fresh receipts may precede HPD; HPD never reassociates an old receipt. */
+	return ticket.associated && dcp_firmware_metadata_physical(dcp) &&
+	       ticket.generation == dcp->metadata.epoch.generation &&
+	       ticket.connection_sequence == dcp->rate_proof.connection_sequence &&
+	       (READ_ONCE(dcp->active_typec_route) ||
+		ticket.hdmi_generation == dcp_hdmi_attachment_generation(dcp));
+}
+
+static bool dcp_firmware_metadata_valid(struct apple_dcp *dcp)
+{
+	if (dcp_firmware_metadata_recoverable(dcp) &&
+	    !dcp_firmware_metadata_matches(dcp, dcp->metadata.catalog_ticket))
+		return false;
+	return dcp->metadata.epoch.connected && dcp->metadata.attributes_valid &&
+	       dcp->metadata.timing_valid &&
+	       dcp_firmware_metadata_matches(dcp, dcp->metadata.attributes_ticket) &&
+	       dcp_firmware_metadata_matches(dcp, dcp->metadata.timing_ticket);
+}
+
 void dcp_firmware_metadata_begin(struct apple_dcp *dcp)
 {
 	unsigned long flags;
 
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->chunks.metadata_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+	if (dcp_firmware_metadata_recoverable(dcp)) {
+		dcp->chunks.metadata_ticket.associated = dcp_firmware_metadata_physical(dcp);
+		dcp->chunks.metadata_ticket.connection_sequence =
+			dcp->rate_proof.connection_sequence;
+		dcp->chunks.metadata_ticket.hdmi_generation = dcp_hdmi_attachment_generation(dcp);
+	}
+	/* Capture catalog and metadata provenance in the same critical section. */
+	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL) {
+		dcp->chunks.automatic_connection_sequence = dcp->rate_proof.connection_sequence;
+		dcp->chunks.mode_ticket = dcp->chunks.metadata_ticket;
+		dcp->chunks.mode_ticket.associated =
+			dcp->metadata.epoch.generation == READ_ONCE(dcp->typec_generation) &&
+			(READ_ONCE(dcp->typec_cable_connected) ||
+			 (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+			  !READ_ONCE(dcp->active_typec_route) && READ_ONCE(dcp->external_cable)));
+	}
 	dcp->chunks.received = 0;
 	dcp->chunks.contiguous = true;
 	dcp->chunks.payload_complete = false;
@@ -721,9 +777,7 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 	bool ready;
 
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	ready = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	ready = dcp_firmware_metadata_valid(dcp);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (ready && dcp->connector && READ_ONCE(dcp->connector->connected))
 		schedule_work(&dcp->connector->hotplug_wq);
@@ -732,7 +786,7 @@ static void dcp_firmware_metadata_notify(struct apple_dcp *dcp)
 static bool dcp_firmware_metadata_complete(struct apple_dcp *dcp)
 {
 	return dcp->chunks.contiguous && dcp->chunks.payload_complete &&
-	       dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket);
+	       dcp_firmware_metadata_matches(dcp, dcp->chunks.metadata_ticket);
 }
 
 void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
@@ -743,11 +797,12 @@ void dcp_firmware_metadata_attributes(struct apple_dcp *dcp,
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	if (dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket)) {
+	if (dcp_firmware_metadata_matches(dcp, dcp->chunks.metadata_ticket)) {
 		dcp->metadata.attributes_valid = attributes && dcp_firmware_metadata_complete(dcp);
 		if (dcp->metadata.attributes_valid) {
 			dcp->metadata.attributes = *attributes;
 			dcp->metadata.attributes_ticket = dcp->chunks.metadata_ticket;
+			dcp->metadata.snapshot_sequence++;
 		}
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
@@ -758,15 +813,23 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 {
 	unsigned long flags;
 	unsigned int i, best = UINT_MAX;
+	struct dcp_metadata_ticket ticket;
 
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return;
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	if (!dcp_metadata_matches(&dcp->metadata.epoch, dcp->chunks.metadata_ticket))
+	if (!dcp_firmware_metadata_matches(dcp, dcp->chunks.metadata_ticket))
 		goto unlock;
 	dcp->metadata.timing_valid = false;
 	if (!dcp_firmware_metadata_complete(dcp))
 		goto unlock;
+	ticket = dcp->chunks.metadata_ticket;
+	if (dcp_firmware_metadata_recoverable(dcp)) {
+		/* PreferredTimingElements may select only from a current full catalog. */
+		ticket = dcp->metadata.catalog_ticket;
+		if (!dcp_firmware_metadata_matches(dcp, ticket))
+			goto unlock;
+	}
 	/*
 	 * The EDID's detailed timing: the preferred mode when the firmware
 	 * describes it fully, otherwise the highest-scored timing it marks
@@ -789,8 +852,9 @@ void dcp_firmware_metadata_timing(struct apple_dcp *dcp)
 		dcp->metadata.preferred = dcp->modes[best].mode;
 		/* Desktop 26.x publishes its modes without their polarity. */
 		dcp->metadata.preferred.flags |= dcp->modes[best].metadata_sync_flags;
-		dcp->metadata.timing_ticket = dcp->chunks.metadata_ticket;
+		dcp->metadata.timing_ticket = ticket;
 		dcp->metadata.timing_valid = true;
+		dcp->metadata.snapshot_sequence++;
 	}
 unlock:
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
@@ -803,8 +867,12 @@ bool dcp_firmware_metadata_current(struct apple_dcp *dcp, u64 generation)
 	bool valid;
 
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
-		generation == dcp->metadata.epoch.generation;
+	if (dcp_firmware_metadata_recoverable(dcp))
+		valid = dcp_firmware_metadata_valid(dcp) &&
+			generation == dcp->metadata.snapshot_sequence;
+	else
+		valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
+			generation == dcp->metadata.epoch.generation;
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	return valid;
 }
@@ -820,22 +888,19 @@ const struct drm_edid *dcp_firmware_edid(struct apple_dcp *dcp, u64 *generation)
 	if (!dcp_firmware_metadata_enabled(dcp))
 		return ERR_PTR(-ENODEV);
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = dcp->metadata.attributes_valid && dcp->metadata.timing_valid &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.attributes_ticket) &&
-		dcp_metadata_matches(&dcp->metadata.epoch, dcp->metadata.timing_ticket);
+	valid = dcp_firmware_metadata_valid(dcp);
 	if (valid) {
 		attributes = dcp->metadata.attributes;
 		preferred = dcp->metadata.preferred;
-		*generation = dcp->metadata.epoch.generation;
+		/* Replacing either receipt also retires an EDID built outside the lock. */
+		*generation = dcp_firmware_metadata_recoverable(dcp) ?
+			dcp->metadata.snapshot_sequence : dcp->metadata.epoch.generation;
 	}
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	if (!valid)
 		return ERR_PTR(-ENODATA);
 	edid = dcp_metadata_edid(&attributes, &preferred);
-	spin_lock_irqsave(&dcp->metadata.lock, flags);
-	valid = !dcp->metadata.epoch.invalidated && dcp->metadata.epoch.connected &&
-		*generation == dcp->metadata.epoch.generation;
-	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+	valid = dcp_firmware_metadata_current(dcp, *generation);
 	if (!valid && !IS_ERR(edid)) {
 		drm_edid_free(edid);
 		return ERR_PTR(-ESTALE);
@@ -7113,7 +7178,6 @@ static const struct apple_dcp_hw_data apple_dcp_hw_t8142_external = {
 	.num_dptx_ports = 2,
 	.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL,
 	.adopt_live_session = true,
-	.sink_metadata_edid = true,
 };
 
 static const struct apple_dcp_hw_data apple_dcp_hw_dcp = {

@@ -14,6 +14,8 @@ struct dcp_metadata_epoch {
 
 struct dcp_metadata_ticket {
 	u64 generation;
+	/* FW27 receipts also fence same-cable loss and fixed HDMI replacement. */
+	u64 connection_sequence, hdmi_generation;
 	bool associated;
 };
 
