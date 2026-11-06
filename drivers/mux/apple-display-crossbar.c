@@ -1100,7 +1100,8 @@ int apple_dpxbar_link_configure(struct mux_control *mux, unsigned int pclk, bool
 		ret = -EIO;
 	else if (xbar->selected_dispext[index] < 0)
 		ret = -ENODEV;
-	else if (xbar->enabled[index])
+	else if (xbar->enabled[index] &&
+		 (xbar->pclk[index] != pclk || xbar->uhbr[index] != uhbr))
 		ret = -EBUSY;
 	else {
 		xbar->pclk[index] = pclk;
