@@ -2837,7 +2837,7 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 
 /* PreferredTimingElements identifies native timings even without IsPreferred. */
 int dcp_modes_set_preferred_v27(struct apple_dcp *dcp, const void *blob, size_t len,
-			      u64 generation)
+				u64 generation)
 {
 	struct dcp_timing_id *timings;
 	int count;
