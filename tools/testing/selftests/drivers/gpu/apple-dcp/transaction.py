@@ -350,8 +350,8 @@ def probe(root):
     # The common SAFE fixture does not enter firmware-27 non-SAFE mode.
     unit = unit.replace('struct apple_dcp { int external_lock,external_error;',
                         'struct apple_dcp { int fw_compat; bool fixed_route_selected,hdmi_yielded; void *fixed_phy; int external_lock,external_error;', 1)
-    unit = unit.replace('static int dcp_typec_route_finish(',
-                        '#define DCP_FIRMWARE_V_27_0 27\nstatic int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;(void)s;assert(!"non-SAFE firmware-27 path");return -EINVAL; }\nstatic int dcp_typec_route_finish(', 1)
+    unit = unit.replace('static int dcp_typec_route_release(',
+                        '#define DCP_FIRMWARE_V_27_0 27\nstatic int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;(void)s;assert(!"non-SAFE firmware-27 path");return -EINVAL; }\nstatic int dcp_typec_route_release(', 1)
     helpers = r"""
 #undef dev_err
 #define dev_err(...) ((void)0)
