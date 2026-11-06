@@ -104,6 +104,8 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	mutex_init(&dcp->hpd_mutex);
 	spin_lock_init(&dcp->relink_lock);
 	mutex_init(&dcp->dcpavserv.lock);
+	init_completion(&dcp->dcpavserv.enable_completion);
+	INIT_WORK(&dcp->dcpavserv.close_wq, announce_test_noop);
 	spin_lock_init(&dcp->metadata.lock);
 	INIT_DELAYED_WORK(&dcp->announce_wq, dcp_announce_work);
 	INIT_DELAYED_WORK(&dcp->typec_reconnect_wq, announce_test_noop);
@@ -113,8 +115,10 @@ static struct announce_test *announce_test_init(struct kunit *test)
 	INIT_DELAYED_WORK(&dcp->hdmi_recheck_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->link_recovery_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->hybrid_wq, announce_test_noop);
+	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->bl_fallback_wq, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->backlight.fade_work, announce_test_noop);
+	INIT_DELAYED_WORK(&dcp->brightness.fade_work, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->backlight.retry_work, announce_test_noop);
 	INIT_WORK(&dcp->external_stop_work, announce_test_noop);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, announce_test_noop);
