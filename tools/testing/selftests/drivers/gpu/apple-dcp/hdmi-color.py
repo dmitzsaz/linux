@@ -2,13 +2,113 @@
 # SPDX-License-Identifier: GPL-2.0-only OR MIT
 """FW27 fixed-HDMI SDR converter policy and A413, with synthetic catalogs only."""
 import argparse
+import copy
 import json
 from pathlib import Path
 import re
+import struct
 import tempfile
 
 from common import block, run_unit
 import rate
+
+
+def timing_inputs(f):
+    """Mutate timing dictionaries independently of the C fixture builder."""
+    pairs = f['ObjectPairs']
+    timing = copy.deepcopy(f['timing_fixture'][0])
+    timing.update(ID=147, Score=100, ValidPixelEncodings=2,
+                  UnsafeColorElementIDs=[9, 7, 8], DSCRequiredColorElementIDs=[])
+    timing['HorizontalAttributes'].update(Active=3840, Total=4400,
+        FrontPorch=176, SyncWidth=88, PreciseSyncRate=0)
+    timing['VerticalAttributes'].update(Active=2160, Total=2250,
+        FrontPorch=8, SyncWidth=10, PreciseSyncRate=60 << 16)
+    color = dict(ID=187, Score=100, Depth=8, PixelEncoding=3,
+                 DynamicRange=1, EOTF=0, Colorimetry=1, IsVirtual=False)
+    color['DownstreamFormat'] = dict(color, ID=186, PixelEncoding=1)
+    timing['ColorModes'] = [color]
+    cases = [('valid', timing)]
+    for field in ('ID', 'Score', 'IsVirtual', 'IsInterlaced',
+                  'HorizontalAttributes', 'VerticalAttributes'):
+        missing = copy.deepcopy(timing)
+        del missing[field]
+        cases.append(('missing-timing-' + field, missing))
+    for field, value in [('ID', 28), ('Score', 1), ('IsVirtual', False),
+                         ('HorizontalAttributes', timing['HorizontalAttributes']),
+                         ('VerticalAttributes', timing['VerticalAttributes'])]:
+        duplicate = pairs(list(copy.deepcopy(timing).items()) + [(field, value)])
+        cases.append(('duplicate-timing-' + field, duplicate))
+    for scope in ('HorizontalAttributes', 'VerticalAttributes'):
+        for field in timing[scope]:
+            missing = copy.deepcopy(timing)
+            del missing[scope][field]
+            cases.append(('missing-' + scope + '-' + field, missing))
+            duplicate = copy.deepcopy(timing)
+            value = 3839 if field == 'Active' else timing[scope][field]
+            duplicate[scope] = pairs(list(duplicate[scope].items()) + [(field, value)])
+            cases.append(('duplicate-' + scope + '-' + field, duplicate))
+    definitions, checks = '', ''
+    for name, value in cases:
+        for rgb in (False, True):
+            catalog = copy.deepcopy(value)
+            rgb_color = dict(ID=176, Score=1, Depth=8, PixelEncoding=0,
+                             DynamicRange=0, EOTF=0, Colorimetry=10, IsVirtual=False)
+            if rgb:
+                if isinstance(catalog, pairs):
+                    catalog = pairs([(k, [rgb_color] + v if k == 'ColorModes' else v)
+                                     for k, v in catalog])
+                else:
+                    catalog['ColorModes'].insert(0, rgb_color)
+            raw = bytearray(struct.pack('<I', 0xd3))
+            f['wire']([catalog], raw)
+            index = definitions.count('static const')
+            definitions += 'static const u8 identity_%u[]={%s};\n' % (
+                index, ','.join(map(str, raw)))
+            checks += ('check_timing_input(%s,identity_%u,sizeof(identity_%u),%s,%s);\n' %
+                       (json.dumps(name), index, index, str(rgb).lower(),
+                        str(name == 'valid').lower()))
+    driver = r'''
+static void check_timing_input(const char *name,const u8 *raw,size_t len,bool rgb,bool valid)
+{
+    struct drm_display_mode baseline={0};
+    unsigned baseline_count=0;
+    u32 baseline_id=0;
+    for(unsigned enabled=0;enabled<2;enabled++) {
+        struct dcp_parse_ctx ctx;unsigned count=0,before=commands;
+        assert(!parse(raw,len,&ctx));ctx.fw27_hdmi_ycbcr420=enabled;
+        struct dcp_display_mode *m=enumerate_modes(&ctx,&count,0,0,0,false,true);
+        if(IS_ERR(m)){count=0;m=NULL;}
+        assert(count<=1);
+        if(rgb && !enabled) {
+            baseline_count=count;
+            if(count){baseline=m[0].mode;baseline_id=m[0].timing_mode_id;}
+        }
+        unsigned want=rgb?baseline_count:enabled&&valid;
+        if(count) {
+            struct apple_dcp d={.fw_compat=27,.fixed_connector_type=11,
+                .hw={.iomfb_method_profile=2},.selected=m[0]};
+            struct drm_crtc_state state={.mode=m[0].mode};
+            assert(!iomfb_modeset_v27(&d,&state));
+            assert(sent.color_mode_id==(rgb?176U:187U));
+            if(rgb) {
+                assert(sent.timing_mode_id==baseline_id);
+                assert(!memcmp(&baseline,&m[0].mode,sizeof(baseline)));
+            } else {
+                if(!want)fprintf(stderr,"unexpected A413: %s color=%u timing=%u\n",
+                    name,sent.color_mode_id,sent.timing_mode_id);
+                assert(sent.timing_mode_id==147);
+            }
+        }
+        assert(count==want && commands==before+want);
+        free(m);
+    }
+}
+static void timing_identity_and_command(void)
+{
+CHECKS
+}
+'''.replace('CHECKS', checks)
+    return definitions + driver, len(cases)
 
 
 def fixture(root):
@@ -184,13 +284,18 @@ int main(void)
     puts("PASS: preferred RGB, PQ metadata and FW27 unsafe RGB8 1080p180 exclusion");
     dcp_ycc_truncated_test(&test);cleanup(&test);
     puts("PASS: truncated converter catalogs never publish a partial mode");
+    dcp_ycc_timing_identity_test(&test);cleanup(&test);
+    puts("PASS: incomplete/ambiguous converter timings rejected; RGB policy retained");
     scope_and_command(&test);cleanup(&test);
     puts("PASS: fixed FW27 HDMI only; actual modeset sends outer color187 through A413");
+    timing_identity_and_command();
+    puts("PASS: timing mutation matrix reaches actual A413 only for admitted controls");
     return 0;
 }
 '''
+    identity, _ = timing_inputs(f)
     return (f['prefix'] + shim + f['metadata'] + f['epoch'] + f['header'] + parser +
-            tests + request + output + main)
+            tests + request + output + identity + main)
 
 
 def main():

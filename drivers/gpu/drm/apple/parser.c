@@ -333,7 +333,8 @@ bool dcp_property_complete(const void *blob, size_t received, size_t advertised)
 	return ctx.pos == received || round_up(ctx.pos, 4) == received;
 }
 
-static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, bool polarity)
+static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim,
+			   bool polarity, bool *ambiguous)
 {
 	static const char * const fields[] = { "Active", "Total", "FrontPorch", "SyncWidth", "PreciseSyncRate" };
 	unsigned int seen = 0;
@@ -358,12 +359,17 @@ static int parse_dimension(struct dcp_parse_ctx *handle, struct dimension *dim, 
 		char *key = parse_string(it.handle);
 		unsigned int field;
 
-		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-			for (field = 0; field < 5; field++)
-				if (!strcmp(key, fields[field])) {
+		if (!IS_ERR(key) && (handle->automatic_1080p180_rgb8 || ambiguous)) {
+			for (field = 0; field < ARRAY_SIZE(fields); field++) {
+				if (strcmp(key, fields[field]))
+					continue;
+				if (handle->automatic_1080p180_rgb8)
 					handle->ambiguous_180hz |= !!(seen & (1U << field));
-					seen |= 1U << field;
-				}
+				if (ambiguous)
+					*ambiguous |= !!(seen & (1U << field));
+				seen |= 1U << field;
+			}
+		}
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
@@ -880,6 +886,8 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 	bool have_preferred = false, have_interlaced = false;
 	bool is_preferred = false;
 	bool timing_keys = external_sdr || handle->metadata_timing;
+	bool converter_sdr = external_sdr && handle->fw27_hdmi_ycbcr420;
+	bool ambiguous_timing = false;
 	bool limits_known;
 	struct drm_display_mode *mode = &out->mode;
 
@@ -912,12 +920,16 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		char *key = parse_string(it.handle);
 		unsigned int field;
 
-		if (!IS_ERR(key) && handle->automatic_1080p180_rgb8)
-			for (field = 0; field < ARRAY_SIZE(fields); field++)
-				if (!strcmp(key, fields[field])) {
+		if (!IS_ERR(key) && (handle->automatic_1080p180_rgb8 || converter_sdr)) {
+			for (field = 0; field < ARRAY_SIZE(fields); field++) {
+				if (strcmp(key, fields[field]))
+					continue;
+				if (handle->automatic_1080p180_rgb8)
 					handle->ambiguous_180hz |= !!(seen & (1U << field));
-					seen |= 1U << field;
-				}
+				ambiguous_timing |= !!(seen & (1U << field));
+				seen |= 1U << field;
+			}
+		}
 
 		if (IS_ERR(key))
 			ret = PTR_ERR(key);
@@ -926,11 +938,13 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 		else if (!strcmp(key, "HorizontalAttributes")) {
 			duplicate_scope |= have_horiz;
 			have_horiz = true;
-			ret = parse_dimension(it.handle, &horiz, timing_keys || internal);
+			ret = parse_dimension(it.handle, &horiz, timing_keys || internal,
+					      converter_sdr ? &ambiguous_timing : NULL);
 		} else if (!strcmp(key, "VerticalAttributes")) {
 			duplicate_scope |= have_vert;
 			have_vert = true;
-			ret = parse_dimension(it.handle, &vert, timing_keys || internal);
+			ret = parse_dimension(it.handle, &vert, timing_keys || internal,
+					      converter_sdr ? &ambiguous_timing : NULL);
 		} else if (!strcmp(key, "MinimumVariableRefreshRate")) {
 			vrr_ambiguous |= !!(vrr_seen & 1);
 			vrr_seen |= 1;
@@ -980,9 +994,11 @@ static int parse_mode(struct dcp_parse_ctx *handle,
 			return ret;
 		}
 	}
-	/* The fallback is representable only as progressive, unrepeated scanout. */
+	/* Only a complete, unambiguous timing may supply a converter command ID. */
 	if (external_sdr && out->sdr.score >= 0 &&
-	    (!have_interlaced || interlaced || notch_height ||
+	    (ambiguous_timing || duplicate_scope || !have_horiz || !have_vert ||
+	     !have_virtual || is_virtual || !have_interlaced || interlaced || notch_height ||
+	     horiz.precise_sync_rate < 0 || horiz.sync_polarity < 0 || vert.sync_polarity < 0 ||
 	     horiz.pixel_repetition != 0 || vert.pixel_repetition != 0))
 		out->sdr.score = -1;
 	/*
@@ -2597,9 +2613,9 @@ int dcp_parse_timing_ids(const void *blob, size_t len, struct dcp_timing_id *out
 			if (!strcmp(key, "ID"))
 				err = parse_int_bound(&ctx, &id, 0, U32_MAX);
 			else if (!strcmp(key, "HorizontalAttributes"))
-				err = parse_dimension(&ctx, &horiz, false);
+				err = parse_dimension(&ctx, &horiz, false, NULL);
 			else if (!strcmp(key, "VerticalAttributes"))
-				err = parse_dimension(&ctx, &vert, false);
+				err = parse_dimension(&ctx, &vert, false, NULL);
 			else
 				err = skip(&ctx);
 			kfree(key);
