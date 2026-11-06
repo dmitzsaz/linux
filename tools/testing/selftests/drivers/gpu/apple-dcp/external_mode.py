@@ -17,9 +17,15 @@ def transaction(root):
     assert enable.index('typec_work_enabled = true') < enable.rindex('dcp_external_queue_initial_mode(dcp)')
     stop = block(dcp, 'VISIBLE_IF_KUNIT void dcp_disable_typec_work(')
     assert 'disable_work_sync(&dcp->external_modeset_work)' in stop
+    probe = block(dcp, 'static int dcp_platform_probe_pipe(')
+    work_init = probe[probe.index('INIT_WORK(&dcp->external_modeset_work,'):
+                      probe.index('INIT_WORK(&dcp->external_stop_work,')]
     iomfb = (apple / 'iomfb.c').read_text()
     template = (apple / 'iomfb_template.c').read_text()
     state = (apple / 'iomfb-state.h').read_text().replace('#include <linux/spinlock.h>', '')
+    work_state = '\n'.join(line for name in ('dcp-announce.h', 'dcp-relink.h')
+                           for line in (apple / name).read_text().splitlines()
+                           if not line.startswith('#include'))
     prefix = r'''
 #include <assert.h>
 #include <stdbool.h>
@@ -42,7 +48,9 @@ typedef uint32_t u32; typedef uint64_t u64; typedef int spinlock_t;
 #define spin_lock_irqsave(p,f) ((void)(p),(f)=0)
 #define spin_unlock_irqrestore(p,f) ((void)(p),(void)(f))
 #define lockdep_assert_held(p) ((void)(p))
+#define VISIBLE_IF_KUNIT
 #define container_of(p,t,m) ((t *)((char *)(p)-offsetof(t,m)))
+#define time_before(a,b) ((long)((a)-(b))<0)
 #define DCP_FIRMWARE_V_27_0 27
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 #define DCP_FW_VER 27
@@ -69,10 +77,32 @@ static void kref_init(struct kref *p) { p->count=1; }
 static void kref_get(struct kref *p) { p->count++; }
 static void release_wait_cookie(struct kref *p) { free(container_of(p,struct dcp_wait_cookie,refcount)); }
 static void kref_put(struct kref *p,void (*release)(struct kref *)) { if(!--p->count)release(p); }
-struct work_struct { bool pending,disabled; };
+/* Single-threaded queue model: cancellation removes pending callbacks and
+ * disable depth rejects future enqueues, as kernel/workqueue.c requires. */
+struct work_struct {
+ bool pending,initialized;
+ unsigned disable_depth;
+ void (*func)(struct work_struct *);
+};
 struct delayed_work { struct work_struct work; };
-static int schedule_work(struct work_struct *w) { if(w->disabled)return 0;w->pending=true;return 1; }
-static void cancel_delayed_work_sync(struct delayed_work *w) { w->work.pending=false; }
+static void init_work(struct work_struct *w,void (*func)(struct work_struct *))
+{ *w=(struct work_struct){.initialized=true,.func=func}; }
+#define INIT_WORK(w,fn) init_work(w,fn)
+static bool schedule_work(struct work_struct *w) {
+ assert(w->initialized);
+ if(w->disable_depth||w->pending)return false;
+ w->pending=true;return true;
+}
+static bool cancel_work_sync(struct work_struct *w)
+{ assert(w->initialized);bool pending=w->pending;w->pending=false;return pending; }
+static bool disable_work_sync(struct work_struct *w)
+{ bool pending=cancel_work_sync(w);w->disable_depth++;return pending; }
+#define disable_work disable_work_sync
+static bool enable_work(struct work_struct *w)
+{ assert(w->initialized&&w->disable_depth);return !--w->disable_depth; }
+static void cancel_delayed_work_sync(struct delayed_work *w) { cancel_work_sync(&w->work); }
+static void disable_delayed_work_sync(struct delayed_work *w) { disable_work_sync(&w->work); }
+static void enable_delayed_work(struct delayed_work *w) { enable_work(&w->work); }
 struct drm_display_mode { int clock,hdisplay,vdisplay; };
 struct drm_crtc_state { struct drm_display_mode mode; bool vrr_enabled; };
 struct dcp_color_mode { int id,score,depth,format,colorimetry,eotf,range; };
@@ -83,11 +113,15 @@ struct dcp_display_mode {
  bool sdr_usable,automatic_rgb8_quirk,firmware_preferred,needs_timestamps,vrr;
 };
 struct dcp_set_digital_out_mode_req { u32 color_mode_id,timing_mode_id; };
-struct apple_connector { bool connected,edid_live,edid_invalidation_pending; };
+struct apple_connector {
+ bool connected,edid_live,edid_invalidation_pending;
+ void *dcp;
+ struct work_struct hotplug_wq;
+};
 '''
-    prefix += state + r'''
+    prefix += state + work_state + r'''
 struct apple_dcp {
- int external_lock,modes_lock,fw_compat;
+ int external_lock,modes_lock,fw_compat,hpd_mutex,relink_lock;
  struct { int iomfb_method_profile; } hw;
  struct { int lock;bool presentation_paused; } iomfb;
  struct { bool connected; } dptxport[1];
@@ -109,6 +143,12 @@ struct apple_dcp {
  struct dcp_mode_state mode_state;
  struct work_struct external_modeset_work,external_stop_work;
  struct delayed_work typec_reconnect_wq,placeholder_edid_wq;
+ struct delayed_work typec_relink_wq,announce_wq,external_stop_retry_wq;
+ struct delayed_work hdmi_settle_wq,hdmi_recheck_wq,link_recovery_wq,hybrid_wq;
+ struct dcp_announce announce;
+ struct dcp_relink_state relink;
+ bool typec_cable_connected;
+ u64 typec_generation;
  struct dcp_set_digital_out_mode_req mode,external_mode;
  bool pq_requested,output_pq,use_timestamps,main_display,vrr_enabled;
  u64 swap_submit_timestamp;
@@ -124,7 +164,7 @@ static void dcp_firmware_metadata_announced(struct apple_dcp *d) { (void)d; }
 static bool metadata_live;
 static void dcp_firmware_metadata_hotplug(struct apple_dcp *d,bool c) { (void)d;metadata_live=c; }
 static void apple_connector_edid_set_live(struct apple_connector *c,bool live) { if(c)c->edid_live=live; }
-static unsigned notices,powers,stops,rpcs;
+static unsigned notices,powers,stops,rpcs,detaches;
 static void dcp_handle_hotplug_actions(struct apple_dcp *d,unsigned action) {
  if(d->connector&&d->connector->connected&&d->mode_state.valid)assert(d->external_mode_valid&&metadata_live&&d->connector->edid_live);
  notices+=!!action;
@@ -133,12 +173,22 @@ static int dcp_external_link_locked(struct apple_dcp *d) { assert(d->external_pr
 static void iomfb_pause_presentation(struct apple_dcp *d,bool p) { d->iomfb.presentation_paused=p; }
 static int iomfb_external_power_h17p(struct apple_dcp *d,bool on) { assert(on&&!d->connector->connected);powers++;return 0; }
 static int dcp_external_stop_locked(struct apple_dcp *d,u64 g) { assert(g==d->external_generation);stops++;d->external_mode_valid=false;return 0; }
-static void dpavservep_detach(struct apple_dcp *d) { (void)d; }
+static void dpavservep_detach(struct apple_dcp *d) { (void)d;detaches++; }
 static void dcp_external_report_disconnected(struct apple_dcp *d) { d->connector->connected=false; }
 static void dcp_external_hdr_hints(struct apple_dcp *d,bool p) { (void)d;(void)p; }
 static void dcp_set_adaptive_sync(struct apple_dcp *d,u32 m,void *c) { (void)d;(void)m;(void)c;assert(false); }
 static bool dcp_external_hotplug(struct apple_dcp *,bool);
 static void dcp_set_digital_out_mode(struct apple_dcp *,bool,struct dcp_set_digital_out_mode_req *,void (*)(struct apple_dcp *,void *,void *),void *);
+/* The HDMI service and announcement timeout are outside this transaction.
+ * Model their boundaries; the mode worker and its enable/disable run below. */
+static void dcp_hdmi_enable(struct apple_dcp *d) { (void)d; }
+static void dcp_hdmi_disable(struct apple_dcp *d) { (void)d; }
+static void dcp_announce_arm(struct apple_dcp *d) { assert(!d->announce.stopped); }
+static void dcp_firmware_metadata_connection(struct apple_dcp *d,u64 g,bool connected)
+{ assert(g==d->typec_generation&&!connected);metadata_live=false; }
+static void dcp_queue_typec_reconnect(struct apple_dcp *d,unsigned long delay)
+{ assert(d->typec_work_enabled&&!delay);schedule_work(&d->typec_reconnect_wq.work); }
+#define to_platform_device(d) (d)
 '''
     production = block(template, 'static void complete_set_digital_out_mode(')
     production += '\n' + block(template, template.rindex('int DCP_FW_NAME(iomfb_modeset)('))
@@ -148,6 +198,8 @@ static void dcp_set_digital_out_mode(struct apple_dcp *,bool,struct dcp_set_digi
                  'static void dcp_external_modeset_work(', 'static void dcp_external_stop_work(',
                  'bool dcp_external_hotplug('):
         production += '\n' + block(dcp, name).replace('bool dcp_external_hotplug(', 'static bool dcp_external_hotplug(', 1)
+    production += '\n' + stop + '\n' + enable
+    production += '\nstatic void init_external_work(struct apple_dcp *dcp) {\n' + work_init + '\n}\n'
     tests = r'''
 enum event { NONE, BOUNCE, LOW, DETACH, STALE, QUIESCE, FAULT };
 static enum event event;
@@ -174,22 +226,42 @@ static void dcp_set_digital_out_mode(struct apple_dcp *d,bool b,struct dcp_set_d
 static struct apple_dcp d;
 static struct apple_connector con;
 static struct dcp_display_mode modes[4];
-static void init(bool fixed) {
+static void unexpected_work(struct work_struct *w) { (void)w;assert(!"unrelated work executed"); }
+static void init_state(bool fixed,bool bound) {
  d=(struct apple_dcp){.fw_compat=27,.hw.iomfb_method_profile=2,.connector=&con,
   .external_prepared=true,.external_cable=true,.external_generation=7,.external_rx_generation=7,
   .external_crtc_generation=6,.modes_generation=11,.modes_admitted=true,
-  .modes=modes,.nr_modes=4,.typec_work_enabled=true,.active_typec_route=fixed?NULL:&d,
+  .modes=modes,.nr_modes=4,.active_typec_route=fixed?NULL:&d,.dev=&d,
+  .typec_cable_connected=!fixed,
   .fixed_phy=fixed?&d:NULL,.iomfb.presentation_paused=true};
- con=(struct apple_connector){};
+ con=(struct apple_connector){.dcp=&d};
+ init_external_work(&d);
+ INIT_WORK(&d.external_stop_work,dcp_external_stop_work);
+ INIT_WORK(&con.hotplug_wq,unexpected_work);
+ init_work(&d.external_stop_retry_wq.work,unexpected_work);
+ /* Probe and fabric init leave these disabled until component bind. */
+ struct delayed_work *delayed[]={&d.typec_reconnect_wq,&d.placeholder_edid_wq,
+  &d.typec_relink_wq,&d.announce_wq,&d.hdmi_settle_wq,&d.hdmi_recheck_wq,
+  &d.link_recovery_wq,&d.hybrid_wq};
+ for(unsigned i=0;i<sizeof(delayed)/sizeof(delayed[0]);i++) {
+  init_work(&delayed[i]->work,unexpected_work);
+  disable_work(&delayed[i]->work);
+ }
+ d.announce.stopped=true;
  /* Boot 36: native 60 Hz timing 46/color 109; compositor timing 100/color 103.
   * Other geometries ensure neither smallest mode nor largest area wins. */
  modes[0]=(struct dcp_display_mode){.mode={148500,1920,1080},.sdr_usable=true,.timing_mode_id=1};
  modes[1]=(struct dcp_display_mode){.mode={580080,2560,1440},.sdr_usable=true,.timing_mode_id=100,.color_mode_id=103};
  modes[2]=(struct dcp_display_mode){.mode={241500,2560,1440},.sdr_usable=true,.firmware_preferred=true,.timing_mode_id=46,.color_mode_id=109};
  modes[3]=(struct dcp_display_mode){.mode={594000,3840,2160},.sdr_usable=true,.timing_mode_id=200};
- notices=powers=stops=rpcs=0;event=NONE;reply=0;missing=false;metadata_live=false;
+ notices=powers=stops=rpcs=detaches=0;event=NONE;reply=0;missing=false;metadata_live=false;
+ if(bound)dcp_enable_typec_work(&d);
 }
-static void drain_initial(void) { if(d.external_modeset_work.pending){d.external_modeset_work.pending=false;dcp_external_modeset_work(&d.external_modeset_work);} }
+static void init(bool fixed) { init_state(fixed,true); }
+static void drain_initial(void) {
+ struct work_struct *w=&d.external_modeset_work;
+ if(w->pending){assert(!w->disable_depth);w->pending=false;w->func(w);}
+}
 static int apply(unsigned i) { struct drm_crtc_state s={.mode=modes[i].mode};return dcp_external_modeset(&d,&s,d.modes_generation); }
 int main(void) {
  for(unsigned fixed=0;fixed<2;fixed++) {
@@ -215,10 +287,28 @@ int main(void) {
  assert(!dcp_external_hotplug(&d,true));dcp_external_stop_work(&d.external_stop_work);assert(stops==0&&con.connected);
  d.external_hotplug_generation--;d.external_fw_connected=false;dcp_external_stop_work(&d.external_stop_work);assert(!stops);
  /* D575/catalog before bind: re-enable schedules after admission opens. */
- init(false);d.external_modeset_work.disabled=true;d.typec_work_enabled=false;
+ init_state(false,false);
+ assert(d.external_modeset_work.initialized&&d.external_modeset_work.disable_depth==1);
  dcp_external_hotplug(&d,true);assert(!d.external_modeset_work.pending&&!con.connected);
- d.external_modeset_work.disabled=false;d.typec_work_enabled=true;dcp_external_queue_initial_mode(&d);
+ dcp_enable_typec_work(&d);
+ assert(d.typec_work_enabled&&d.external_modeset_work.pending&&!d.external_modeset_work.disable_depth);
  drain_initial();assert(con.connected&&rpcs==1);
+ /* Suspend before the queued first mode: drain it and reject RX/catalog
+  * enqueues until the actual re-enable replays the discovery. */
+ for(unsigned fixed=0;fixed<2;fixed++) {
+  init(fixed);dcp_external_hotplug(&d,true);assert(d.external_modeset_work.pending);
+  dcp_disable_typec_work(&d,false);
+  assert(!d.typec_work_enabled&&!d.external_modeset_work.pending&&d.external_modeset_work.disable_depth==1);
+  dcp_external_queue_initial_mode(&d);drain_initial();assert(!rpcs&&!powers&&!con.connected);
+  assert(d.typec_cable_connected==!fixed&&d.typec_generation==1);
+  dcp_enable_typec_work(&d);drain_initial();assert(con.connected&&rpcs==1&&powers==1);
+  assert(!d.external_modeset_work.disable_depth&&d.relink.enabled&&!d.announce.stopped);
+ }
+ /* Teardown also drains the work and releases the Type-C cable. */
+ init(false);dcp_external_hotplug(&d,true);dcp_disable_typec_work(&d,true);
+ assert(!d.typec_cable_connected&&detaches==1&&!d.external_modeset_work.pending);
+ assert(!d.relink.enabled&&d.announce.stopped);
+ dcp_external_queue_initial_mode(&d);drain_initial();assert(!rpcs&&!powers);
  /* Catalog after D575, without another HPD edge. */
  init(false);d.modes_admitted=false;dcp_external_hotplug(&d,true);drain_initial();assert(!powers);
  d.modes_admitted=true;dcp_external_queue_initial_mode(&d);drain_initial();assert(con.connected);
