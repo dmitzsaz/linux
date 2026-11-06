@@ -401,6 +401,7 @@ static struct relink_test *relink_test_init(struct kunit *test)
 	dcp->dev = &t->pdev->dev;
 	dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	iomfb_queue_init(dcp);
+	spin_lock_init(&dcp->backlight.lock);
 	mutex_init(&dcp->external_lock);
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->dcpavserv.lock);
