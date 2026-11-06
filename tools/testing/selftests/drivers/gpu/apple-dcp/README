@@ -97,6 +97,21 @@ the FW27 ban on the automatic RGB8 exception. Older firmware retains its
 exception's receipt-start service and connection tickets. KUnit exercises
 the parser/publisher/readiness integration in apple-display-parser.
 
+The metadata-lifecycle fixture additionally starts with the full production M5
+hardware initializer and probe metadata branch. Real START/0x1000 CHUNK/END,
+DisplayAttributes and TimingElements decoders/publishers feed readiness and the
+real firmware EDID builder. It covers both HPD/catalog orders, replug recovery,
+late physical/same-generation receipts, preferred-only rejection, fixed HDMI
+attachment epochs, invalid catalogs, EDID allocation races, successful A413 HPD
+bounce settlement and the desktop 26.x independent epoch. The A413 transport
+returns a mocked success; the production HPD handler and modeset settlement
+execute. The legacy rate fixtures explicitly exclude FW27-only HDMI/preference
+helpers; their physical link/service proofs are separate controls.
+Run python3 metadata.py --mutations --old-ref 358d78e54f3 to compile the actual
+baseline (which fails catalog association), its profile-only correction (which
+fails replug EDID recovery), and seven assertion-based stale-fence controls.
+No negative control counts a compilation failure as a successful rejection.
+
 Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
 establish source behavior; electrical readiness, firmware/FDT ownership,
 concurrency and system suspend require separate kernel/hardware qualification.

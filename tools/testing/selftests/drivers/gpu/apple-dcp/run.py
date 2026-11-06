@@ -36,6 +36,7 @@ import display
 import colorimetry
 import fw27
 import external_mode
+import metadata
 
 
 def parking_unit(root):
@@ -61,6 +62,7 @@ def main():
         ('fw27', 'fw27-hdmi-handback', fw27.handback, ((),), ()),
         ('fw27', 'fw27-initial-mode', external_mode.transaction, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-preferred-timings', external_mode.preferred, ((),), ('-Wno-unused-function',)),
+        ('fw27', 'fw27-metadata-lifecycle', metadata.fixture, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-catalog-ready', external_mode.catalog_ready, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-cold-typec-probe', transaction.probe, ((),), ('-pthread',)),
         ('fw27', 'fw27-fixed-sink', fw27.ownership, ((),), ()),

@@ -524,6 +524,7 @@ def policy(root):
 #define READ_ONCE(v) (v)
 #define WRITE_ONCE(p,v) ((p)=(v))
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
+#define DCP_FIRMWARE_V_27_0 27
 #define DPTX_ENDPOINT_V2 0x2c
 #define DRM_CONNECTOR_REGISTERED 1
 #define to_platform_device(p) (p)
@@ -555,7 +556,8 @@ struct apple_dcp {
     u64 typec_generation; unsigned int nr_modes;
     struct dcp_display_mode *modes;
     struct { bool holding, stopped; } announce;
-    bool ext_backlight, has_panel;
+    bool ext_backlight, has_panel,external_cable;
+    int fw_compat;
 };
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
@@ -706,7 +708,7 @@ def publication(root):
     iomfb = (base/'iomfb.c').read_text()
     template = (base/'iomfb_template.c').read_text()
 
-    state = n['state']
+    state = n['state'].replace('    int fw_compat;', '').replace(',external_cable;', ';')
     state = state.replace('struct apple_connector {', '''struct drm_device { void *dev; struct { bool mutex; } mode_config; };
 struct drm_connector { struct drm_device *dev; int registration_state; void *state;
     struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;
@@ -722,6 +724,10 @@ struct apple_connector {''')
     state = state.replace('u64 typec_generation; unsigned int nr_modes;', '''u64 typec_generation; unsigned int nr_modes;
     struct apple_epic *dcpavservep;
     int fw_compat,width_mm,height_mm,fixed_connector_type; unsigned notch_height;
+    bool external_physically_absent,external_cable;
+    bool full_catalog_v27;
+    void *preferred_timings_v27;unsigned nr_preferred_timings_v27;
+    struct { bool valid,changing; } mode_state;
     bool modes_lock,modes_admitted,modes_provisional,placeholder_retried,external_native; int external_held;
     u64 modes_generation,dimensions_generation; struct work_struct dimensions_wq;
     struct { int width_mm,height_mm; } panel;
@@ -858,7 +864,18 @@ static int __attribute__((unused)) dcp_direct_crossbar_link(struct apple_dcp *d,
     # property bounds the catalogue helpers use, all actual.
     property_header = base/'dcp-property.h'
     reasons = re.search(r'^enum dcp_hotplug_reason \{', iomfb, re.M)
-    mode_helpers = (''.join(line+'\n' for line in (property_header.read_text().splitlines() if property_header.exists() else ())
+    legacy_modes = r'''
+/* Fixed FW27 attachment/preference helpers are covered by metadata.py. */
+static void dcp_external_queue_initial_mode(struct apple_dcp *d) { assert(d->fw_compat!=27); }
+static int dcp_modes_set_preferred_v27(struct apple_dcp *d,const void *p,size_t n,u64 g)
+{ (void)d;(void)p;(void)n;(void)g;abort(); }
+static bool dcp_modes_check_hdmi_locked(struct apple_dcp *d) { assert(d->fw_compat!=27);return false; }
+static bool dcp_modes_retag_preferred_v27(struct apple_dcp *d) { assert(d->fw_compat!=27);return false; }
+static void dcp_modes_invalidate_locked(struct apple_dcp *d) {
+ d->modes_generation++;d->modes_admitted=false;d->modes_provisional=false;d->full_catalog_v27=false;
+}
+'''
+    mode_helpers = (legacy_modes + ''.join(line+'\n' for line in (property_header.read_text().splitlines() if property_header.exists() else ())
                             if not line.startswith('#include')).replace('static inline ', 'static inline __attribute__((unused)) ')
                     + (block(iomfb, reasons.start())+';\n' if reasons else '')
                     + ''.join(apple_function(root, name) for name in ('dcp_queue_hotplug', 'dcp_modes_for_connector',
@@ -1057,14 +1074,22 @@ static void conflicting_receipts(void) {
     # Execute the production metadata notifier so a manual probe cannot hide a
     # missing connector refresh after the last eligible mode is withdrawn.
     unit=unit.replace('bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_epoch epoch;',
-        'bool lock, attributes_valid, timing_valid, hpd_seen; struct dcp_metadata_ticket attributes_ticket,timing_ticket; struct drm_display_mode preferred; struct dcp_metadata_epoch epoch;')
+        'bool lock, attributes_valid, timing_valid, hpd_seen; u64 snapshot_sequence; struct dcp_metadata_ticket attributes_ticket,timing_ticket; struct drm_display_mode preferred; struct dcp_metadata_epoch epoch;')
     dcp_source=(base/'dcp.c').read_text()
     metadata_notifier='\n'.join(block(dcp_source,marker) for marker in (
+        'static bool dcp_firmware_metadata_recoverable(',
+        'static bool dcp_firmware_metadata_physical(',
+        'static bool dcp_firmware_metadata_matches(',
+        'static bool dcp_firmware_metadata_valid(',
+        'void dcp_firmware_metadata_begin(',
         'static void dcp_firmware_metadata_notify(',
         'static bool dcp_firmware_metadata_complete(',
-        'void dcp_firmware_metadata_timing('))
+        'void dcp_firmware_metadata_timing(') if marker in dcp_source)
+    unit=unit.replace(block(unit,'static void dcp_firmware_metadata_begin('), '')
     unit=unit.replace(block(unit,'static void dcp_firmware_metadata_timing('),
-        '#define dcp_trace_metadata(d,p,v) ((void)0)\nstatic bool dcp_firmware_metadata_enabled(struct apple_dcp *d);\n'+metadata_notifier)
+        '#define dcp_trace_metadata(d,p,v) ((void)0)\n'
+        'static u64 dcp_hdmi_attachment_generation(struct apple_dcp *d) { (void)d;return 0; }\n'
+        'static bool dcp_firmware_metadata_enabled(struct apple_dcp *d);\n'+metadata_notifier)
 
     failed_receipts = r'''
 static bool malformed_receipt(const char *key,unsigned fault) {
@@ -1109,8 +1134,6 @@ static void failed_replacements(void) {
 def panel_dimensions(root):
     n = publication(root)
     unit, block = n['unit'], n['block']
-    unit = unit.replace('bool modes_lock,modes_admitted,',
-                        'bool external_physically_absent,modes_lock,modes_admitted,', 1)
     # The connector's physical size, which DRM keeps in display_info.
     old = 'struct { struct { unsigned min_vfreq,max_vfreq; } monitor_range; } display_info;'
     assert unit.count(old) == 1
@@ -1220,11 +1243,11 @@ static int dcp_tunnel_set_rate(struct apple_dcp *d,void *phy,...) {
     unit = unit.replace('assert(current(&d,&d.modes[0]));cleanup();runs++;', 'assert(current(&d,&d.modes[0]));assert(hardware_rate==8100 && hardware_lanes==2 && phy_calls==2);cleanup();runs++;')
     unit = unit.replace('struct apple_dcp {', '''struct apple_dcp {
     struct { bool lock,presentation_paused; } iomfb;
-    struct { bool valid,changing; } mode_state;
     struct work_struct external_stop_work,vblank_wq;
-    bool external_physically_absent,main_display,typec_crtc_off,external_cable,external_error,external_power_attempted,external_stopped;
+    bool main_display,typec_crtc_off,external_error,external_power_attempted,external_stopped;
     bool external_hotplug_pending,external_hotplug_connected,typec_poweron_hpd;
-    u64 external_stop_generation,external_rx_generation,external_crtc_generation;
+    u64 external_stop_generation,external_rx_generation,external_crtc_generation,external_hotplug_generation;
+    bool external_fw_connected;
     unsigned swap_watchdog_retrains;int typec_iomfb_hpd_ready;''')
     stubs = r'''
 #define DCP_HOTPLUG_NOTIFY 1

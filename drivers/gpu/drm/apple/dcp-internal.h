@@ -569,6 +569,8 @@ struct apple_dcp {
 		struct dcp_display_metadata attributes;
 		struct drm_display_mode preferred;
 		struct dcp_metadata_ticket attributes_ticket, timing_ticket;
+		/* FW27 derived EDID token, changed when either snapshot is replaced. */
+		u64 snapshot_sequence;
 		/* The connection whose TimingElements filled the mode catalogue. */
 		struct dcp_metadata_ticket catalog_ticket;
 		u64 catalog_connection_sequence;
