@@ -48,6 +48,15 @@ enum ycc_change {
 	YCC_TIMING_HORIZ_ACTIVE,
 	YCC_TIMING_VERT_RATE,
 	YCC_TIMING_NO_HRATE,
+	YCC_SIBLING_DEPTH,
+	YCC_SIBLING_DEPTH_REVERSE,
+	YCC_SIBLING_OUTPUT,
+	YCC_SIBLING_OUTPUT_REVERSE,
+	YCC_SIBLING_DISTINCT,
+	YCC_SIBLING_DISTINCT_REVERSE,
+	YCC_SIBLING_IDENTICAL,
+	YCC_DISTINCT_DEPTH,
+	YCC_UNSAFE_OUTPUT_ID,
 };
 
 struct ycc_blob {
@@ -112,6 +121,12 @@ static void ycc_colors(struct ycc_blob *b, enum ycc_change change, bool output)
 		values[1] = -1;
 	if (change == YCC_OUTPUT_SAME_ID && output)
 		values[0] = 187;
+	if (change == YCC_DISTINCT_DEPTH && !output) {
+		values[0] = 188;
+		values[2] = 10;
+	}
+	if (change == YCC_UNSAFE_OUTPUT_ID && output)
+		values[0] = 9;
 
 	ycc_tag(b, 1, 8 + outputs + duplicate - missing);
 	ycc_bool(b, "IsVirtual", virtual);
@@ -186,6 +201,13 @@ static void ycc_timing(struct ycc_blob *b, u32 id, u32 width, u32 rate,
 	bool missing_virtual = change == YCC_TIMING_NO_VIRTUAL;
 	bool extra = change >= YCC_TIMING_ID && change <= YCC_TIMING_DUP_VERT &&
 		!missing_virtual;
+	bool sibling = change >= YCC_SIBLING_DEPTH && change <= YCC_SIBLING_IDENTICAL;
+	bool sibling_first = change == YCC_SIBLING_DEPTH_REVERSE ||
+		change == YCC_SIBLING_OUTPUT_REVERSE || change == YCC_SIBLING_DISTINCT_REVERSE;
+	bool unsafe_output = change == YCC_SIBLING_OUTPUT || change == YCC_SIBLING_OUTPUT_REVERSE;
+	enum ycc_change sibling_change = unsafe_output ? YCC_UNSAFE_OUTPUT_ID :
+		change == YCC_SIBLING_DISTINCT || change == YCC_SIBLING_DISTINCT_REVERSE ?
+		YCC_DISTINCT_DEPTH : change == YCC_SIBLING_IDENTICAL ? YCC_NORMAL : YCC_DEPTH;
 
 	ycc_tag(b, 1, 10 + encoding - missing_virtual + extra);
 	ycc_int(b, "ID", id);
@@ -199,19 +221,28 @@ static void ycc_timing(struct ycc_blob *b, u32 id, u32 width, u32 rate,
 		put_unaligned_le64(1, b->data + b->size - 8);
 	ycc_dimension(b, true, width >= 3840 ? 2160 : 1080, rate, change);
 	ycc_key(b, "ColorModes");
-	ycc_tag(b, 2, rgb + ycc + pq);
+	ycc_tag(b, 2, rgb + ycc + pq + sibling);
 	if (rgb)
 		ycc_rgb(b, false);
+	if (sibling_first)
+		ycc_colors(b, sibling_change, false);
 	if (ycc)
 		ycc_colors(b, change, false);
+	if (sibling && !sibling_first)
+		ycc_colors(b, sibling_change, false);
 	if (pq)
 		ycc_rgb(b, true);
 	ycc_key(b, "UnsafeColorElementIDs");
-	ycc_tag(b, 2, unsafe);
+	ycc_tag(b, 2, unsafe + unsafe_output);
 	if (unsafe) {
 		ycc_tag(b, 4, 64);
 		put_unaligned_le64(change == YCC_RGB_UNSAFE ? 176 :
 				   change == YCC_UNSAFE ? 187 : 186, b->data + b->size);
+		b->size += 8;
+	}
+	if (unsafe_output) {
+		ycc_tag(b, 4, 64);
+		put_unaligned_le64(9, b->data + b->size);
 		b->size += 8;
 	}
 	ycc_key(b, "DSCRequiredColorElementIDs");
@@ -406,6 +437,57 @@ static void dcp_ycc_timing_identity_test(struct kunit *test)
 	}
 }
 
+static void dcp_ycc_sibling_colors_test(struct kunit *test)
+{
+	enum ycc_change change;
+	unsigned int rgb;
+
+	for (change = YCC_SIBLING_DEPTH; change <= YCC_SIBLING_IDENTICAL; change++) {
+		for (rgb = 0; rgb < 2; rgb++) {
+			struct ycc_blob *b = ycc_begin(test, 1);
+			struct dcp_display_mode *m;
+			unsigned int count;
+			bool admitted = rgb || change >= YCC_SIBLING_DISTINCT;
+
+			KUNIT_ASSERT_NOT_NULL(test, b);
+			ycc_timing(b, 147, 3840, 60U << 16, change, rgb, true, false);
+			m = ycc_parse(test, b, true, &count);
+			KUNIT_ASSERT_NOT_ERR_OR_NULL(test, m);
+			KUNIT_EXPECT_EQ_MSG(test, count, admitted, "change=%d rgb=%u", change, rgb);
+			if (count)
+				KUNIT_EXPECT_EQ(test, m[0].color_mode_id, rgb ? 176U : 187U);
+			kfree(m);
+		}
+	}
+}
+
+static void dcp_ycc_sibling_timings_test(struct kunit *test)
+{
+	unsigned int flags;
+
+	for (flags = 0; flags < 16; flags++) {
+		bool reverse = flags & 1, duplicate = flags & 2;
+		bool filtered = flags & 4, rgb = flags & 8;
+		struct ycc_blob *b = ycc_begin(test, 2);
+		struct dcp_display_mode *m;
+		unsigned int count, i;
+		unsigned int want = rgb ? 2 : duplicate ? 0 : 2 - filtered;
+
+		KUNIT_ASSERT_NOT_NULL(test, b);
+		for (i = 0; i < 2; i++) {
+			bool fast = reverse ? !i : i;
+
+			ycc_timing(b, fast || duplicate ? 147 : 143, 3840,
+				   (fast ? 60U : 50U) << 16,
+				   !fast && filtered ? YCC_DEPTH : YCC_NORMAL, rgb, true, false);
+		}
+		m = ycc_parse(test, b, true, &count);
+		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, m);
+		KUNIT_EXPECT_EQ(test, count, want);
+		kfree(m);
+	}
+}
+
 static struct kunit_case dcp_ycc_cases[] = {
 	KUNIT_CASE(dcp_ycc_catalog_test),
 	KUNIT_CASE(dcp_ycc_restrictions_test),
@@ -413,6 +495,8 @@ static struct kunit_case dcp_ycc_cases[] = {
 	KUNIT_CASE(dcp_ycc_unsafe_rgb_test),
 	KUNIT_CASE(dcp_ycc_truncated_test),
 	KUNIT_CASE(dcp_ycc_timing_identity_test),
+	KUNIT_CASE(dcp_ycc_sibling_colors_test),
+	KUNIT_CASE(dcp_ycc_sibling_timings_test),
 	{}
 };
 
