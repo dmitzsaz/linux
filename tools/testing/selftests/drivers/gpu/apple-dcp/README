@@ -56,13 +56,24 @@ and suspend fences, and discovery replay after enabling work. Run it with
 ./run.sh --group fw27. The corresponding KUnit cases are in apple-dcp-v27-start.
 The host fixture executes the production work initialization and enable/disable
 paths, including pending cancellation, disabled enqueue rejection and replay.
-Physical GPIO generations revoke fixed-HDMI catalogs and cached pairs even
-inside A413; a new admitted attachment received there gets one discovery replay.
+Confirmed HDMI attachment generations revoke fixed-HDMI catalogs and cached
+pairs even inside A413; a new admitted attachment received there gets one
+discovery replay. The existing HPD classifier keeps 500 us, 1 ms and 2 ms
+service pulses in the same attachment, including across A413 and cache reuse.
+Only a rising edge after more than 2 ms low advances the physical generation;
+an untimed GPIO or missing converter does not invent that classification.
 A failed first A413 may finish after replug on its already-powered pipe. Its
 own callbacks cannot request another attempt on the same attachment.
 Native geometry needs IsPreferred or a matching PreferredTimingElements ID
 (and reported geometry); without either, initialization waits with ENODATA.
-The preferred fixture runs the real serialized parser in both catalog orders.
+The preferred fixture runs the real serialized parser and catalog publication
+in both property orders. Without an authoritative native hint, FW27 clears
+the parser's largest-area DRM preference and defers bootstrap. With a hint,
+DRM prefers the highest usable SDR refresh at native geometry (1440p144 in
+the fixture), while bootstrap keeps the lowest pixel clock (1440p60). A
+larger-blanking timing checks the rational refresh comparison. Preferred
+updates refresh derived metadata before initialization and notify an already
+connected connector when its default changes; raw IsPreferred stays intact.
 `python3 external_mode.py --mutations` checks the five work-lifecycle negative
 controls and five physical/native/retry controls; compile errors are not kills.
 The native timing IDs/clock fixture follows the old boot-36 log; it is synthetic,

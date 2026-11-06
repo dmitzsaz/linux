@@ -1111,10 +1111,10 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
  * usable SDR element, the higher refresh rate ranks first, then IsPreferred,
  * then the firmware score.
  */
-VISIBLE_IF_KUNIT bool dcp_mode_default_above(const struct dcp_display_mode *mode,
-					     s64 score,
-					     const struct dcp_display_mode *best,
-					     s64 best_score)
+bool dcp_mode_default_above(const struct dcp_display_mode *mode,
+			    s64 score,
+			    const struct dcp_display_mode *best,
+			    s64 best_score)
 {
 	/* clock / (htotal * vtotal), compared without dividing */
 	u64 refresh = (u64)mode->mode.clock * best->mode.htotal * best->mode.vtotal;
