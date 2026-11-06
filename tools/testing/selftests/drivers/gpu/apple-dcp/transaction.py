@@ -343,12 +343,13 @@ int main(void) {
 def probe(root):
     core = (root / 'drivers/usb/typec/tipd/core.c').read_text()
     unit = quiesce.make_unit(root)
+    unit = '#define WRITE_ONCE(x,v) ((x)=(v))\n' + unit
     unit = unit.replace(block(unit, 'int main('), block(unit, 'int main(').replace('int main(', 'int __attribute__((unused)) prior_main(', 1), 1)
     unit = unit.replace('struct tipd_data {', 'struct fwnode_handle;\nstruct tipd_data { unsigned irq_mask1; int (*init)(struct tps6598x *); int (*switch_power_state)(struct tps6598x *, int); int (*register_port)(struct tps6598x *, struct fwnode_handle *); bool (*read_data_status)(struct tps6598x *); bool (*read_power_status)(struct tps6598x *); int (*connect)(struct tps6598x *,u32); void (*ready)(struct tps6598x *); void *irq_handler;')
     unit = unit.replace('struct tps6598x {', 'struct tps6598x { bool h17_display,dbma_at_probe,wakeup; u32 status; bool (*sleep_event)(struct tps6598x *);')
     # The common SAFE fixture does not enter firmware-27 non-SAFE mode.
     unit = unit.replace('struct apple_dcp { int external_lock,external_error;',
-                        'struct apple_dcp { int fw_compat; bool fixed_route_selected; void *fixed_phy; int external_lock,external_error;', 1)
+                        'struct apple_dcp { int fw_compat; bool fixed_route_selected,hdmi_yielded; void *fixed_phy; int external_lock,external_error;', 1)
     unit = unit.replace('static int dcp_typec_route_finish(',
                         '#define DCP_FIRMWARE_V_27_0 27\nstatic int dcp_typec_route_apply(struct typec_mux_dev *m,struct typec_mux_state *s) { (void)m;(void)s;assert(!"non-SAFE firmware-27 path");return -EINVAL; }\nstatic int dcp_typec_route_finish(', 1)
     helpers = r"""
