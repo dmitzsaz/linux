@@ -1769,10 +1769,41 @@ void dcp_modes_init(struct apple_dcp *dcp)
 	disable_work(&dcp->dimensions_wq);
 }
 
+/* Caller holds modes_lock. No GPIO reads or firmware calls in this fence. */
+static void dcp_modes_invalidate_locked(struct apple_dcp *dcp)
+{
+	dcp->modes_generation++;
+	dcp->modes_admitted = false;
+	dcp->modes_provisional = false;
+	dcp->full_catalog_v27 = false;
+	dcp->nr_preferred_timings_v27 = 0;
+}
+
+static bool dcp_modes_check_hdmi_locked(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+	u64 generation;
+
+	lockdep_assert_held(&dcp->modes_lock);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
+	    READ_ONCE(dcp->active_typec_route) || !dcp->fixed_phy)
+		return false;
+	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
+	generation = dcp->hdmi_presence.generation;
+	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+	if (generation == dcp->modes_hdmi_generation)
+		return false;
+	dcp->modes_hdmi_generation = generation;
+	dcp_modes_invalidate_locked(dcp);
+	return true;
+}
+
 bool dcp_modes_for_connector(struct apple_dcp *dcp,
 			     struct apple_connector *connector)
 {
 	lockdep_assert_held(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	return dcp->modes_admitted && READ_ONCE(dcp->connector) == connector;
 }
 
@@ -1789,6 +1820,7 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 
 	/* An attachment sees no catalog until one is admitted for it. */
 	guard(mutex)(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	if (!dcp->modes_admitted ||
 	    (connector && !dcp_modes_for_connector(dcp, connector))) {
 		*count = 0;
@@ -1802,7 +1834,11 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 }
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
-	/* A fixed sink's HPD inside A413 is settled with the transaction result. */
+	guard(mutex)(&dcp->modes_lock);
+	/* Physical edges always revoke the catalog, including inside A413. */
+	if (dcp_modes_check_hdmi_locked(dcp))
+		return;
+	/* Only the fixed sink's virtual HPD is settled with the A413 result. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
 	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    !READ_ONCE(dcp->active_typec_route) && READ_ONCE(dcp->mode_state.changing))
@@ -1811,11 +1847,7 @@ void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 	if (dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
 	    dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return;
-	guard(mutex)(&dcp->modes_lock);
-	dcp->modes_generation++;
-	dcp->modes_admitted = false;
-	dcp->modes_provisional = false;
-	dcp->full_catalog_v27 = false;
+	dcp_modes_invalidate_locked(dcp);
 }
 
 bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *route)
@@ -1826,10 +1858,7 @@ bool dcp_modes_end_typec(struct apple_dcp *dcp, struct apple_dcp_typec_route *ro
 	/* H17P external catalogs are fenced by their connection receipt. */
 	if (dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
-		dcp->full_catalog_v27 = false;
-		dcp->modes_generation++;
-		dcp->modes_admitted = false;
-		dcp->modes_provisional = false;
+		dcp_modes_invalidate_locked(dcp);
 	}
 	return true;
 }
@@ -1842,6 +1871,7 @@ struct dcp_display_mode *dcp_modes_dup(struct apple_dcp *dcp,
 	struct dcp_display_mode *modes;
 
 	guard(mutex)(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	*count = 0;
 	if (!connector || !dcp->nr_modes || !dcp->modes_admitted ||
 	    READ_ONCE(dcp->connector) != connector)
@@ -1869,6 +1899,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 	if (!modes)
 		return;
 	guard(mutex)(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	/* Never overwrite a fresh catalog or lend it to a different attachment. */
 	if (generation != dcp->modes_generation ||
 	    READ_ONCE(dcp->connector) != connector || dcp->modes_admitted) {
@@ -1887,6 +1918,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 u64 dcp_modes_transfer_begin(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	return dcp->modes_generation;
 }
 
@@ -1913,6 +1945,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 
 	/* A stale transfer is refused before it is parsed, as it is published. */
 	scoped_guard(mutex, &dcp->modes_lock) {
+		dcp_modes_check_hdmi_locked(dcp);
 		if (generation != dcp->modes_generation)
 			return -ESTALE;
 	}
@@ -1956,6 +1989,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	}
 
 	mutex_lock(&dcp->modes_lock);
+	dcp_modes_check_hdmi_locked(dcp);
 	if (generation != dcp->modes_generation) {
 		mutex_unlock(&dcp->modes_lock);
 		kfree(modes);
@@ -2046,6 +2080,7 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	bool backlight_control = false, ext;
 
 	scoped_guard(mutex, &dcp->modes_lock) {
+		dcp_modes_check_hdmi_locked(dcp);
 		if (generation != dcp->modes_generation)
 			return -ESTALE;
 		ret = parse_display_attributes(handle, &width_mm, &height_mm,
@@ -2102,6 +2137,9 @@ void dcp_modes_release(void *data)
 	guard(mutex)(&dcp->modes_lock);
 	dcp->modes_generation++;
 	dcp->modes_admitted = false;
+	kfree(dcp->preferred_timings_v27);
+	dcp->preferred_timings_v27 = NULL;
+	dcp->nr_preferred_timings_v27 = 0;
 	kfree(dcp->modes);
 	dcp->modes = NULL;
 	dcp->nr_modes = 0;
@@ -2797,6 +2835,53 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 	return dcp_mode_settable(dcp, mode) ? MODE_OK : MODE_BAD;
 }
 
+/* PreferredTimingElements identifies native timings even without IsPreferred. */
+int dcp_modes_set_preferred_v27(struct apple_dcp *dcp, const void *blob, size_t len,
+			      u64 generation)
+{
+	struct dcp_timing_id *timings;
+	int count;
+
+	timings = kcalloc(DCP_MAX_TIMING_MODES, sizeof(*timings), GFP_KERNEL);
+	if (!timings)
+		return -ENOMEM;
+	count = dcp_parse_timing_ids(blob, len, timings, DCP_MAX_TIMING_MODES);
+	if (count < 0) {
+		kfree(timings);
+		return count;
+	}
+	scoped_guard(mutex, &dcp->modes_lock) {
+		dcp_modes_check_hdmi_locked(dcp);
+		if (generation != dcp->modes_generation) {
+			kfree(timings);
+			return -ESTALE;
+		}
+		kfree(dcp->preferred_timings_v27);
+		dcp->preferred_timings_v27 = timings;
+		dcp->nr_preferred_timings_v27 = count;
+	}
+	dcp_external_queue_initial_mode(dcp);
+	return 0;
+}
+
+static bool dcp_external_native_mode(struct apple_dcp *dcp,
+				     const struct dcp_display_mode *mode)
+{
+	unsigned int i;
+
+	if (mode->firmware_preferred)
+		return true;
+	for (i = 0; i < dcp->nr_preferred_timings_v27; i++) {
+		const struct dcp_timing_id *p = &dcp->preferred_timings_v27[i];
+
+		if (p->id == mode->timing_mode_id &&
+		    (!p->width || p->width == mode->mode.hdisplay) &&
+		    (!p->height || p->height == mode->mode.vdisplay))
+			return true;
+	}
+	return false;
+}
+
 /* Firmware preference supplies the native geometry; start at its lowest clock. */
 int dcp_external_initial_mode(struct apple_dcp *dcp, struct drm_crtc_state *state,
 			     u64 *generation)
@@ -2810,7 +2895,8 @@ int dcp_external_initial_mode(struct apple_dcp *dcp, struct drm_crtc_state *stat
 	for (i = 0; i < dcp->nr_modes; i++) {
 		const struct dcp_display_mode *m = &dcp->modes[i];
 
-		if (!m->sdr_usable || m->automatic_rgb8_quirk)
+		if (!m->sdr_usable || m->automatic_rgb8_quirk ||
+		    !dcp_external_native_mode(dcp, m))
 			continue;
 		if (!native ||
 		    (m->firmware_preferred && !native->firmware_preferred) ||
@@ -2846,11 +2932,12 @@ int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
 {
 	unsigned int action = DCP_HOTPLUG_NONE;
 	unsigned long flags;
-	bool connected, fixed, fixed_held;
+	bool connected, fixed, fixed_held, retry_initial = false;
 	int ret;
 
 	lockdep_assert_held(&dcp->external_lock);
 	scoped_guard(mutex, &dcp->modes_lock) {
+		dcp_modes_check_hdmi_locked(dcp);
 		if (generation != dcp->modes_generation || !dcp->modes_admitted) {
 			dcp->external_mode_valid = false;
 			dcp_mode_invalidate(&dcp->mode_state);
@@ -2878,8 +2965,12 @@ int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
 
 	scoped_guard(mutex, &dcp->iomfb.lock) {
 		scoped_guard(mutex, &dcp->modes_lock) {
+			dcp_modes_check_hdmi_locked(dcp);
 			if (generation != dcp->modes_generation || !dcp->modes_admitted)
 				ret = -ESTALE;
+			/* A fresh sink catalog may have arrived while A413 suppressed work. */
+			retry_initial = fixed && generation != dcp->modes_generation &&
+					dcp->modes_admitted;
 		}
 		connected = dcp->external_hotplug_generation == dcp->external_generation &&
 			    dcp->external_fw_connected && dcp->external_cable &&
@@ -2909,17 +3000,18 @@ int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
 			dcp->external_mode_generation = dcp->external_generation;
 			dcp->external_mode_catalog_generation = generation;
 			dcp->iomfb.presentation_paused = false;
-		} else if (!connected) {
+		} else if (!connected || ret == -ESTALE) {
+			dcp->iomfb.presentation_paused = true;
 			dcp_firmware_metadata_hotplug(dcp, false);
 			apple_connector_edid_set_live(dcp->connector, false);
-			if (READ_ONCE(dcp->active_typec_route)) {
+			if (!connected && READ_ONCE(dcp->active_typec_route)) {
 				dcp->external_stop_generation = dcp->external_rx_generation;
 				schedule_work(&dcp->external_stop_work);
 			}
 		}
 		/* Publish the connector only after recording the established pair. */
 		spin_lock_irqsave(&dcp->mode_state.lock, flags);
-		if (!connected || !ret)
+		if (!connected || !ret || ret == -ESTALE)
 			action = dcp_mode_apply_hotplug(&dcp->mode_state, connected && !ret,
 						 dcp->connector ?
 						 &dcp->connector->connected : NULL);
@@ -2929,6 +3021,9 @@ int dcp_external_modeset(struct apple_dcp *dcp, struct drm_crtc_state *state,
 	if (ret && dcp->connector && READ_ONCE(dcp->connector->connected))
 		action |= DCP_HOTPLUG_NOTIFY;
 	dcp_handle_hotplug_actions(dcp, action);
+	/* Only a distinct admitted attachment earns a replay, never A413's own HPD. */
+	if (ret == -ESTALE && connected && retry_initial)
+		dcp_external_queue_initial_mode(dcp);
 	return ret;
 }
 
