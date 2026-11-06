@@ -110,11 +110,15 @@ static int macsmc_rtc_get_time(struct device *dev, struct rtc_time *tm)
 	memcpy(&off, p_off, RTC_BYTES);
 	kfree(p_off);
 
+	/* A PMU reset can clear the offset, leaving only time since power-up. */
+	if (!off)
+		return -EINVAL;
+
 	/* Sign extend from 48 to 64 bits, then arithmetic shift right 15 bits to get seconds */
 	now = sign_extend64(ctr + off, RTC_BITS - 1) >> RTC_SEC_SHIFT;
 	rtc_time64_to_tm(now, tm);
 
-	return ret;
+	return 0;
 }
 
 static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
@@ -145,7 +149,8 @@ static int macsmc_rtc_set_time(struct device *dev, struct rtc_time *tm)
 
 	/* This sets the offset such that the set second begins now */
 	off = (rtc_tm_to_time64(tm) << RTC_SEC_SHIFT) - ctr;
-	return nvmem_cell_write(rtc->rtc_offset, &off, RTC_BYTES);
+	ret = nvmem_cell_write(rtc->rtc_offset, &off, RTC_BYTES);
+	return ret < 0 ? ret : 0;
 }
 
 
