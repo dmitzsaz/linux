@@ -444,8 +444,8 @@ int main(void) {
     return prefix + production + tests
 
 
-def preferred(root):
-    """Real serialized preferred timings, retained independently of the full catalog."""
+def catalog_fixture(root, catalog_only=False):
+    """Real catalog parser and publisher, shared by preference and receipt tests."""
     f = rate.parser_fixture(root)
     apple = root / 'drivers/gpu/drm/apple'
     iomfb = (apple / 'iomfb.c').read_text()
@@ -468,12 +468,14 @@ struct dcp_timing_id { u32 id,width,height; };
 struct apple_connector { void *dcp; bool connected,edid_invalidation_pending; };
 struct drm_crtc_state { struct drm_display_mode mode; };
 struct apple_dcp {
- int modes_lock,hdmi_presence_lock,fw_compat;
+ int modes_lock,hdmi_presence_lock,fw_compat,hpd_mutex;
  struct { int iomfb_method_profile; } hw;
  struct dcp_hdmi *hdmi;
  struct { bool changing; } mode_state;
  void *active_typec_route,*fixed_phy,*dev;
- bool quiescing,placeholder_retried;
+ bool quiescing,placeholder_retried,typec_cable_connected,external_cable;
+ u64 typec_generation;
+ struct { int lock; u64 epoch; bool enabled; void *service; } dcpavserv;
  int width_mm,height_mm,notch_height,fixed_connector_type,external_held;
  struct apple_connector *connector;
  struct dcp_display_mode *modes;
@@ -482,10 +484,14 @@ struct apple_dcp {
  bool modes_admitted,modes_provisional,full_catalog_v27;
  struct dcp_timing_id *preferred_timings_v27;
  struct { int lock; struct dcp_metadata_ticket catalog_ticket;
+  struct dcp_metadata_epoch epoch;
+  bool hpd_seen,attributes_valid,timing_valid;
   u64 catalog_connection_sequence; } metadata;
- struct { u64 catalog_sequence; } rate_proof;
- struct { bool payload_complete,automatic_service_pending;
-  struct dcp_metadata_ticket mode_ticket;
+ struct { u64 catalog_sequence,connection_sequence,sequence;
+  struct { bool valid; } rate,lanes; } rate_proof;
+ struct { bool payload_complete,automatic_service_pending,contiguous;
+  size_t length,received; void *data; u64 modes_generation;
+  struct dcp_metadata_ticket mode_ticket,metadata_ticket;
   u64 av_service_epoch,automatic_connection_sequence; } chunks;
 };
 #define DCP_FIRMWARE_V_26_6_DESKTOP 26
@@ -503,7 +509,7 @@ static void dcp_firmware_metadata_timing(struct apple_dcp *d) {
  for(unsigned i=0;i<d->nr_modes;i++)
   if(d->modes[i].mode.type&DRM_MODE_TYPE_PREFERRED)metadata_id=d->modes[i].timing_mode_id;
 }
-static bool dcp_firmware_metadata_enabled(struct apple_dcp *d) { (void)d;return false; }
+static bool dcp_firmware_metadata_enabled(struct apple_dcp *d) { return d->hw.iomfb_method_profile==2; }
 static void dcp_180hz_catalog_changed(struct apple_dcp *d) { (void)d; }
 static void dcp_queue_hotplug(struct apple_connector *c) { assert(c->connected);notifications++; }
 static unsigned requests;
@@ -539,9 +545,17 @@ static void dcp_external_queue_initial_mode(struct apple_dcp *d) { (void)d;reque
     for name, value in [('catalog', [native, fast, uhd, blanking]), ('preferred', [pref]),
                         ('id_only', [{'ID': 46}]), ('unknown', [{'ID': 999}]),
                         ('wrong_size', [dict(pref, HorizontalAttributes=dict(pref['HorizontalAttributes'], Active=1920))])]:
+        if catalog_only and name != 'catalog':
+            continue
         raw = bytearray(struct.pack('<I', 0xd3))
         f['wire'](value, raw)
         blobs += f'static const u8 {name}[]={{' + ','.join(map(str, raw)) + '};\n'
+    return prefix, production, blobs
+
+
+def preferred(root):
+    """Real serialized preferred timings, retained independently of the full catalog."""
+    prefix, production, blobs = catalog_fixture(root)
     return prefix + production + blobs + r'''
 static void publish(struct apple_dcp *d) {
  struct dcp_parse_ctx c;
@@ -617,6 +631,148 @@ int main(void) {
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
  free(d.preferred_timings_v27);free(d.modes);
  puts("PASS FW27 real preferred/full publication orders, native 144 Hz DRM/60 Hz bootstrap, blanking/SDR filters and stale receipts");
+}
+'''
+
+
+def catalog_ready(root):
+    """Transfer-start tickets through the real parser/publisher to FW27 readiness."""
+    prefix, production, blobs = catalog_fixture(root, catalog_only=True)
+    apple = root / 'drivers/gpu/drm/apple'
+    dcp = (apple / 'dcp.c').read_text()
+    template = (apple / 'iomfb_template.c').read_text()
+    readiness = (apple / 'dcp-180hz.c').read_text()
+    prefix += r'''
+#define DCP_FW_VER 27
+#define DCP_FW_H17(v) 1
+#define WRITE_ONCE(p,v) ((p)=(v))
+#define SZ_1M (1024*1024)
+#define SZ_16M (16*SZ_1M)
+#define kzalloc(n,f) calloc(1,n)
+#define dev_warn(...) ((void)0)
+struct dcp_set_dcpav_prop_chunk_req { char data[0x1000]; u32 offset,length; };
+static bool dcp_sink_metadata(struct apple_dcp *d) { (void)d;return false; }
+static void dcp_desktop_metadata_new_sink(struct apple_dcp *d) { (void)d;abort(); }
+static void dcp_180hz_notify(struct apple_dcp *d) { (void)d; }
+/* FW27 readiness must never fall through to unqualified EDID/exception checks. */
+static bool dcpavserv_edid_current(struct apple_dcp *d,u64 g) { (void)d;(void)g;abort(); }
+static bool dcpavserv_edid_service_current(struct apple_dcp *d,u64 e) { (void)d;(void)e;abort(); }
+static bool dcp_180hz_link_current(struct apple_dcp *d,const struct dcp_display_mode *m)
+{ (void)d;(void)m;abort(); }
+'''
+    prefix += '\n' + block((apple / 'dcp-property.h').read_text(),
+                            'static inline bool dcp_property_size_valid(')
+    for marker in ('void dcp_firmware_metadata_connection(',
+                   'static void dcp_firmware_metadata_present_locked(',
+                   'void dcp_firmware_metadata_hotplug(', 'void dcp_firmware_metadata_begin('):
+        production += '\n' + block(dcp, marker)
+    for marker in ('static u8 dcpep_cb_prop_start(', 'static u8 dcpep_cb_prop_chunk('):
+        production += '\n' + block(template, marker)
+    for marker in ('static bool dcp_catalog_current(', 'bool dcp_external_modes_ready('):
+        production += '\n' + block(readiness, marker)
+    f = rate.policy(root)
+    unsafe = bytearray(struct.pack('<I', 0xd3))
+    f['namespace']['wire'](f['fixture'], unsafe)
+    blobs += 'static const u8 unsafe_catalog[]={' + ','.join(map(str, unsafe)) + '};\n'
+    return prefix + production + blobs + r'''
+static bool ready(struct apple_dcp *d) { return dcp_external_modes_ready(d); }
+static void start(struct apple_dcp *d,const u8 *data,size_t size) {
+ u32 length=size;
+ assert(dcpep_cb_prop_start(d,&length));
+ struct dcp_set_dcpav_prop_chunk_req chunk={.length=size};
+ assert(size<=sizeof(chunk.data));memcpy(chunk.data,data,size);
+ assert(dcpep_cb_prop_chunk(d,&chunk));
+}
+static int finish(struct apple_dcp *d) {
+ struct dcp_parse_ctx ctx;
+ struct dcp_display_mode *old=d->modes;
+ /* The completion gate used by dcpep_process_chunks(), with the real decoder. */
+ d->chunks.payload_complete=d->chunks.contiguous&&
+  dcp_property_complete(d->chunks.data,d->chunks.received,d->chunks.length);
+ assert(!parse(d->chunks.data,d->chunks.length,&ctx));
+ int ret=dcp_modes_replace(d,&ctx,d->chunks.modes_generation);
+ if(d->fw_compat==27) {
+  assert(!ctx.automatic_1080p180_rgb8);
+  for(unsigned i=0;i<d->nr_modes;i++)assert(!d->modes[i].automatic_rgb8_quirk);
+ }
+ free(d->chunks.data);d->chunks.data=NULL;
+ if(d->modes!=old)free(old);
+ return ret;
+}
+static void publish(struct apple_dcp *d) {
+ start(d,catalog,sizeof(catalog));assert(!finish(d));
+}
+int main(void) {
+ for(unsigned fixed=0;fixed<2;fixed++) {
+  struct apple_dcp d={.fw_compat=27,.hw.iomfb_method_profile=2,
+   .typec_generation=7,.typec_cable_connected=!fixed,.external_cable=true};
+  d.active_typec_route=fixed?NULL:&d;
+  /* Use the real enable policy for metadata producers. */
+  dcp_firmware_metadata_connection(&d,7,true);
+  assert(!ready(&d));
+  d.dcpavserv.epoch=13;publish(&d);
+  assert(d.metadata.catalog_ticket.associated&&!ready(&d));
+  assert(d.chunks.av_service_epoch==13&&d.chunks.automatic_service_pending);
+  dcp_firmware_metadata_hotplug(&d,true);assert(ready(&d));
+  assert(!d.dcpavserv.enabled); /* No EDID RPC or rate exception proof. */
+  /* Short, noncontiguous, overlong and malformed replacements prove nothing. */
+  for(unsigned bad=0;bad<4;bad++) {
+   start(&d,catalog,sizeof(catalog));
+   if(bad==0)d.chunks.received--;
+   if(bad==1)d.chunks.contiguous=false;
+   if(bad==2)d.chunks.length+=2;
+   if(bad==3)((u8 *)d.chunks.data)[7]=0x1f;
+   assert(finish(&d)<=0);assert(!ready(&d));
+   publish(&d);assert(ready(&d));
+  }
+  /* The special 180 Hz RGB element remains forbidden on FW27. */
+  start(&d,unsafe_catalog,sizeof(unsafe_catalog));assert(!finish(&d));
+  assert(!d.nr_modes&&!ready(&d));publish(&d);assert(ready(&d));
+  /* Publication retains receipt-start cable and connection provenance. */
+  start(&d,catalog,sizeof(catalog));
+  u64 old_generation=d.chunks.mode_ticket.generation;
+  u64 old_sequence=d.chunks.automatic_connection_sequence;
+  d.typec_cable_connected=false;d.typec_generation++;
+  dcp_firmware_metadata_connection(&d,d.typec_generation,false);
+  d.typec_cable_connected=!fixed;d.typec_generation++;
+  dcp_firmware_metadata_connection(&d,d.typec_generation,true);
+  dcp_firmware_metadata_hotplug(&d,true);assert(!ready(&d));
+  assert(!finish(&d));assert(!ready(&d));
+  assert(d.metadata.catalog_ticket.generation==old_generation);
+  assert(d.metadata.catalog_connection_sequence==old_sequence);
+  publish(&d);assert(ready(&d));
+  /* A same-generation downstream loss still revokes the old receipt. */
+  start(&d,catalog,sizeof(catalog));
+  dcp_firmware_metadata_hotplug(&d,false);
+  dcp_firmware_metadata_hotplug(&d,true);
+  assert(!finish(&d)&&!ready(&d));publish(&d);assert(ready(&d));
+  /* A new attachment rejects an old transfer at the mode-generation fence. */
+  start(&d,catalog,sizeof(catalog));
+  dcp_modes_begin_attachment(&d);
+  assert(finish(&d)==-ESTALE);
+  /* A pre-attachment transfer must not associate on a later announcement. */
+  d.typec_cable_connected=false;d.external_cable=false;
+  start(&d,catalog,sizeof(catalog));assert(!d.chunks.mode_ticket.associated);
+  d.typec_cable_connected=!fixed;d.external_cable=true;
+  dcp_firmware_metadata_hotplug(&d,true);
+  assert(!finish(&d)&&!ready(&d));publish(&d);assert(ready(&d));
+  free(d.modes);
+ }
+ /* Older firmware keeps its qualified exception and immutable service ticket. */
+ struct apple_dcp legacy={.fw_compat=14,.hw.iomfb_method_profile=2,
+  .typec_generation=9,.typec_cable_connected=true};
+ dcp_firmware_metadata_connection(&legacy,9,true);
+ legacy.dcpavserv.epoch=23;
+ start(&legacy,unsafe_catalog,sizeof(unsafe_catalog));legacy.dcpavserv.epoch++;
+ assert(!finish(&legacy)&&legacy.nr_modes==1);
+ const struct dcp_display_mode *m=&legacy.modes[0];
+ assert(m->automatic_rgb8_quirk&&m->unsafe_rgb8_ticket.associated);
+ assert(m->unsafe_rgb8_ticket.generation==9&&m->unsafe_rgb8_service_epoch==23);
+ assert(m->automatic_service_pending);
+ assert(m->automatic_connection_sequence==legacy.rate_proof.connection_sequence);
+ assert(m->automatic_catalog_sequence==legacy.rate_proof.catalog_sequence);
+ free(legacy.modes);
+ puts("PASS FW27 real receipt/publisher/readiness: Type-C/fixed, complete, incomplete/malformed, replug, late old receipts and no RGB8 exception; legacy exception tickets retained");
 }
 '''
 

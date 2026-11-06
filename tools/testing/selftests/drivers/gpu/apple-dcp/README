@@ -79,6 +79,14 @@ controls and five physical/native/retry controls; compile errors are not kills.
 The native timing IDs/clock fixture follows the old boot-36 log; it is synthetic,
 not a captured binary TimingElements catalog.
 
+The catalog-ready fixture runs the real property-start/chunk callbacks and
+TimingElements parser/publisher through FW27 readiness for Type-C and fixed
+outputs. It checks complete receipts, incomplete and malformed replacements,
+replug and same-generation loss, late old receipts, attachment fencing and
+the FW27 ban on the automatic RGB8 exception. Older firmware retains its
+exception's receipt-start service and connection tickets. KUnit exercises
+the parser/publisher/readiness integration in apple-display-parser.
+
 Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
 establish source behavior; electrical readiness, firmware/FDT ownership,
 concurrency and system suspend require separate kernel/hardware qualification.

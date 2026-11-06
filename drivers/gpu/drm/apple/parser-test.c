@@ -540,6 +540,122 @@ static void parser_replacement(struct kunit *test)
 	kfree(dcp->modes);
 }
 
+/* Capture the receipt-start fields used by dcpep_cb_prop_start(). */
+static void parser_fw27_receipt(struct apple_dcp *dcp, struct parser_blob *blob)
+{
+	dcp->chunks.modes_generation = dcp_modes_transfer_begin(dcp);
+	dcp_firmware_metadata_begin(dcp);
+	dcp->chunks.mode_ticket = dcp_metadata_begin(&dcp->metadata.epoch);
+	dcp->chunks.mode_ticket.associated = dcp->typec_cable_connected &&
+		dcp->metadata.epoch.generation == dcp->typec_generation;
+	dcp->chunks.automatic_connection_sequence = dcp->rate_proof.connection_sequence;
+	dcp->chunks.av_service_epoch = dcp->dcpavserv.epoch;
+	dcp->chunks.automatic_service_pending = !dcp->dcpavserv.enabled &&
+		!dcp->dcpavserv.service;
+	dcp->chunks.length = blob->size;
+	dcp->chunks.received = blob->size;
+}
+
+static int parser_fw27_publish(struct kunit *test, struct apple_dcp *dcp,
+			       struct parser_blob *blob)
+{
+	struct dcp_display_mode *old = dcp->modes;
+	struct dcp_parse_ctx ctx;
+	int ret;
+
+	dcp->chunks.payload_complete = dcp->chunks.contiguous &&
+		dcp_property_complete(blob->data, dcp->chunks.received, dcp->chunks.length);
+	KUNIT_ASSERT_EQ(test, parse(blob->data, blob->size, &ctx), 0);
+	ctx.dcp = &parser_dcp;
+	ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
+	KUNIT_EXPECT_FALSE(test, ctx.automatic_1080p180_rgb8);
+	/* There are no concurrent snapshot readers in this test. */
+	if (old != dcp->modes)
+		kfree(old);
+	return ret;
+}
+
+static bool parser_fw27_ready(struct apple_dcp *dcp)
+{
+	guard(mutex)(&dcp->hpd_mutex);
+	return dcp_external_modes_ready(dcp);
+}
+
+/* Exercise the real publisher and consumer without injecting a catalog ticket. */
+static void parser_fw27_catalog_receipt(struct kunit *test)
+{
+	struct parser_record record = valid_record(7, 10);
+	struct apple_dcp *dcp = kunit_kzalloc(test, sizeof(*dcp), GFP_KERNEL);
+	struct parser_blob *blob = make_blob(test, &record, 1);
+	u64 sequence;
+
+	KUNIT_ASSERT_NOT_NULL(test, dcp);
+	KUNIT_ASSERT_NOT_NULL(test, blob);
+	parser_modes_init(dcp);
+	mutex_init(&dcp->hpd_mutex);
+	/* No native mode worker is needed to test catalog publication. */
+	dcp->mode_state.changing = true;
+	dcp->active_typec_route = kunit_kzalloc(test, 1, GFP_KERNEL);
+	KUNIT_ASSERT_NOT_NULL(test, dcp->active_typec_route);
+	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
+	dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL;
+	dcp->typec_cable_connected = true;
+	dcp->typec_generation = 1;
+	dcp_firmware_metadata_connection(dcp, 1, true);
+	KUNIT_ASSERT_EQ(test, kunit_add_action_or_reset(test, dcp_modes_release, dcp), 0);
+
+	parser_fw27_receipt(dcp, blob);
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+	dcp_firmware_metadata_hotplug(dcp, true);
+	KUNIT_EXPECT_TRUE(test, parser_fw27_ready(dcp));
+	KUNIT_EXPECT_FALSE(test, dcp->dcpavserv.enabled);
+
+	parser_fw27_receipt(dcp, blob);
+	dcp->chunks.received--;
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+	parser_fw27_receipt(dcp, blob);
+	dcp->chunks.contiguous = false;
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+
+	/* Retained modes and a transfer begun on the old cable cannot admit it. */
+	parser_fw27_receipt(dcp, blob);
+	dcp->typec_cable_connected = false;
+	dcp->typec_generation++;
+	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, false);
+	dcp_modes_begin_attachment(dcp);
+	dcp->typec_cable_connected = true;
+	dcp->typec_generation++;
+	dcp_firmware_metadata_connection(dcp, dcp->typec_generation, true);
+	dcp_firmware_metadata_hotplug(dcp, true);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+	KUNIT_EXPECT_EQ(test, parser_fw27_publish(test, dcp, blob), -ESTALE);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+	parser_fw27_receipt(dcp, blob);
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_TRUE(test, parser_fw27_ready(dcp));
+
+	/* A late receipt cannot be retagged after a same-generation link loss. */
+	parser_fw27_receipt(dcp, blob);
+	sequence = dcp->chunks.automatic_connection_sequence;
+	dcp_firmware_metadata_hotplug(dcp, false);
+	dcp_firmware_metadata_hotplug(dcp, true);
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_EQ(test, dcp->metadata.catalog_connection_sequence, sequence);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+	parser_fw27_receipt(dcp, blob);
+	KUNIT_ASSERT_EQ(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_TRUE(test, parser_fw27_ready(dcp));
+
+	/* A malformed replacement withdraws the receipt as well as its modes. */
+	blob->size--;
+	parser_fw27_receipt(dcp, blob);
+	KUNIT_EXPECT_LT(test, parser_fw27_publish(test, dcp, blob), 0);
+	KUNIT_EXPECT_FALSE(test, parser_fw27_ready(dcp));
+}
+
 /*
  * Described again after a withdrawal it was kept connected through, the same
  * display keeps its EDID; any other replacement, or a placeholder being
@@ -1651,6 +1767,7 @@ static struct kunit_case parser_cases[] = {
 	KUNIT_CASE(parser_notch_vrr),
 	KUNIT_CASE(parser_vrr_empty_range),
 	KUNIT_CASE(parser_replacement),
+	KUNIT_CASE(parser_fw27_catalog_receipt),
 	KUNIT_CASE(parser_held_keeps_edid),
 	KUNIT_CASE(parser_attachment_admission),
 	KUNIT_CASE(parser_stale_transfer),
