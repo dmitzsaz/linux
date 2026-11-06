@@ -48,6 +48,15 @@ The modules contain public synthetic host boundaries and retained assertions:
   tuple/resource admission, unsupported VRR rejection and power reply bounds;
   15,552 D134 dispatcher scope/length/context and legacy reply cases.
 
+The fw27 group includes the initial external mode transaction: native geometry
+from firmware preference, lowest pixel clock, power before A413, mode established
+before connector publication, status failures, repeated-pair reuse, fixed-HDMI
+and Type-C transient/final HPD, stale stop revocation, physical detach, catalog
+and suspend fences, and discovery replay after enabling work. Run it with
+./run.sh --group fw27. The corresponding KUnit cases are in apple-dcp-v27-start.
+The native timing IDs/clock fixture follows the old boot-36 log; it is synthetic,
+not a captured binary TimingElements catalog.
+
 Transport, MMIO, kernel locks and work scheduling are host mocks. These tests
 establish source behavior; electrical readiness, firmware/FDT ownership,
 concurrency and system suspend require separate kernel/hardware qualification.

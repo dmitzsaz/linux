@@ -2066,7 +2066,8 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 		dcp->external_stop_deferred = false;
 		dcp->external_stop_retries = 0;
 		dcp->external_running = true;
-		iomfb_pause_presentation(dcp, false);
+		if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+			iomfb_pause_presentation(dcp, false);
 		return 0;
 	}
 	iomfb_pause_presentation(dcp, true);
@@ -2081,8 +2082,51 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 	dcp->external_stopped = false;
 	WRITE_ONCE(dcp->pipe_enabled_h17p, true);
 	WRITE_ONCE(dcp->typec_crtc_off, false);
-	iomfb_pause_presentation(dcp, false);
+	/* Firmware 27 publishes its first connection only after A413 succeeds. */
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0)
+		iomfb_pause_presentation(dcp, false);
 	return 0;
+}
+
+/* RX/catalog producers only queue work; external_lock owns every power/mode RPC. */
+void dcp_external_queue_initial_mode(struct apple_dcp *dcp)
+{
+	if (dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		schedule_work(&dcp->external_modeset_work);
+}
+
+static void dcp_external_modeset_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_modeset_work);
+	struct drm_crtc_state state = {};
+	u64 generation;
+	int ret;
+
+	guard(mutex)(&dcp->external_lock);
+	scoped_guard(mutex, &dcp->iomfb.lock) {
+		if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
+		    READ_ONCE(dcp->external_physically_absent) || !dcp->external_cable ||
+		    dcp->external_error || dcp->external_running || !dcp->external_fw_connected ||
+		    !READ_ONCE(dcp->typec_work_enabled) ||
+		    dcp->external_hotplug_generation != dcp->external_generation ||
+		    !dcp->iomfb.presentation_paused ||
+		    /* Same-cable DPMS wake belongs to the atomic enable. */
+		    (dcp->external_power_attempted && dcp->external_stopped &&
+		     dcp->external_generation == dcp->external_crtc_generation))
+			return;
+	}
+	ret = dcp_external_initial_mode(dcp, &state, &generation);
+	if (ret)
+		return; /* A later catalog publication can supply the missing mode. */
+	ret = dcp_external_start_locked(dcp);
+	if (!ret) {
+		dcp->pq_requested = false;
+		ret = dcp_external_modeset(dcp, &state, generation);
+	}
+	if (ret) {
+		dev_err(dcp->dev, "initial external display mode failed: %d\n", ret);
+		return;
+	}
 }
 
 /*
@@ -2565,6 +2609,8 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 	}
 	dcp->external_stop_deferred = false;
 	dcp->external_stop_retries = 0;
+	dcp->external_mode_valid = false;
+	dcp_mode_invalidate(&dcp->mode_state);
 	if (!ret) {
 		step = "powering the pipe off";
 		ret = iomfb_external_power_h17p(dcp, false);
@@ -2578,6 +2624,7 @@ static int dcp_external_stop_locked(struct apple_dcp *dcp, u64 generation)
 	/* This is a transport acknowledgment, not permission to free scanout. */
 	WRITE_ONCE(dcp->pipe_enabled_h17p, false);
 release_link:
+	dcp->external_mode_valid = false;
 	scoped_guard(mutex, &dcp->hpd_mutex) {
 		if (dcp->dptxport[0].connected) {
 			step = "withdrawing the DPTX link";
@@ -2609,9 +2656,17 @@ static int dcp_external_disconnect(struct apple_dcp *dcp, bool physical)
 {
 	int ret;
 
+	/* Fence an A413 already in flight before waiting for its lifecycle lock. */
+	if (physical) {
+		guard(mutex)(&dcp->iomfb.lock);
+		WRITE_ONCE(dcp->external_physically_absent, true);
+		dcp_mode_invalidate(&dcp->mode_state);
+	}
 	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
+	if (physical)
+		dcp->external_mode_valid = false;
 	/* Invalidate physical EDID before waiting for firmware power/link teardown. */
 	if (physical) {
 		WRITE_ONCE(dcp->external_physically_absent, true);
@@ -2658,6 +2713,13 @@ static void dcp_external_stop_work(struct work_struct *work)
 	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
 	guard(mutex)(&dcp->external_lock);
 	if (generation == dcp->external_generation) {
+		if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+			guard(mutex)(&dcp->iomfb.lock);
+			/* A newer D575 or a completed A413 can revoke a queued stop. */
+			if (dcp->external_hotplug_generation != generation ||
+			    dcp->external_fw_connected || dcp->mode_state.changing)
+				return;
+		}
 		/* The deferred disconnect also covers missing out-of-band HPD. */
 		dpavservep_detach(dcp);
 		dcp_external_stop_locked(dcp, generation);
@@ -2671,12 +2733,39 @@ bool dcp_external_hotplug(struct apple_dcp *dcp, bool connected)
 		return false;
 	/* No lifecycle or HPD mutex may be acquired from the RX callback. */
 	lockdep_assert_held(&dcp->iomfb.lock);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		dcp->external_hotplug_generation = dcp->external_rx_generation;
+		dcp->external_fw_connected = connected;
+	}
 	if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->external_physically_absent))
 		return true;
-	/* The fixed converter stays connected when its downstream sink leaves. */
-	if (!connected && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
-	    !READ_ONCE(dcp->active_typec_route))
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
+		dcp->external_hotplug_pending = true;
+		dcp->external_hotplug_connected = connected;
+		if (connected)
+			dcp_firmware_metadata_announced(dcp);
+		/* A413 may lower then restore HPD. Its result settles that sequence. */
+		if (READ_ONCE(dcp->mode_state.changing))
+			return true;
+		/* The fixed converter's link survives a downstream sink unplug. */
+		if (!connected && !READ_ONCE(dcp->active_typec_route)) {
+			dcp->external_hotplug_pending = false;
+			return false;
+		}
+		if (dcp->iomfb.presentation_paused) {
+			if (connected)
+				dcp_external_queue_initial_mode(dcp);
+			return true;
+		}
+		if (!connected) {
+			dcp_firmware_metadata_hotplug(dcp, false);
+			dcp->external_stop_generation = dcp->external_rx_generation;
+			schedule_work(&dcp->external_stop_work);
+			return true;
+		}
+		dcp->external_hotplug_pending = false;
 		return false;
+	}
 	if (dcp->iomfb.presentation_paused) {
 		dcp->external_hotplug_pending = true;
 		dcp->external_hotplug_connected = connected;
@@ -5135,6 +5224,8 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 	if (release_cable && dcp_is_external_h17p(dcp))
 		dpavservep_detach(dcp);
 	/* Block new enqueues as well as draining users of the AFK endpoints. */
+	if (dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		disable_work_sync(&dcp->external_modeset_work);
 	disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
 	scoped_guard(spinlock_irqsave, &dcp->relink_lock)
@@ -5152,6 +5243,8 @@ VISIBLE_IF_KUNIT void dcp_disable_typec_work(struct apple_dcp *dcp, bool release
 
 VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 {
+	if (dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		enable_work(&dcp->external_modeset_work);
 	enable_delayed_work(&dcp->typec_reconnect_wq);
 	enable_delayed_work(&dcp->placeholder_edid_wq);
 	enable_delayed_work(&dcp->typec_relink_wq);
@@ -5180,6 +5273,8 @@ VISIBLE_IF_KUNIT void dcp_enable_typec_work(struct apple_dcp *dcp)
 		    READ_ONCE(con->dcp) == to_platform_device(dcp->dev))
 			schedule_work(&con->hotplug_wq);
 	}
+	/* Discovery may have arrived before bind or while this work was disabled. */
+	dcp_external_queue_initial_mode(dcp);
 }
 
 static int dcp_get_firmware_clocks_v27(struct apple_dcp *dcp)
@@ -6022,6 +6117,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 		return ret;
 	mutex_init(&dcp->hpd_mutex);
 	mutex_init(&dcp->external_lock);
+	INIT_WORK(&dcp->external_modeset_work, dcp_external_modeset_work);
+	disable_work(&dcp->external_modeset_work);
 	INIT_WORK(&dcp->external_stop_work, dcp_external_stop_work);
 	INIT_DELAYED_WORK(&dcp->external_stop_retry_wq, dcp_external_stop_retry);
 	mutex_init(&dcp->tb_lock);
@@ -6567,6 +6664,8 @@ static void dcp_platform_remove(struct platform_device *pdev)
 			disable_delayed_work_sync(&dcp->typec_reconnect_wq);
 		return;
 	}
+	if (dcp && dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+		disable_work_sync(&dcp->external_modeset_work);
 	component_del(&pdev->dev, &dcp_comp_ops);
 	if (dcp && dcp->fw_compat == DCP_FIRMWARE_V_26_6)
 		iomfb_v26_6_unbind(dcp);

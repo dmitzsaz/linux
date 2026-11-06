@@ -35,6 +35,7 @@ import m4
 import display
 import colorimetry
 import fw27
+import external_mode
 
 
 def parking_unit(root):
@@ -57,6 +58,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('fw27', 'fw27-initial-mode', external_mode.transaction, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-cold-typec-probe', transaction.probe, ((),), ('-pthread',)),
         ('fw27', 'fw27-fixed-sink', fw27.ownership, ((),), ()),
         ('fw27', 'fw27-remote-ports', fw27.ports, ((),), ()),

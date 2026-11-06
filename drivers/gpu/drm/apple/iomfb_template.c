@@ -2646,6 +2646,10 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 */
 	if (dcp->main_display)
 		return;
+	/* Firmware 27 must observe even HPD changes inside a paused mode set. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    dcp_external_hotplug(dcp, !!(*connected)))
+		return;
 	/*
 	 * Report firmware hotplug independently of the USB4 PHY.
 	 * Reassigning lpdptxphy blanked eDP even with these callbacks ignored;
@@ -2681,7 +2685,8 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	if (!*connected)
 		WRITE_ONCE(dcp->ext_backlight, false);
 
-	if (dcp_external_hotplug(dcp, !!(*connected)))
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 &&
+	    dcp_external_hotplug(dcp, !!(*connected)))
 		return;
 
 	dcp_firmware_metadata_hotplug(dcp, !!(*connected));
@@ -3644,6 +3649,16 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 
 	/* Built-in ProMotion panels require timestamps even in fixed-120 mode. */
 	dcp->use_timestamps = mode->needs_timestamps && dcp->main_display;
+
+	/* A repeated A413 is not a successful way to check the current mode. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    dcp->hw.iomfb_method_profile == DCP_IOMFB_METHODS_H17P_EXTERNAL &&
+	    dcp->external_mode_valid &&
+	    dcp->external_mode_generation == dcp->external_generation &&
+	    dcp->external_mode_catalog_generation == dcp_modes_transfer_begin(dcp) &&
+	    dcp->external_mode.timing_mode_id == mode->timing_mode_id &&
+	    dcp->external_mode.color_mode_id == mode->color_mode_id)
+		return 0;
 
 	cookie = kzalloc(sizeof(*cookie), GFP_KERNEL);
 	if (!cookie) {
