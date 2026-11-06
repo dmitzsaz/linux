@@ -886,7 +886,8 @@ static u64 dcp_hdmi_edge(struct apple_dcp *dcp)
 	unsigned long flags;
 	u64 generation;
 
-	if (!dcp_hdmi_settle_enabled(dcp))
+	/* FW27 needs a physical revocation token even without fabric borrowing. */
+	if (!dcp_hdmi_settle_enabled(dcp) && dcp->fw_compat != DCP_FIRMWARE_V_27_0)
 		return 0;
 	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
 	if (dcp->hdmi_presence.state != DCP_FABRIC_SETTLING)

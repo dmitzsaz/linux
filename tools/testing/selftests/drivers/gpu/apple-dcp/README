@@ -56,6 +56,15 @@ and suspend fences, and discovery replay after enabling work. Run it with
 ./run.sh --group fw27. The corresponding KUnit cases are in apple-dcp-v27-start.
 The host fixture executes the production work initialization and enable/disable
 paths, including pending cancellation, disabled enqueue rejection and replay.
+Physical GPIO generations revoke fixed-HDMI catalogs and cached pairs even
+inside A413; a new admitted attachment received there gets one discovery replay.
+A failed first A413 may finish after replug on its already-powered pipe. Its
+own callbacks cannot request another attempt on the same attachment.
+Native geometry needs IsPreferred or a matching PreferredTimingElements ID
+(and reported geometry); without either, initialization waits with ENODATA.
+The preferred fixture runs the real serialized parser in both catalog orders.
+`python3 external_mode.py --mutations` checks the five work-lifecycle negative
+controls and five physical/native/retry controls; compile errors are not kills.
 The native timing IDs/clock fixture follows the old boot-36 log; it is synthetic,
 not a captured binary TimingElements catalog.
 

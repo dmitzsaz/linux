@@ -430,6 +430,9 @@ struct apple_dcp {
 	u64 external_mode_catalog_generation;
 	struct dcp_set_digital_out_mode_req external_mode;
 	struct work_struct external_modeset_work;
+	/* Producers request discovery; A413's own callbacks cannot request retries. */
+	atomic64_t external_initial_request;
+	u64 external_initial_attempt; /* external_lock */
 	bool external_cable;
 	/* RX tombstone: initially unknown; only physical OOB events change it. */
 	bool external_physically_absent;
@@ -656,6 +659,10 @@ struct apple_dcp {
 	bool modes_admitted;
 	bool modes_provisional;
 	bool full_catalog_v27; /* modes_lock, current attachment only */
+	/* GPIO edges revoke fixed FW27 catalogs, independently of virtual D575. */
+	u64 modes_hdmi_generation;
+	struct dcp_timing_id *preferred_timings_v27;
+	unsigned int nr_preferred_timings_v27;
 
 	/* Attributes of the connector */
 	int connector_type;
@@ -977,6 +984,7 @@ static inline void dcp_test_point(struct apple_dcp *dcp, enum dcp_test_point poi
 }
 
 #if IS_ENABLED(CONFIG_KUNIT)
+void dcp_external_modeset_work(struct work_struct *work);
 void dcp_work_register_backlight(struct work_struct *work);
 void dcp_comp_unbind(struct device *dev, struct device *main, void *data);
 void dcp_platform_shutdown(struct platform_device *pdev);
