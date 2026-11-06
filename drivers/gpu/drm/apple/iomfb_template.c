@@ -1518,8 +1518,8 @@ static bool dcpep_process_chunks(struct apple_dcp *dcp,
 	if (full_catalog || preferred_catalog) {
 		if (preferred_external)
 			ret = dcp_modes_set_preferred_v27(dcp, dcp->chunks.data,
-						  dcp->chunks.length,
-						  dcp->chunks.modes_generation);
+							  dcp->chunks.length,
+							  dcp->chunks.modes_generation);
 		else
 			ret = dcp_modes_replace(dcp, &ctx, dcp->chunks.modes_generation);
 		if (ret) {
