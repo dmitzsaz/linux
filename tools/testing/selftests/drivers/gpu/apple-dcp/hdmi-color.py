@@ -13,9 +13,7 @@ from common import block, run_unit
 import rate
 
 
-def timing_inputs(f):
-    """Mutate timing dictionaries independently of the C fixture builder."""
-    pairs = f['ObjectPairs']
+def converter_timing(f):
     timing = copy.deepcopy(f['timing_fixture'][0])
     timing.update(ID=147, Score=100, ValidPixelEncodings=2,
                   UnsafeColorElementIDs=[9, 7, 8], DSCRequiredColorElementIDs=[])
@@ -27,6 +25,13 @@ def timing_inputs(f):
                  DynamicRange=1, EOTF=0, Colorimetry=1, IsVirtual=False)
     color['DownstreamFormat'] = dict(color, ID=186, PixelEncoding=1)
     timing['ColorModes'] = [color]
+    return timing
+
+
+def timing_inputs(f):
+    """Mutate timing dictionaries independently of the C fixture builder."""
+    pairs = f['ObjectPairs']
+    timing = converter_timing(f)
     cases = [('valid', timing)]
     for field in ('ID', 'Score', 'IsVirtual', 'IsInterlaced',
                   'HorizontalAttributes', 'VerticalAttributes'):
@@ -104,6 +109,114 @@ static void check_timing_input(const char *name,const u8 *raw,size_t len,bool rg
     }
 }
 static void timing_identity_and_command(void)
+{
+CHECKS
+}
+'''.replace('CHECKS', checks)
+    return definitions + driver, len(cases)
+
+
+def sibling_inputs(f):
+    pairs = f['ObjectPairs']
+    timing = converter_timing(f)
+    good = timing['ColorModes'][0]
+    bad_depth = dict(good, Depth=10)
+    bad_output = copy.deepcopy(good)
+    bad_output['DownstreamFormat']['ID'] = 9
+    distinct = dict(bad_depth, ID=188)
+    cases = [('valid-only', [timing], 1, 1, 187),
+             ('invalid-only', [dict(timing, ColorModes=[bad_depth])], 0, 0, 187),
+             ('unsafe-output-only', [dict(timing, ColorModes=[bad_output])], 0, 0, 187)]
+    for name, colors, count, color_id in [
+        ('conflicting-depth', [good, bad_depth], 0, 187),
+        ('conflicting-output', [good, bad_output], 0, 187),
+        ('invalid-distinct-id', [good, distinct], 1, 187),
+        ('identical-color-siblings', [good, dict(good, Score=200)], 1, 187),
+        ('valid-distinct-colors', [good, dict(good, ID=188, Score=200)], 1, 188),
+        ('ambiguous-color-id', [good, pairs(list(good.items()) + [('ID', 188)])], 0, 187),
+    ]:
+        for reverse in (False, True):
+            values = list(reversed(colors)) if reverse else colors
+            cases.append((name + str(int(reverse)), [dict(timing, ColorModes=values)],
+                          count, count, color_id))
+    for reverse in (False, True):
+        for duplicate in (False, True):
+            slow = copy.deepcopy(timing)
+            slow['ID'] = 147 if duplicate else 143
+            slow['HorizontalAttributes'].update(Total=5280, FrontPorch=1056)
+            slow['VerticalAttributes']['PreciseSyncRate'] = 50 << 16
+            for filtered in ('valid', 'depth', 'virtual', 'incomplete', 'ambiguous-id'):
+                first = copy.deepcopy(slow)
+                if filtered == 'depth':
+                    first['ColorModes'] = [bad_depth]
+                elif filtered == 'virtual':
+                    first['IsVirtual'] = True
+                elif filtered == 'incomplete':
+                    del first['IsVirtual']
+                elif filtered == 'ambiguous-id':
+                    first = pairs(list(first.items()) + [('ID', 188)])
+                values = [timing, first] if reverse else [first, timing]
+                count = 0 if duplicate else 1 + (filtered == 'valid')
+                cases.append((f'timing-{reverse}-{duplicate}-{filtered}', values,
+                              count, count, 187))
+    cases.append(('identical-timing-siblings', [timing, timing], 0, 0, 187))
+    cases.append(('color-identity-bound', [dict(timing, ColorModes=[good] * 65)], 0, 0, 187))
+    definitions, checks = '', ''
+    for name, value, count, commands, color_id in cases:
+        for rgb in (False, True):
+            catalog = copy.deepcopy(value)
+            if rgb:
+                rgb_color = dict(ID=176, Score=1, Depth=8, PixelEncoding=0,
+                                 DynamicRange=0, EOTF=0, Colorimetry=10, IsVirtual=False)
+                for i, entry in enumerate(catalog):
+                    if isinstance(entry, pairs):
+                        catalog[i] = pairs([(k, [rgb_color] + v if k == 'ColorModes' else v)
+                                            for k, v in entry])
+                    else:
+                        entry['ColorModes'].insert(0, rgb_color)
+            raw = bytearray(struct.pack('<I', 0xd3))
+            f['wire'](catalog, raw)
+            index = definitions.count('static const')
+            definitions += 'static const u8 sibling_%u[]={%s};\n' % (
+                index, ','.join(map(str, raw)))
+            checks += ('check_sibling_input(%s,sibling_%u,sizeof(sibling_%u),%s,%u,%u,%u);\n' %
+                       (json.dumps(name), index, index, str(rgb).lower(),
+                        count, commands, color_id))
+    driver = r'''
+static void check_sibling_input(const char *name,const u8 *raw,size_t len,bool rgb,
+                                unsigned want,unsigned want_commands,u32 color_id)
+{
+    unsigned baseline_count=0,baseline_commands=0;
+    for(unsigned enabled=0;enabled<2;enabled++) {
+        struct dcp_parse_ctx ctx;unsigned count=0;
+        assert(!parse(raw,len,&ctx));ctx.fw27_hdmi_ycbcr420=enabled;
+        struct dcp_display_mode *m=enumerate_modes(&ctx,&count,0,0,0,false,true);
+        if(IS_ERR(m)){count=0;m=NULL;}
+        struct apple_dcp d={.fw_compat=27,.fixed_connector_type=11,
+            .hw={.iomfb_method_profile=2}};
+        commands=0;reply=0;
+        for(unsigned i=0;i<count;i++) {
+            d.selected=m[i];struct drm_crtc_state state={.mode=m[i].mode};
+            assert(!iomfb_modeset_v27(&d,&state));
+            assert(sent.color_mode_id==(rgb?176:color_id));
+            /* Mirror the enclosing caller's successful pair receipt. */
+            d.external_mode_valid=true;d.external_mode=d.mode;
+            d.external_mode_generation=d.external_generation;
+            d.external_mode_catalog_generation=1;
+            unsigned before=commands;
+            assert(!iomfb_modeset_v27(&d,&state) && commands==before);
+        }
+        if(rgb && !enabled){baseline_count=count;baseline_commands=commands;}
+        unsigned expected=rgb?baseline_count:enabled?want:0;
+        unsigned expected_commands=rgb?baseline_commands:enabled?want_commands:0;
+        if(count!=expected || commands!=expected_commands)
+            fprintf(stderr,"sibling %s: modes=%u A413=%u expected=%u/%u\n",
+                    name,count,commands,expected,expected_commands);
+        assert(count==expected && commands==expected_commands);
+        free(m);
+    }
+}
+static void sibling_identity_and_cache(void)
 {
 CHECKS
 }
@@ -286,16 +399,22 @@ int main(void)
     puts("PASS: truncated converter catalogs never publish a partial mode");
     dcp_ycc_timing_identity_test(&test);cleanup(&test);
     puts("PASS: incomplete/ambiguous converter timings rejected; RGB policy retained");
+    dcp_ycc_sibling_colors_test(&test);cleanup(&test);
+    dcp_ycc_sibling_timings_test(&test);cleanup(&test);
+    puts("PASS: converter sibling identities checked before eligibility filtering");
     scope_and_command(&test);cleanup(&test);
     puts("PASS: fixed FW27 HDMI only; actual modeset sends outer color187 through A413");
     timing_identity_and_command();
     puts("PASS: timing mutation matrix reaches actual A413 only for admitted controls");
+    sibling_identity_and_cache();
+    puts("PASS: conflicting siblings withheld; distinct commands and A413 cache controls");
     return 0;
 }
 '''
     identity, _ = timing_inputs(f)
+    siblings, _ = sibling_inputs(f)
     return (f['prefix'] + shim + f['metadata'] + f['epoch'] + f['header'] + parser +
-            tests + request + output + identity + main)
+            tests + request + output + identity + siblings + main)
 
 
 def main():

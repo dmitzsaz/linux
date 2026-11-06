@@ -175,6 +175,7 @@ typedef u32 __le32;
 #undef static_assert
 #define static_assert(c) _Static_assert(c, #c)
 #define IS_ENABLED(x) 0
+#define noinline_for_stack __attribute__((noinline))
 /* <kunit/visibility.h> without CONFIG_KUNIT, as IS_ENABLED() above */
 #define VISIBLE_IF_KUNIT static
 #define EXPORT_SYMBOL_IF_KUNIT(symbol)
