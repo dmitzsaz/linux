@@ -1007,8 +1007,9 @@ impl Pair {
             crate::g17::trace::publish(
                 crate::g17::trace::RENDER,
                 self.qids()[1],
-                self.ordinal as u32,
+                self.active.back().ok_or(EIO)?.ticket.ordinal as u32,
                 packet,
+                self.active.len(),
             );
             host.note_submission()
         })();
@@ -1437,6 +1438,7 @@ impl Pair {
             retirement::note_stampless(u16::from(self.slot), ordinal);
         }
         self.note_retirement(ordinal, context_update);
+        let depth = self.active.len();
         let front = self.active.front_mut().ok_or(EIO)?;
         if !front.flist_completed {
             host.complete_render(
@@ -1454,7 +1456,8 @@ impl Pair {
             qids[1],
             ordinal as u32,
             &front.packet,
-            [timestamps[0], timestamps[3]],
+            timestamps,
+            depth,
         );
         defer(Deferred::Retired(
             front.packet.completion.clone(),

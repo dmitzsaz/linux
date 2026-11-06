@@ -1078,7 +1078,8 @@ impl Queue {
                             ticket.qid,
                             ticket.ordinal,
                             &front.packet,
-                            [timestamps[0], timestamps[1]],
+                            [timestamps[0], timestamps[1], 0, 0],
+                            self.active.len,
                         );
                     }
                     self.retire_pending = true;
@@ -2561,7 +2562,8 @@ impl Queue {
             // ring itself and delayed dispatch.
             fence(Ordering::SeqCst);
             host.notify((0x83 << 48) | 0x02 | u64::from(policy.priority()) << 2)?;
-            crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet);
+            crate::g17::trace::publish(crate::g17::trace::COMPUTE, qid, ordinal, &packet,
+                self.active.len);
             host.note_submission()
         })();
         if let Err(error) = result {

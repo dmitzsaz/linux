@@ -15,6 +15,12 @@ void asahi_g17_trace_publish(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			     struct dma_fence *fence);
 void asahi_g17_trace_complete(u8 engine, u8 qid, u32 ordinal, u32 ctx, u64 seq,
 			      u64 gpu_start, u64 gpu_end);
+bool asahi_g17_trace_command_enabled(void);
+void asahi_g17_trace_command(u8 engine, u8 qid, u32 ctx, u64 seq, u64 submit,
+			    u32 depth, u32 width, u32 height, u32 samples,
+			    u64 stream_bytes, u8 timestamps);
+void asahi_g17_trace_timing(u8 engine, u8 qid, u32 ctx, u64 seq, u32 depth,
+			   const u64 *gpu, u64 gpu_hz);
 void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind);
 bool asahi_g17_trace_doorbell_enabled(void);
 void asahi_g17_trace_doorbell(u8 engine, u32 power);

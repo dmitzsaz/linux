@@ -11,6 +11,12 @@ unsafe extern "C" {
         fence: *mut bindings::dma_fence);
     fn asahi_g17_trace_complete(engine: u8, qid: u8, ordinal: u32, ctx: u32, seq: u64,
         gpu_start: u64, gpu_end: u64);
+    fn asahi_g17_trace_command_enabled() -> bool;
+    fn asahi_g17_trace_command(engine: u8, qid: u8, ctx: u32, seq: u64, submit: u64,
+        depth: u32, width: u32, height: u32, samples: u32, stream_bytes: u64,
+        timestamps: u8);
+    fn asahi_g17_trace_timing(engine: u8, qid: u8, ctx: u32, seq: u64, depth: u32,
+        gpu: *const u64, gpu_hz: u64);
     fn asahi_g17_trace_bind(engine: u8, qid: u8, ctx: u32, kind: u8);
     fn asahi_g17_trace_message(kind: u8, value: u64);
     fn asahi_g17_trace_doorbell_enabled() -> bool;
@@ -23,7 +29,10 @@ pub(super) const RENDER: u8 = 0;
 pub(super) const COMPUTE: u8 = 1;
 
 /// Called once the command's doorbell has been rung.
-pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job::Packet>) {
+pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job::Packet>,
+    depth: usize)
+{
+    command(engine, qid, packet, depth);
     // SAFETY: Pure static-key query.
     if !unsafe { asahi_g17_trace_publish_enabled() } {
         return;
@@ -38,12 +47,40 @@ pub(super) fn publish(engine: u8, qid: u8, ordinal: u32, packet: &Arc<super::job
 
 /// Called when exact completion with GPU timestamps is retired.
 pub(super) fn complete(engine: u8, qid: u8, ordinal: u32, packet: &super::job::Packet,
-    gpu: [u64; 2])
+    gpu: [u64; 4], depth: usize)
 {
     // SAFETY: Plain values only.
     unsafe {
         asahi_g17_trace_complete(engine, qid, ordinal, packet.context.id(), packet.order.sequence,
-            gpu[0], gpu[1])
+            gpu[0], gpu[if engine == RENDER { 3 } else { 1 }]);
+        // The four initialized timestamps live until C synchronously copies them.
+        // Queue depth is bounded by the render/compute admission limit.
+        asahi_g17_trace_timing(engine, qid, packet.context.id(), packet.order.sequence,
+            depth as u32, gpu.as_ptr(), crate::hw::t8140::resources::COMMAND_TIMESTAMP_HZ)
+    };
+}
+
+fn command(engine: u8, qid: u8, packet: &super::job::Packet, depth: usize) {
+    // SAFETY: Pure static-key query. Do not inspect command metadata when disabled.
+    if !unsafe { asahi_g17_trace_command_enabled() } {
+        return;
+    }
+    let outputs = |ts: &kernel::uapi::drm_asahi_timestamps| {
+        u8::from(ts.start.handle != 0) | (u8::from(ts.end.handle != 0) << 1)
+    };
+    let (width, height, samples, stream_bytes, timestamps) = match &packet.command {
+        super::command::Validated::Render { pass, timestamps, .. } => (
+            pass.width, pass.height, 1u32 << pass.samples_log2, 0,
+            outputs(&timestamps[0]) | (outputs(&timestamps[1]) << 2),
+        ),
+        super::command::Validated::Compute { cdm_va, cdm_end_va, timestamps, .. } => (
+            0, 0, 0, cdm_end_va.saturating_sub(*cdm_va), outputs(timestamps),
+        ),
+    };
+    // SAFETY: Bounded metadata and scalar values only, with no client pointers.
+    unsafe {
+        asahi_g17_trace_command(engine, qid, packet.context.id(), packet.order.sequence,
+            packet.id, depth as u32, width, height, samples, stream_bytes, timestamps)
     };
 }
 

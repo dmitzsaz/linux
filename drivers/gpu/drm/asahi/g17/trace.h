@@ -72,6 +72,86 @@ TRACE_EVENT(asahi_g17_complete,
 		  __entry->seq, __entry->gpu_start, __entry->gpu_end, __entry->counter)
 );
 
+/* Metadata of a published command. submit groups commands from one ioctl;
+ * depth counts retained commands on this physical queue, including this one.
+ * timestamps is a bitmask of requested TA/CDM start/end and fragment start/end
+ * outputs. No GPU addresses or client memory are recorded.
+ */
+TRACE_EVENT(asahi_g17_command,
+	TP_PROTO(u8 engine, u8 qid, u32 ctx, u64 seq, u64 submit, u32 depth,
+		 u32 width, u32 height, u32 samples, u64 stream_bytes, u8 timestamps),
+	TP_ARGS(engine, qid, ctx, seq, submit, depth, width, height, samples,
+		stream_bytes, timestamps),
+	TP_STRUCT__entry(
+		__field(u8, engine)
+		__field(u8, qid)
+		__field(u32, ctx)
+		__field(u64, seq)
+		__field(u64, submit)
+		__field(u32, depth)
+		__field(u32, width)
+		__field(u32, height)
+		__field(u32, samples)
+		__field(u64, stream_bytes)
+		__field(u8, timestamps)
+	),
+	TP_fast_assign(
+		__entry->engine = engine;
+		__entry->qid = qid;
+		__entry->ctx = ctx;
+		__entry->seq = seq;
+		__entry->submit = submit;
+		__entry->depth = depth;
+		__entry->width = width;
+		__entry->height = height;
+		__entry->samples = samples;
+		__entry->stream_bytes = stream_bytes;
+		__entry->timestamps = timestamps;
+	),
+	TP_printk("engine=%u qid=%u ctx=%u seq=%llu submit=%llu depth=%u size=%ux%u samples=%u stream_bytes=%llu timestamps=%#x",
+		  __entry->engine, __entry->qid, __entry->ctx, __entry->seq,
+		  __entry->submit, __entry->depth, __entry->width, __entry->height,
+		  __entry->samples, __entry->stream_bytes, __entry->timestamps)
+);
+
+/* The four already-validated firmware timestamps at physical retirement.
+ * Render: TA start/end, fragment start/end. Compute: CDM start/end, 0, 0.
+ * Envelopes include firmware scheduling and must not be called shader busy time.
+ * counter_hz describes the CPU counter; gpu_hz describes the firmware timestamps.
+ */
+TRACE_EVENT(asahi_g17_timing,
+	TP_PROTO(u8 engine, u8 qid, u32 ctx, u64 seq, u32 depth, const u64 *gpu,
+		 u64 gpu_hz, u64 counter, u64 counter_hz),
+	TP_ARGS(engine, qid, ctx, seq, depth, gpu, gpu_hz, counter, counter_hz),
+	TP_STRUCT__entry(
+		__field(u8, engine)
+		__field(u8, qid)
+		__field(u32, ctx)
+		__field(u64, seq)
+		__field(u32, depth)
+		__array(u64, gpu, 4)
+		__field(u64, gpu_hz)
+		__field(u64, counter)
+		__field(u64, counter_hz)
+	),
+	TP_fast_assign(
+		__entry->engine = engine;
+		__entry->qid = qid;
+		__entry->ctx = ctx;
+		__entry->seq = seq;
+		__entry->depth = depth;
+		memcpy(__entry->gpu, gpu, sizeof(__entry->gpu));
+		__entry->gpu_hz = gpu_hz;
+		__entry->counter = counter;
+		__entry->counter_hz = counter_hz;
+	),
+	TP_printk("engine=%u qid=%u ctx=%u seq=%llu depth=%u ta=%llu..%llu fr=%llu..%llu gpu_hz=%llu counter=%llu counter_hz=%llu",
+		  __entry->engine, __entry->qid, __entry->ctx, __entry->seq,
+		  __entry->depth, __entry->gpu[0], __entry->gpu[1],
+		  __entry->gpu[2], __entry->gpu[3], __entry->gpu_hz,
+		  __entry->counter, __entry->counter_hz)
+);
+
 TRACE_EVENT(asahi_g17_bind,
 	TP_PROTO(u8 engine, u8 qid, u32 ctx, u8 kind),
 	TP_ARGS(engine, qid, ctx, kind),

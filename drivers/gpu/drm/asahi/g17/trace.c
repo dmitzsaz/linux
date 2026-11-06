@@ -33,6 +33,27 @@ void asahi_g17_trace_bind(u8 engine, u8 qid, u32 ctx, u8 kind)
 	trace_asahi_g17_bind(engine, qid, ctx, kind);
 }
 
+bool asahi_g17_trace_command_enabled(void)
+{
+	return trace_asahi_g17_command_enabled();
+}
+
+void asahi_g17_trace_command(u8 engine, u8 qid, u32 ctx, u64 seq, u64 submit,
+			    u32 depth, u32 width, u32 height, u32 samples,
+			    u64 stream_bytes, u8 timestamps)
+{
+	trace_asahi_g17_command(engine, qid, ctx, seq, submit, depth, width, height,
+				samples, stream_bytes, timestamps);
+}
+
+void asahi_g17_trace_timing(u8 engine, u8 qid, u32 ctx, u64 seq, u32 depth,
+			   const u64 *gpu, u64 gpu_hz)
+{
+	if (trace_asahi_g17_timing_enabled())
+		trace_asahi_g17_timing(engine, qid, ctx, seq, depth, gpu, gpu_hz,
+				       __arch_counter_get_cntvct(), arch_timer_get_cntfrq());
+}
+
 bool asahi_g17_trace_doorbell_enabled(void)
 {
 	return trace_asahi_g17_doorbell_enabled();
