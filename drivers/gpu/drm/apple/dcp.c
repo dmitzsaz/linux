@@ -6095,6 +6095,8 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 	/* System sleep and shutdown cancel these even if no bind succeeded. */
 	INIT_WORK(&dcp->vblank_wq, dcp_delayed_vblank);
 	INIT_DELAYED_WORK(&dcp->swap_watchdog_wq, dcp_swap_watchdog);
+	INIT_WORK(&dcp->ext_early_mode_wq, dcp_ext_early_mode_work);
+	mutex_init(&dcp->ext_modeset_lock);
 	INIT_WORK(&dcp->bl_register_wq, dcp_work_register_backlight);
 	INIT_WORK(&dcp->bl_update_wq, dcp_work_update_backlight);
 	mutex_init(&dcp->bl_register_mutex);
@@ -6887,6 +6889,7 @@ static int dcp_platform_suspend(struct device *dev)
 	 */
 	dcp_disable_typec_work(dcp, false);
 	cancel_delayed_work_sync(&dcp->swap_watchdog_wq);
+	cancel_work_sync(&dcp->ext_early_mode_wq);
 	if (dcp->external_native)
 		disable_work_sync(&dcp->external_audio_work);
 
