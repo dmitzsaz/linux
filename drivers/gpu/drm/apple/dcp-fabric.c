@@ -1724,6 +1724,48 @@ static int dcp_typec_route_prepare(struct typec_mux_dev *mux,
 static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 				 struct typec_mux_state *state);
 
+/* Restore the fixed route while retaining the yield until ownership is published. */
+static int dcp_typec_route_release(struct apple_dcp_typec_route *route)
+{
+	struct apple_dcp *dcp = route->dcp;
+	bool yielded = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		       READ_ONCE(dcp->hdmi_yielded);
+	int ret;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (yielded)
+		WRITE_ONCE(dcp->hdmi_yielded, false);
+	ret = dcp_typec_route_deactivate(route);
+	if (yielded)
+		WRITE_ONCE(dcp->hdmi_yielded, true);
+	if (ret) {
+		/* The failed release still owns the pipeline until a later event. */
+		dev_err(dcp->dev, "could not release the Type-C display route: %d\n", ret);
+	}
+	return ret;
+}
+
+static int dcp_typec_connect_fixed(struct apple_dcp *dcp)
+{
+	int ret;
+
+	lockdep_assert_held(&dcp_typec_fabric_lock);
+	if (!dcp->hdmi_hpd || !dcp->active || READ_ONCE(dcp->hdmi_yielded) ||
+	    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
+		return 0;
+
+	/* HPD may have risen since deactivation parked on the Type-C PHY. */
+	ret = dcp_fixed_output_select(dcp);
+	if (ret) {
+		dev_err(dcp->dev, "could not select the HDMI output on handback: %d\n", ret);
+		return ret;
+	}
+	ret = dcp_dptx_connect(dcp, 0);
+	if (ret)
+		dev_err(dcp->dev, "could not connect the HDMI output on handback: %d\n", ret);
+	return ret;
+}
+
 static int dcp_typec_route_finish(struct typec_mux_dev *mux,
 				  struct typec_mux_state *state)
 {
@@ -1742,7 +1784,7 @@ static int dcp_typec_route_finish(struct typec_mux_dev *mux,
 	if (state->mode != TYPEC_STATE_SAFE || !port->safe_pending ||
 	    port->safe_finish_ready)
 		return 0;
-	ret = port->owner ? dcp_typec_route_deactivate(port->owner) : 0;
+	ret = port->owner ? dcp_typec_route_release(port->owner) : 0;
 	if (ret)
 		return ret;
 	port->safe_finish_ready = true;
@@ -1773,8 +1815,8 @@ static void dcp_typec_route_commit(struct typec_mux_dev *mux,
 	if (released && released->fw_compat == DCP_FIRMWARE_V_27_0) {
 		/* The Type-C display is gone: the HDMI display it took over gets it back. */
 		WRITE_ONCE(released->hdmi_yielded, false);
-		if (released->fixed_route_selected && released->fixed_phy && released->active)
-			dcp_dptx_connect(released, 0);
+		if (released->fixed_phy)
+			dcp_typec_connect_fixed(released);
 	}
 	dcp_typec_pipeline_freed();
 }
@@ -1916,7 +1958,7 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 			 * the pipeline just freed must not route this port again.
 			 */
 			port->dp_hpd = false;
-			ret = dcp_typec_route_deactivate(port->owner);
+			ret = dcp_typec_route_release(port->owner);
 			if (ret)
 				return ret;
 			port->owner = NULL;
@@ -1925,10 +1967,10 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 			if (dcp->fw_compat == DCP_FIRMWARE_V_27_0)
 				WRITE_ONCE(dcp->hdmi_yielded, false);
 			/* The hybrid went back to a live HDMI display. */
-			if (dcp->hdmi_hpd && dcp->active && !READ_ONCE(dcp->hdmi_yielded) &&
-			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-				dcp_dptx_connect(dcp, 0);
+			ret = dcp_typec_connect_fixed(dcp);
 			dcp_typec_pipeline_freed();
+			if (ret)
+				return ret;
 		}
 	}
 
@@ -1958,15 +2000,15 @@ static int dcp_typec_route_apply(struct typec_mux_dev *mux,
 
 			port->preferred_route = port->owner;
 			port->hpd = false;
-			ret = dcp_typec_route_deactivate(port->owner);
+			ret = dcp_typec_route_release(port->owner);
 			if (ret)
 				return ret;
 			port->owner = NULL;
 
-			if (dcp->hdmi_hpd && dcp->active &&
-			    gpiod_get_value_cansleep(dcp->hdmi_hpd))
-				dcp_dptx_connect(dcp, 0);
+			ret = dcp_typec_connect_fixed(dcp);
 			dcp_typec_pipeline_freed();
+			if (ret)
+				return ret;
 		} else if (was_counted && dcp_typec_keep_order()) {
 			/* a stream the plan left dark is gone: plan the rest */
 			dcp_typec_rebalance_locked(NULL, 0);

@@ -58,6 +58,7 @@ def main():
                                        'orientation-faults', 'backend-change', 'safe-first',
                                        'failed-flip-return', 'live-park'))
     tests = [
+        ('fw27', 'fw27-hdmi-handback', fw27.handback, ((),), ()),
         ('fw27', 'fw27-initial-mode', external_mode.transaction, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-preferred-timings', external_mode.preferred, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-catalog-ready', external_mode.catalog_ready, ((),), ('-Wno-unused-function',)),
