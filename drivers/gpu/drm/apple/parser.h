@@ -25,6 +25,8 @@ struct dcp_parse_ctx {
 	/* External H17P candidates require separate publication/lookup proof. */
 	bool automatic_1080p180_rgb8;
 	bool ambiguous_180hz;
+	/* Fixed FW27 HDMI: firmware-owned SDR 4:2:2 to 4:2:0 conversion. */
+	bool fw27_hdmi_ycbcr420;
 	/* Desktop 26.6 uses zero placeholders for an unreported VRR range. */
 	bool zero_vrr_range_fallback;
 	/*

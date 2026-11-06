@@ -2039,6 +2039,9 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 		ctx->metadata_timing = dcp_firmware_metadata_enabled(dcp);
 	}
 	ctx->zero_vrr_range_fallback = dcp->fw_compat == DCP_FIRMWARE_V_26_6_DESKTOP;
+	ctx->fw27_hdmi_ycbcr420 = dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+		h17p_external && dcp->fixed_connector_type == DRM_MODE_CONNECTOR_HDMIA &&
+		!READ_ONCE(dcp->active_typec_route);
 	modes = enumerate_modes(ctx, &nr_modes, dcp->width_mm, dcp->height_mm,
 				dcp->notch_height,
 				dcp->fixed_connector_type == DRM_MODE_CONNECTOR_eDP,

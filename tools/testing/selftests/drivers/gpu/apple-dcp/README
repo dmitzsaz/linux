@@ -21,6 +21,16 @@ to the synthetic callback test.
 No target access, firmware command, captured fixture or kernel
 configuration is required.
 
+Run ./hdmi-color.py for the fixed FW27 HDMI SDR converter regression. It
+executes the independent apple-dcp-hdmi-color KUnit cases against the actual
+parser under ASan/UBSan: 40 RGB timings remain, and six firmware-listed UHD
+timings gain their 8-bit limited-range BT.709 4:2:2 command with matching
+downstream 4:2:0. Unsafe/DSC colors, BT.601, malformed or mismatched outputs,
+and virtual entries are rejected. RGB preference, PQ selection and the FW27
+unsafe RGB8 1080p180 exclusion remain intact. The host test also executes the
+production FW27 modeset function and checks the outer color187/timing147 A413
+request. It mocks firmware replies and cannot establish a TV picture.
+
 One TAP entry point uses shared production extraction and compiler handling.
 The modules contain public synthetic host boundaries and retained assertions:
 
