@@ -776,19 +776,12 @@ static void iomfb_external_device_complete(struct apple_dcp *dcp, void *out, voi
 		iomfb_external_power_complete(dcp, NULL, data);
 		return;
 	}
-	/*
-	 * Firmware 27 powers the external controller up as soon as adaptive
-	 * sync is set, before a mode exists ("timing not valid"). The modeset
-	 * that follows then powers it down again, shuts the trained link
-	 * and retrains it, which fails on T8142. Go straight to
-	 * set_power_state, as the external display path that drove these
-	 * displays on J704 did; the controller then comes up with the first
-	 * modeset, on the link trained at connect.
-	 */
+	/* The original FW27 external power-on sequence has no parameter call. */
 	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0) {
 		struct dcp_set_power_state_req_h17p request = { .unklong = 1 };
 
-		dcp_set_power_state(dcp, true, &request, iomfb_external_power_complete, data);
+		/* Diagnostic parity check: the original A484 used command context 0. */
+		dcp_set_power_state(dcp, false, &request, iomfb_external_power_complete, data);
 		return;
 	}
 	dcp_set_parameter_dcp(dcp, false, &parameter, iomfb_external_parameter_complete, data);
