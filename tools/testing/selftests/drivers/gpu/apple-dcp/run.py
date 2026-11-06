@@ -60,6 +60,7 @@ def main():
     tests = [
         ('fw27', 'fw27-initial-mode', external_mode.transaction, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-preferred-timings', external_mode.preferred, ((),), ('-Wno-unused-function',)),
+        ('fw27', 'fw27-catalog-ready', external_mode.catalog_ready, ((),), ('-Wno-unused-function',)),
         ('fw27', 'fw27-cold-typec-probe', transaction.probe, ((),), ('-pthread',)),
         ('fw27', 'fw27-fixed-sink', fw27.ownership, ((),), ()),
         ('fw27', 'fw27-remote-ports', fw27.ports, ((),), ()),
