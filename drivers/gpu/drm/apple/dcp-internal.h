@@ -659,7 +659,7 @@ struct apple_dcp {
 	bool modes_admitted;
 	bool modes_provisional;
 	bool full_catalog_v27; /* modes_lock, current attachment only */
-	/* GPIO edges revoke fixed FW27 catalogs, independently of virtual D575. */
+	/* Confirmed HDMI attachment epoch, independently of virtual D575. */
 	u64 modes_hdmi_generation;
 	struct dcp_timing_id *preferred_timings_v27;
 	unsigned int nr_preferred_timings_v27;

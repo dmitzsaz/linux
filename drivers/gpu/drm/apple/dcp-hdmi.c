@@ -22,6 +22,7 @@
  * T6030 and T8142 external coprocessors with a fixed HDMI route use this.
  */
 
+#include <kunit/visibility.h>
 #include <linux/atomic.h>
 #include <linux/device.h>
 #include <linux/gpio/consumer.h>
@@ -55,6 +56,8 @@ struct dcp_hdmi {
 	struct delayed_work work;
 	/* Hard IRQ context only: time of the last falling HPD edge, or 0. */
 	u64 falling_ns;
+	/* Confirmed long-low/rising cable changes, separate from IRQ_HPD. */
+	atomic64_t attachment_generation;
 	/* Short pulses seen and not yet passed on. */
 	atomic_t pulses;
 	/* Poll requests until this time (jiffies); 0 when not polling. */
@@ -129,33 +132,53 @@ next:
 				 msecs_to_jiffies(DCP_HDMI_SERVICE_PERIOD_MS));
 }
 
-/*
- * Hard IRQ context, from the HPD GPIO's edge handler, on every edge.
- * Records the low time of each pulse and queues short ones.
- */
-void dcp_hdmi_hpd_edge(struct apple_dcp *dcp)
+static bool dcp_hdmi_is_irq_hpd(u64 low_ns)
+{
+	return low_ns <= DCP_HDMI_IRQ_HPD_MAX_NS;
+}
+
+/* Hard IRQ state update only: no GPIO, firmware or workqueue operations. */
+VISIBLE_IF_KUNIT bool dcp_hdmi_record_hpd_edge(struct apple_dcp *dcp, int level,
+					       u64 now)
 {
 	struct dcp_hdmi *hdmi = dcp->hdmi;
-	u64 now, low;
-	int level;
+	u64 low;
 
-	if (!hdmi || !hdmi->timed_edges)
-		return;
+	if (!hdmi || !hdmi->timed_edges || level < 0)
+		return false;
 
-	now = ktime_get_ns();
-	level = gpiod_get_value(dcp->hdmi_hpd);
-	if (level < 0)
-		return;
 	if (!level) {
 		hdmi->falling_ns = now;
-		return;
+		return false;
 	}
 
 	/* A rising edge without a falling one: the pulse ended before we read it. */
 	low = hdmi->falling_ns ? now - hdmi->falling_ns : 0;
 	hdmi->falling_ns = 0;
-	if (low > DCP_HDMI_IRQ_HPD_MAX_NS)
-		return;	/* A cable change, handled by the HPD presence logic. */
+	if (!dcp_hdmi_is_irq_hpd(low)) {
+		atomic64_inc(&hdmi->attachment_generation);
+		return false;
+	}
+	return true;
+}
+
+/* No GPIO reads or firmware calls: safe under IOMFB and modes locks. */
+u64 dcp_hdmi_attachment_generation(struct apple_dcp *dcp)
+{
+	return dcp->hdmi ? atomic64_read(&dcp->hdmi->attachment_generation) : 0;
+}
+
+/* Hard IRQ context, from the HPD GPIO's edge handler, on every edge. */
+void dcp_hdmi_hpd_edge(struct apple_dcp *dcp)
+{
+	struct dcp_hdmi *hdmi = dcp->hdmi;
+	u64 now;
+
+	if (!hdmi || !hdmi->timed_edges)
+		return;
+	now = ktime_get_ns();
+	if (!dcp_hdmi_record_hpd_edge(dcp, gpiod_get_value(dcp->hdmi_hpd), now))
+		return;
 
 	atomic_inc(&hdmi->pulses);
 	mod_delayed_work(system_freezable_wq, &hdmi->work, 0);
@@ -205,16 +228,10 @@ static void dcp_hdmi_release(void *data)
  * Called from probe once the HPD GPIO is known and before its IRQ is
  * requested, so that the IRQ is released before this state on unbind.
  */
-int dcp_hdmi_init(struct apple_dcp *dcp)
+VISIBLE_IF_KUNIT int dcp_hdmi_create(struct apple_dcp *dcp, bool timed_edges)
 {
 	struct dcp_hdmi *hdmi;
 	int ret;
-
-	if (!dcp->hdmi_hpd ||
-	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA ||
-	    (!of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext") &&
-	     !of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext")))
-		return 0;
 
 	hdmi = devm_kzalloc(dcp->dev, sizeof(*hdmi), GFP_KERNEL);
 	if (!hdmi)
@@ -222,7 +239,8 @@ int dcp_hdmi_init(struct apple_dcp *dcp)
 
 	hdmi->dcp = dcp;
 	atomic_set(&hdmi->pulses, 0);
-	hdmi->timed_edges = !gpiod_cansleep(dcp->hdmi_hpd);
+	atomic64_set(&hdmi->attachment_generation, 0);
+	hdmi->timed_edges = timed_edges;
 	INIT_DELAYED_WORK(&hdmi->work, dcp_hdmi_work);
 	/* Balanced by dcp_hdmi_enable() once the DPTX endpoint may be used. */
 	disable_delayed_work(&hdmi->work);
@@ -232,7 +250,23 @@ int dcp_hdmi_init(struct apple_dcp *dcp)
 		return ret;
 
 	dcp->hdmi = hdmi;
-	if (!hdmi->timed_edges)
+	return 0;
+}
+
+int dcp_hdmi_init(struct apple_dcp *dcp)
+{
+	int ret;
+
+	if (!dcp->hdmi_hpd ||
+	    dcp->fixed_connector_type != DRM_MODE_CONNECTOR_HDMIA ||
+	    (!of_device_is_compatible(dcp->dev->of_node, "apple,t6030-dcpext") &&
+	     !of_device_is_compatible(dcp->dev->of_node, "apple,t8142-dcpext")))
+		return 0;
+
+	ret = dcp_hdmi_create(dcp, !gpiod_cansleep(dcp->hdmi_hpd));
+	if (ret)
+		return ret;
+	if (!dcp->hdmi->timed_edges)
 		dev_info(dcp->dev, "HDMI: HPD GPIO can sleep, converter requests are polled only\n");
 	return 0;
 }
