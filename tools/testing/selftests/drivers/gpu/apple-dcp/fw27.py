@@ -32,6 +32,7 @@ typedef uint64_t u64;
 struct work_struct { bool queued; };
 struct delayed_work { struct work_struct work; };
 enum dcp_fabric_presence_state { DCP_FABRIC_ABSENT, DCP_FABRIC_SETTLING, DCP_FABRIC_PRESENT };
+struct dcp_fabric_presence { enum dcp_fabric_presence_state state; u64 generation; unsigned long deadline; };
 struct apple_connector { bool connected; };
 struct dptx_port { bool enabled,connected; void *service; };
 struct apple_dcp {
@@ -40,7 +41,8 @@ struct apple_dcp {
  void *active_typec_route,*fixed_phy;
  bool fixed_sink_known,fixed_sink_present,fixed_link_held,hdmi_yielded,external,quiescing,typec_work_enabled;
  struct apple_connector *fixed_connector;
- struct { enum dcp_fabric_presence_state state; u64 generation; } hdmi_presence;
+ struct dcp_fabric_presence hdmi_presence;
+ enum dcp_fabric_presence_state hdmi_presence_prev;
  struct delayed_work hdmi_recheck_wq;
  struct dptx_port dptxport[2];
 };
@@ -64,10 +66,12 @@ static bool dptx_service_available(struct dptx_port *p) { return p->enabled; }
 static int dptxport_set_hpd(void *s,bool h) { assert(s&&!h);hpd_calls++;return hpd_error; }
 static int dptxport_release_display(void *s) { assert(s);assert(hpd_calls>release_calls);release_calls++;return release_error; }
 '''
-    production = '\n'.join(block(fabric, x) for x in (
+    production = block((apple / 'dcp-fabric-core.c').read_text(), 'u64 dcp_fabric_presence_edge(') + '\n'
+    production += '\n'.join(block(fabric, x) for x in (
         'bool dcp_hdmi_port_attached(',
         'static bool dcp_typec_route_fixed_output_busy(',
         'static enum dcp_fabric_presence_state dcp_hdmi_presence(',
+        'static u64 dcp_hdmi_edge(',
         'static void dcp_hdmi_recheck_work(',
         'void dcp_fixed_sink_hotplug('))
     production += '\n' + block(dcp, 'static int dcp_dptx_withdraw_locked(')
@@ -82,6 +86,10 @@ int main(void) {
  struct apple_dcp d={.fw_compat=27,.fixed_phy=&gpio,.hdmi_hpd=&gpio,.typec_work_enabled=true,.hpd_mutex=1};
  struct apple_dcp_typec_route route={.dcp=&d};
  d.dptxport[0]=(struct dptx_port){.enabled=true,.connected=true,.service=&d};
+ /* Physical FW27 edges have a token even when fabric settling is disabled. */
+ assert(dcp_hdmi_edge(&d)==1&&d.hdmi_presence.generation==1);
+ assert(dcp_hdmi_edge(&d)==2&&d.hdmi_presence.generation==2);
+ d.fw_compat=26;assert(dcp_hdmi_edge(&d)==0&&d.hdmi_presence.generation==2);d.fw_compat=27;
  /* A high converter HPD and no initial downstream report reserve nothing. */
  assert(!dcp_hdmi_port_attached(&d));
  assert(!dcp_typec_route_fixed_output_busy(&route));

@@ -2091,22 +2091,30 @@ static int dcp_external_start_locked(struct apple_dcp *dcp)
 /* RX/catalog producers only queue work; external_lock owns every power/mode RPC. */
 void dcp_external_queue_initial_mode(struct apple_dcp *dcp)
 {
-	if (dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0)
+	if (dcp_is_external_h17p(dcp) && dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->mode_state.changing)) {
+		atomic64_inc(&dcp->external_initial_request);
 		schedule_work(&dcp->external_modeset_work);
+	}
 }
 
-static void dcp_external_modeset_work(struct work_struct *work)
+VISIBLE_IF_KUNIT void dcp_external_modeset_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(work, struct apple_dcp, external_modeset_work);
 	struct drm_crtc_state state = {};
-	u64 generation;
+	u64 generation, request;
 	int ret;
 
 	guard(mutex)(&dcp->external_lock);
+	request = atomic64_read(&dcp->external_initial_request);
+	if (request == dcp->external_initial_attempt)
+		return;
 	scoped_guard(mutex, &dcp->iomfb.lock) {
 		if (READ_ONCE(dcp->quiescing) || READ_ONCE(dcp->crashed) ||
 		    READ_ONCE(dcp->external_physically_absent) || !dcp->external_cable ||
-		    dcp->external_error || dcp->external_running || !dcp->external_fw_connected ||
+		    dcp->external_error ||
+		    (dcp->external_mode_valid && READ_ONCE(dcp->mode_state.valid)) ||
+		    !dcp->external_fw_connected ||
 		    !READ_ONCE(dcp->typec_work_enabled) ||
 		    dcp->external_hotplug_generation != dcp->external_generation ||
 		    !dcp->iomfb.presentation_paused ||
@@ -2118,7 +2126,9 @@ static void dcp_external_modeset_work(struct work_struct *work)
 	ret = dcp_external_initial_mode(dcp, &state, &generation);
 	if (ret)
 		return; /* A later catalog publication can supply the missing mode. */
-	ret = dcp_external_start_locked(dcp);
+	/* One attempt per outside discovery event, including a powered replug. */
+	dcp->external_initial_attempt = request;
+	ret = dcp->external_running ? 0 : dcp_external_start_locked(dcp);
 	if (!ret) {
 		dcp->pq_requested = false;
 		ret = dcp_external_modeset(dcp, &state, generation);
