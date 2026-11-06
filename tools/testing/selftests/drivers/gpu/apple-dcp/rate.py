@@ -559,6 +559,8 @@ struct apple_dcp {
     bool ext_backlight, has_panel,external_cable;
     int fw_compat;
 };
+/* These legacy units never drive a fixed FW27 HDMI attachment. */
+static u64 dcp_hdmi_attachment_generation(struct apple_dcp *d) { assert(d->fw_compat!=27);return 0; }
 struct rate_guard { bool *lock; };
 static struct rate_guard rate_lock(bool *p) { assert(!*p);*p=true;return (struct rate_guard){p}; }
 static void rate_unlock(struct rate_guard *g) { assert(*g->lock);*g->lock=false; }
@@ -1088,7 +1090,6 @@ static void conflicting_receipts(void) {
     unit=unit.replace(block(unit,'static void dcp_firmware_metadata_begin('), '')
     unit=unit.replace(block(unit,'static void dcp_firmware_metadata_timing('),
         '#define dcp_trace_metadata(d,p,v) ((void)0)\n'
-        'static u64 dcp_hdmi_attachment_generation(struct apple_dcp *d) { (void)d;return 0; }\n'
         'static bool dcp_firmware_metadata_enabled(struct apple_dcp *d);\n'+metadata_notifier)
 
     failed_receipts = r'''
