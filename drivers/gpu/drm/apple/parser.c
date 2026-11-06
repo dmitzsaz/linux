@@ -668,14 +668,24 @@ static bool parse_sdr_420_output(struct dcp_parse_ctx handle, u32 *id)
 	return true;
 }
 
-static int parse_color_modes(struct dcp_parse_ctx *handle,
-			     struct dcp_display_mode *out, bool external_sdr,
-			     const struct timing_color_restrictions *limits,
-			     bool limits_known,
-			     struct dcp_color_mode *unsafe_rgb8)
+struct converter_color_identity {
+	s64 id;
+	u32 output_id;
+	bool usable;
+};
+
+/* Keep the bounded identity table out of the timing/enumeration stack frame. */
+static noinline_for_stack int
+parse_color_modes(struct dcp_parse_ctx *handle, struct dcp_display_mode *out,
+		  bool external_sdr, const struct timing_color_restrictions *limits,
+		  bool limits_known, struct dcp_color_mode *unsafe_rgb8)
 {
 	struct iterator outer_it;
 	struct dcp_color_mode bootstrap = { .score = -1 };
+	struct converter_color_identity identities[DCP_TIMING_COLOR_ID_LIMIT];
+	bool ambiguous_color_ids = false;
+	bool ycbcr420;
+	u32 selected_output_id = 0;
 	unsigned int best_sdr_rank = 0, best_unsafe_rank = 0, best_pq_rank = 0;
 	int ret = 0;
 	out->sdr_444.score = -1;
@@ -689,6 +699,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 	ret = iterator_begin(handle, &outer_it, false);
 	if (ret)
 		return ret;
+	/* Bound the identity table without changing ordinary RGB admission. */
+	ycbcr420 = external_sdr && handle->fw27_hdmi_ycbcr420 && limits->ycbcr420 &&
+		outer_it.len <= ARRAY_SIZE(identities);
 
 	for (; outer_it.idx < outer_it.len; ++outer_it.idx) {
 		struct iterator it;
@@ -696,7 +709,7 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		unsigned int seen = 0;
 		bool is_virtual = true;
 		bool ambiguous = false, output_seen = false, output_valid = false;
-		bool ycbcr420 = external_sdr && handle->fw27_hdmi_ycbcr420 && limits->ycbcr420;
+		bool converter_usable;
 		u32 output_id = 0;
 		struct color_mode cmode = {
 			.colorimetry = -1,
@@ -720,6 +733,9 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 				for (field = 0; field < ARRAY_SIZE(fields); field++) {
 					if (strcmp(key, fields[field]))
 						continue;
+					if (ycbcr420 && (seen & (1U << field)) &&
+					    !strcmp(key, "ID"))
+						ambiguous_color_ids = true;
 					ambiguous |= !!(seen & (1U << field));
 					seen |= 1U << field;
 				}
@@ -760,6 +776,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			if (ret)
 				return ret;
 		}
+
+		/* Retain even rejected descriptions: A413 has no sibling index. */
+		converter_usable = ycbcr420 && !is_virtual && !ambiguous &&
+			seen == (1U << ARRAY_SIZE(fields)) - 1 && output_valid &&
+			output_id != cmode.id &&
+			sdr_ycbcr8(&cmode, DCP_COLOR_FORMAT_YCBCR422) &&
+			!timing_color_contains(&limits->unsafe, cmode.id) &&
+			!timing_color_contains(&limits->dsc_required, cmode.id) &&
+			!timing_color_contains(&limits->unsafe, output_id) &&
+			!timing_color_contains(&limits->dsc_required, output_id);
+		if (ycbcr420)
+			identities[outer_it.idx] = (struct converter_color_identity) {
+				.id = cmode.id, .output_id = output_id, .usable = converter_usable,
+			};
 
 		/*
 		 * Skip virtual or partial entries.  Remember the best virtual
@@ -816,13 +846,10 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 			 * HDMI conversion. Keep this in SDR, behind usable RGB, and
 			 * admit only the matching BT.709 8-bit limited-range pair.
 			 */
-			if (ycbcr420 && !ambiguous &&
-			    seen == (1U << ARRAY_SIZE(fields)) - 1 && output_valid &&
-			    output_id != cmode.id &&
-			    sdr_ycbcr8(&cmode, DCP_COLOR_FORMAT_YCBCR422) &&
-			    !timing_color_contains(&limits->unsafe, output_id) &&
-			    !timing_color_contains(&limits->dsc_required, output_id))
+			if (converter_usable && cmode.score > out->sdr.score) {
 				fill_color_mode(&out->sdr, &cmode);
+				selected_output_id = output_id;
+			}
 			if (!rank || rank < best_sdr_rank)
 				continue;
 			if (rank > best_sdr_rank)
@@ -844,6 +871,20 @@ static int parse_color_modes(struct dcp_parse_ctx *handle,
 		fill_color_mode(&out->best, &cmode);
 	}
 
+	if (ycbcr420 && out->sdr.score >= 0) {
+		unsigned int i;
+
+		for (i = 0; i < outer_it.len; i++) {
+			const struct converter_color_identity *identity = &identities[i];
+
+			if (ambiguous_color_ids ||
+			    (identity->id == out->sdr.id &&
+			     (!identity->usable || identity->output_id != selected_output_id))) {
+				out->sdr.score = -1;
+				break;
+			}
+		}
+	}
 	return 0;
 }
 
@@ -1215,6 +1256,42 @@ static bool dcp_180hz_ids_current(struct dcp_parse_ctx handle,
 	return matches == 1;
 }
 
+/* A converter command needs one timing identity, even among filtered entries. */
+static bool converter_timing_id_unique(struct dcp_parse_ctx handle, u32 id)
+{
+	struct iterator timings;
+	unsigned int matches = 0;
+
+	if (iterator_begin(&handle, &timings, false))
+		return false;
+	for (; timings.idx < timings.len; timings.idx++) {
+		struct iterator entry;
+
+		if (iterator_begin(&handle, &entry, true))
+			return false;
+		for (; entry.idx < entry.len; entry.idx++) {
+			char *key = parse_string(&handle);
+			int ret;
+
+			if (IS_ERR(key))
+				return false;
+			if (!strcmp(key, "ID")) {
+				s64 value;
+
+				ret = parse_int_bound(&handle, &value, 0, U32_MAX);
+				if (!ret && value == id)
+					matches++;
+			} else {
+				ret = skip(&handle);
+			}
+			kfree(key);
+			if (ret || matches > 1)
+				return false;
+		}
+	}
+	return matches == 1;
+}
+
 /*
  * A timing mode that the firmware marks as preferred ranks above every mode
  * that it does not mark; the firmware score orders the modes of each group.
@@ -1341,6 +1418,11 @@ struct dcp_display_mode *enumerate_modes(struct dcp_parse_ctx *handle,
 			}
 			continue;
 		}
+
+		if (external_sdr && handle->fw27_hdmi_ycbcr420 &&
+		    mode->sdr.score >= 0 && mode->color_mode_id == mode->sdr.id &&
+		    !converter_timing_id_unique(catalog, mode->timing_mode_id))
+			continue;
 
 		/* Process a successful mode */
 		(*count)++;
