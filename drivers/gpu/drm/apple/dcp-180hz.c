@@ -5,6 +5,7 @@
 #include "connector.h"
 #include "afk.h"
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "parser.h"
 #include "dcp-180hz.h"
 #include "dcp-180hz-policy.h"
@@ -200,6 +201,12 @@ bool dcp_180hz_mode_current(struct apple_dcp *dcp, const struct dcp_display_mode
 static bool dcp_catalog_current(struct apple_dcp *dcp)
 {
 	const struct dcp_metadata_ticket *ticket = &dcp->metadata.catalog_ticket;
+
+	/* Fixed HDMI can replace its sink without changing the converter link. */
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 &&
+	    !READ_ONCE(dcp->active_typec_route) &&
+	    ticket->hdmi_generation != dcp_hdmi_attachment_generation(dcp))
+		return false;
 
 	return ticket->associated && dcp->nr_modes &&
 	       ticket->generation == dcp->typec_generation &&
