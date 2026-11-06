@@ -4070,34 +4070,26 @@ static const struct dcp_fabric_resume_ops dcp_resume_ops = {
 	.sample = dcp_resume_sample,
 };
 
-#define DCP_HDMI_START_RETRY_MS		1000
-#define DCP_HDMI_START_RETRIES		5
-
 /*
- * An HDMI display attached at start whose first connect failed, typically
- * because the DP-to-HDMI converter powered up at probe did not answer on
- * AUX yet. Its HPD stays high, so nothing else connects it: try again a
- * bounded number of times, a second apart, as long as the HDMI port still
- * has a display and no Type-C display holds the pipeline.
+ * The DP-to-HDMI converter is powered up at probe; connected at once, the
+ * HDMI display is not answering on AUX yet, the firmware reports an inactive
+ * sink and the attempt is withdrawn. Connect it once, a moment later, as the
+ * J704 external display path did after its HPD debounce. A display that is
+ * not ready by then connects on its next HPD edge. Repeated attempts are
+ * avoided: each withdrawn one leaves the firmware less link bandwidth for a
+ * Type-C display on the same pipeline.
  */
+#define DCP_HDMI_START_DELAY_MS		1500
+
 static void dcp_hdmi_start_work(struct work_struct *work)
 {
 	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
 					     hdmi_start_wq);
 
-	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->dptxport[0].connected))
+	if (READ_ONCE(dcp->crashed) || READ_ONCE(dcp->dptxport[0].connected) ||
+	    READ_ONCE(dcp->hdmi_yielded))
 		return;
 	dcp_fabric_hdmi_retry(dcp);
-	if (READ_ONCE(dcp->dptxport[0].connected) || READ_ONCE(dcp->active_typec_route) ||
-	    gpiod_get_value_cansleep(dcp->hdmi_hpd) <= 0)
-		return;
-	if (++dcp->hdmi_start_tries >= DCP_HDMI_START_RETRIES) {
-		dev_warn(dcp->dev, "HDMI: display not connected after %u retries\n",
-			 dcp->hdmi_start_tries);
-		return;
-	}
-	mod_delayed_work(system_freezable_wq, &dcp->hdmi_start_wq,
-			 msecs_to_jiffies(DCP_HDMI_START_RETRY_MS));
 }
 
 static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
@@ -4111,22 +4103,12 @@ static int dcp_enable_dp2hdmi_hpd(struct apple_dcp *dcp)
 		dev_info(dcp->dev, "%s: DP2HDMI HPD connected:%d\n", __func__, connected);
 
 		if (connected && !READ_ONCE(dcp->hdmi_yielded)) {
-			/*
-			 * The DP-to-HDMI converter is powered up at probe and
-			 * may not answer on AUX yet: the firmware then reports
-			 * an inactive sink and no link is configured. Its HPD
-			 * stays high, so no edge will connect it later: retry
-			 * it a few times, see dcp_hdmi_start_work().
-			 */
-			int ret = dcp_dptx_connect(dcp, 0);
-
-			if (ret && ret != -ESHUTDOWN && !dcp->external_native) {
-				dcp->hdmi_start_tries = 0;
+			/* Not at once, see dcp_hdmi_start_work(). */
+			if (dcp->external_native)
+				dcp_dptx_connect(dcp, 0);
+			else
 				mod_delayed_work(system_freezable_wq, &dcp->hdmi_start_wq,
-						 msecs_to_jiffies(DCP_HDMI_START_RETRY_MS));
-			} else if (ret && ret != -EAGAIN && ret != -ESTALE && ret != -ESHUTDOWN) {
-				dcp_external_retry(dcp, "HDMI display link not set up", ret, 1000);
-			}
+						 msecs_to_jiffies(DCP_HDMI_START_DELAY_MS));
 		} else if (!connected) {
 			_dcp_poweroff(dcp);
 		}
