@@ -488,8 +488,16 @@ static int dcp_typec_route_activate(struct apple_dcp_typec_route *route,
 	 * The fixed output's HPD handler leaves disconnects to DCP, so the port
 	 * can still be marked connected to a display that is gone. Release it
 	 * (a no-op otherwise), or connecting the borrowed route returns early.
+	 *
+	 * A newly selected FW27 route starts a different attachment even if
+	 * the previous fixed output was already idle. A nonphysical stop keeps
+	 * its CRTC generation and makes discovery look like a same-cable DPMS
+	 * wake, for which the initial-mode worker must wait for atomic enable.
 	 */
-	ret = dcp_dptx_disconnect(dcp, 0);
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && dcp_is_external_h17p(dcp))
+		ret = dcp_dptx_disconnect_oob(to_platform_device(dcp->dev), 0);
+	else
+		ret = dcp_dptx_disconnect(dcp, 0);
 	if (ret)
 		return ret;
 
