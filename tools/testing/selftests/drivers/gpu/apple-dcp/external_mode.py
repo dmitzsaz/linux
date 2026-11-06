@@ -14,6 +14,27 @@ import rate
 from common import block, run_unit
 
 
+def hdmi_state():
+    return r'''
+#define NSEC_PER_MSEC 1000000ULL
+#define NSEC_PER_SEC 1000000000ULL
+#define DCP_HDMI_IRQ_HPD_MAX_NS (2 * NSEC_PER_MSEC)
+struct dcp_hdmi {
+ u64 falling_ns;
+ atomic64_t attachment_generation;
+ bool timed_edges;
+};
+'''
+
+
+def hdmi_helpers(root):
+    source = (root / 'drivers/gpu/drm/apple/dcp-hdmi.c').read_text()
+    return '\n'.join(block(source, marker) for marker in (
+        'static bool dcp_hdmi_is_irq_hpd(',
+        'VISIBLE_IF_KUNIT bool dcp_hdmi_record_hpd_edge(',
+        'u64 dcp_hdmi_attachment_generation('))
+
+
 def transaction(root):
     apple = root / 'drivers/gpu/drm/apple'
     dcp = (apple / 'dcp.c').read_text()
@@ -113,7 +134,7 @@ static bool enable_work(struct work_struct *w)
 static void cancel_delayed_work_sync(struct delayed_work *w) { cancel_work_sync(&w->work); }
 static void disable_delayed_work_sync(struct delayed_work *w) { disable_work_sync(&w->work); }
 static void enable_delayed_work(struct delayed_work *w) { enable_work(&w->work); }
-struct drm_display_mode { int clock,hdisplay,vdisplay; };
+struct drm_display_mode { int clock,hdisplay,vdisplay,htotal,vtotal,type; };
 struct drm_crtc_state { struct drm_display_mode mode; bool vrr_enabled; };
 struct dcp_color_mode { int id,score,depth,format,colorimetry,eotf,range; };
 struct dcp_display_mode {
@@ -129,10 +150,10 @@ struct apple_connector {
  struct work_struct hotplug_wq;
 };
 '''
-    prefix += state + work_state + r'''
+    prefix += hdmi_state() + state + work_state + r'''
 struct apple_dcp {
  int external_lock,modes_lock,fw_compat,hpd_mutex,relink_lock,hdmi_presence_lock;
- struct { u64 generation; } hdmi_presence;
+ struct dcp_hdmi *hdmi;
  u64 modes_hdmi_generation;
  struct dcp_timing_id *preferred_timings_v27;
  unsigned nr_preferred_timings_v27;
@@ -207,11 +228,12 @@ static void dcp_queue_typec_reconnect(struct apple_dcp *d,unsigned long delay)
 { assert(d->typec_work_enabled&&!delay);schedule_work(&d->typec_reconnect_wq.work); }
 #define to_platform_device(d) (d)
 '''
-    production = block(template, 'static void complete_set_digital_out_mode(')
+    production = hdmi_helpers(root) + '\n' + block(template, 'static void complete_set_digital_out_mode(')
     production += '\n' + block(template, template.rindex('int DCP_FW_NAME(iomfb_modeset)('))
     for name in ('static void dcp_modes_invalidate_locked(', 'static bool dcp_modes_check_hdmi_locked(',
                  'bool dcp_modes_for_connector(', 'u64 dcp_modes_transfer_begin(',
                  'void dcp_modes_begin_attachment(', 'static bool dcp_external_native_mode(',
+                 'static const struct dcp_display_mode *dcp_external_native_geometry(',
                  'int dcp_external_initial_mode(', 'int dcp_external_modeset('):
         production += '\n' + block(iomfb, name)
     for name in ('static int dcp_external_start_locked(', 'void dcp_external_queue_initial_mode(',
@@ -221,8 +243,13 @@ static void dcp_queue_typec_reconnect(struct apple_dcp *d,unsigned long delay)
     production += '\n' + stop + '\n' + enable
     production += '\nstatic void init_external_work(struct apple_dcp *dcp) {\n' + work_init + '\n}\n'
     tests = r'''
-enum event { NONE, BOUNCE, LOW, DETACH, STALE, QUIESCE, FAULT, PHYSICAL, REQUEUE, PHYSICAL_CATALOG };
+enum event { NONE, BOUNCE, LOW, DETACH, STALE, QUIESCE, FAULT, PHYSICAL, REQUEUE, PHYSICAL_CATALOG, IRQ_HPD };
 static enum event event;
+static u64 pulse_ns;
+static void pulse(struct apple_dcp *d,u64 low_ns) {
+ assert(!dcp_hdmi_record_hpd_edge(d,0,NSEC_PER_SEC));
+ assert(dcp_hdmi_record_hpd_edge(d,1,NSEC_PER_SEC+low_ns)==(low_ns<=2*NSEC_PER_MSEC));
+}
 static u32 reply;
 static bool missing;
 static void dcp_set_digital_out_mode(struct apple_dcp *d,bool b,struct dcp_set_digital_out_mode_req *m,
@@ -230,13 +257,14 @@ static void dcp_set_digital_out_mode(struct apple_dcp *d,bool b,struct dcp_set_d
  (void)b;(void)m;rpcs++;
  assert(d->mode_state.changing);
  if(!d->connector->connected)assert(powers==1&&!d->external_mode_valid);
- if(event==BOUNCE||event==LOW||event==PHYSICAL||event==PHYSICAL_CATALOG) {
-  if(event==PHYSICAL||event==PHYSICAL_CATALOG)d->hdmi_presence.generation+=2;
+ if(event==BOUNCE||event==LOW||event==PHYSICAL||event==PHYSICAL_CATALOG||event==IRQ_HPD) {
+  if(event==PHYSICAL||event==PHYSICAL_CATALOG)pulse(d,2*NSEC_PER_MSEC+1);
+  if(event==IRQ_HPD)pulse(d,pulse_ns);
   /* The fixed-sink trampoline retires its catalog before generic HPD. */
   if(d->fixed_phy)dcp_modes_begin_attachment(d);
   assert(dcp_external_hotplug(d,false));
   assert(!d->external_stop_work.pending);
-  if(event==BOUNCE||event==PHYSICAL||event==PHYSICAL_CATALOG)assert(dcp_external_hotplug(d,true));
+  if(event==BOUNCE||event==PHYSICAL||event==PHYSICAL_CATALOG||event==IRQ_HPD)assert(dcp_external_hotplug(d,true));
  }
  if(event==DETACH)d->external_physically_absent=true;
  if(event==STALE)d->modes_generation++;
@@ -252,6 +280,7 @@ static void dcp_set_digital_out_mode(struct apple_dcp *d,bool b,struct dcp_set_d
  cb(d,missing?NULL:&reply,c);
 }
 static struct apple_dcp d;
+static struct dcp_hdmi hdmi;
 static struct apple_connector con;
 static struct dcp_display_mode modes[4];
 static void unexpected_work(struct work_struct *w) { (void)w;assert(!"unrelated work executed"); }
@@ -263,6 +292,7 @@ static void init_state(bool fixed,bool bound) {
   .typec_cable_connected=!fixed,
   .fixed_phy=fixed?&d:NULL,.iomfb.presentation_paused=true};
  con=(struct apple_connector){.dcp=&d};
+ hdmi=(struct dcp_hdmi){.timed_edges=true};d.hdmi=&hdmi;
  init_external_work(&d);
  INIT_WORK(&d.external_stop_work,dcp_external_stop_work);
  INIT_WORK(&con.hotplug_wq,unexpected_work);
@@ -345,6 +375,22 @@ int main(void) {
  struct drm_crtc_state s={};u64 g;assert(!dcp_external_initial_mode(&d,&s,&g)&&s.mode.hdisplay==3440);
  modes[2].sdr_usable=false;modes[1].firmware_preferred=true;
  assert(!dcp_external_initial_mode(&d,&s,&g)&&s.mode.clock==580080);
+ /* Short physical IRQ_HPD pulses preserve the catalog and a cached pair. */
+ const u64 short_pulses[]={500000,1000000,2000000};
+ for(unsigned i=0;i<sizeof(short_pulses)/sizeof(short_pulses[0]);i++) {
+  init(true);dcp_external_hotplug(&d,true);event=IRQ_HPD;pulse_ns=short_pulses[i];
+  drain_initial();assert(con.connected&&con.edid_live&&d.modes_admitted&&d.external_mode_valid);
+  assert(d.modes_generation==11&&!dcp_hdmi_attachment_generation(&d)&&rpcs==1);
+  unsigned published=notices;
+  pulse(&d,pulse_ns);event=NONE;
+  assert(!apply(2)&&rpcs==1&&notices==published&&d.modes_generation==11);
+ }
+ /* Missing timing/GPIO support must not invent a physical epoch. */
+ init(true);hdmi.timed_edges=false;
+ assert(!dcp_hdmi_record_hpd_edge(&d,0,NSEC_PER_SEC));
+ assert(!dcp_hdmi_record_hpd_edge(&d,1,2*NSEC_PER_SEC));
+ assert(!dcp_hdmi_attachment_generation(&d));
+ d.hdmi=NULL;assert(!dcp_hdmi_attachment_generation(&d));
  /* A real GPIO unplug/replug during A413 revokes A, even if final D575 is high. */
  init(true);dcp_external_hotplug(&d,true);event=PHYSICAL;drain_initial();
  assert(!con.connected&&!con.edid_live&&!metadata_live&&!d.external_mode_valid&&!d.mode_state.valid);
@@ -366,7 +412,7 @@ int main(void) {
  dcp_external_modeset_work(&d.external_modeset_work);assert(rpcs==1);
  reply=0;event=NONE;dcp_external_queue_initial_mode(&d);drain_initial();assert(con.connected&&rpcs==2);
  /* An edge before a transaction also forbids a cached A pair, without D575. */
- d.hdmi_presence.generation++;
+ pulse(&d,2*NSEC_PER_MSEC+1);
  assert(apply(2)==-ESTALE&&!d.modes_admitted&&!d.external_mode_valid&&rpcs==2);
  /* First A413 ends low: replug/catalog may finish the powered, paused pipe. */
  init(true);dcp_external_hotplug(&d,true);event=LOW;drain_initial();
@@ -405,6 +451,10 @@ def preferred(root):
     iomfb = (apple / 'iomfb.c').read_text()
     parser = (apple / 'parser.c').read_text()
     prefix = f['prefix'] + f['epoch'] + f['metadata'] + f['header'] + r'''
+typedef u64 atomic64_t;
+static void atomic64_inc(atomic64_t *p) { ++*p; }
+static u64 atomic64_read(atomic64_t *p) { return *p; }
+''' + hdmi_state() + r'''
 #define READ_ONCE(x) (x)
 #define guard(k) fake_guard
 #define fake_guard(p) ((void)(p))
@@ -415,29 +465,57 @@ def preferred(root):
 #define DCP_FIRMWARE_V_27_0 27
 #define DCP_IOMFB_METHODS_H17P_EXTERNAL 2
 struct dcp_timing_id { u32 id,width,height; };
-struct apple_connector { int unused; };
+struct apple_connector { void *dcp; bool connected,edid_invalidation_pending; };
 struct drm_crtc_state { struct drm_display_mode mode; };
 struct apple_dcp {
  int modes_lock,hdmi_presence_lock,fw_compat;
  struct { int iomfb_method_profile; } hw;
- struct { u64 generation; } hdmi_presence;
+ struct dcp_hdmi *hdmi;
  struct { bool changing; } mode_state;
- void *active_typec_route,*fixed_phy;
+ void *active_typec_route,*fixed_phy,*dev;
+ bool quiescing,placeholder_retried;
+ int width_mm,height_mm,notch_height,fixed_connector_type,external_held;
  struct apple_connector *connector;
  struct dcp_display_mode *modes;
  unsigned nr_modes,nr_preferred_timings_v27;
  u64 modes_generation,modes_hdmi_generation;
  bool modes_admitted,modes_provisional,full_catalog_v27;
  struct dcp_timing_id *preferred_timings_v27;
+ struct { int lock; struct dcp_metadata_ticket catalog_ticket;
+  u64 catalog_connection_sequence; } metadata;
+ struct { u64 catalog_sequence; } rate_proof;
+ struct { bool payload_complete,automatic_service_pending;
+  struct dcp_metadata_ticket mode_ticket;
+  u64 av_service_epoch,automatic_connection_sequence; } chunks;
 };
+#define DCP_FIRMWARE_V_26_6_DESKTOP 26
+#define DRM_MODE_CONNECTOR_eDP 14
+#define to_platform_device(d) (d)
+#define atomic_read(p) (*(p))
+#define mutex_lock(p) ((void)(p))
+#define mutex_unlock(p) ((void)(p))
+static void apple_connector_invalidate_edid(struct apple_connector *c)
+{ if(c)c->edid_invalidation_pending=true; }
+static u32 metadata_id;
+static unsigned notifications;
+static void dcp_firmware_metadata_timing(struct apple_dcp *d) {
+ metadata_id=0;
+ for(unsigned i=0;i<d->nr_modes;i++)
+  if(d->modes[i].mode.type&DRM_MODE_TYPE_PREFERRED)metadata_id=d->modes[i].timing_mode_id;
+}
+static bool dcp_firmware_metadata_enabled(struct apple_dcp *d) { (void)d;return false; }
+static void dcp_180hz_catalog_changed(struct apple_dcp *d) { (void)d; }
+static void dcp_queue_hotplug(struct apple_connector *c) { assert(c->connected);notifications++; }
 static unsigned requests;
 static void dcp_external_queue_initial_mode(struct apple_dcp *d) { (void)d;requests++; }
 '''
-    production = f['parser'] + '\n' + block(parser, 'int dcp_parse_timing_ids(')
+    production = hdmi_helpers(root) + '\n' + f['parser'] + '\n' + block(parser, 'int dcp_parse_timing_ids(')
     for marker in ('static void dcp_modes_invalidate_locked(', 'static bool dcp_modes_check_hdmi_locked(',
                    'bool dcp_modes_for_connector(', 'u64 dcp_modes_transfer_begin(',
-                   'void dcp_modes_begin_attachment(', 'int dcp_modes_set_preferred_v27(',
-                   'static bool dcp_external_native_mode(', 'int dcp_external_initial_mode('):
+                   'void dcp_modes_begin_attachment(', 'static bool dcp_external_native_mode(',
+                   'static const struct dcp_display_mode *dcp_external_native_geometry(',
+                   'static bool dcp_modes_retag_preferred_v27(', 'int dcp_modes_replace(',
+                   'int dcp_modes_set_preferred_v27(', 'int dcp_external_initial_mode('):
         production += '\n' + block(iomfb, marker)
     native = copy.deepcopy(f['timing_fixture'][0])
     native['ID'] = 46
@@ -448,57 +526,97 @@ static void dcp_external_queue_initial_mode(struct apple_dcp *d) { (void)d;reque
     fast = copy.deepcopy(native)
     fast['ID'] = 100
     fast['VerticalAttributes']['PreciseSyncRate'] = 144 * 65536
+    blanking = copy.deepcopy(native)
+    blanking['ID'] = 101
+    blanking['HorizontalAttributes']['Total'] = 4000
+    blanking['VerticalAttributes']['Total'] = 2500
     uhd = copy.deepcopy(native)
     uhd['ID'] = 200
     uhd['HorizontalAttributes'].update(Active=3840, Total=4400)
     uhd['VerticalAttributes'].update(Active=2160, Total=2250, PreciseSyncRate=24*65536)
     pref = {k: v for k, v in native.items() if k in ('ID', 'HorizontalAttributes', 'VerticalAttributes')}
     blobs = ''
-    for name, value in [('catalog', [native, fast, uhd]), ('preferred', [pref]),
+    for name, value in [('catalog', [native, fast, uhd, blanking]), ('preferred', [pref]),
                         ('id_only', [{'ID': 46}]), ('unknown', [{'ID': 999}]),
                         ('wrong_size', [dict(pref, HorizontalAttributes=dict(pref['HorizontalAttributes'], Active=1920))])]:
         raw = bytearray(struct.pack('<I', 0xd3))
         f['wire'](value, raw)
         blobs += f'static const u8 {name}[]={{' + ','.join(map(str, raw)) + '};\n'
     return prefix + production + blobs + r'''
+static void publish(struct apple_dcp *d) {
+ struct dcp_parse_ctx c;
+ struct dcp_display_mode *old=d->modes;
+ assert(!parse(catalog,sizeof(catalog),&c));
+ assert(!dcp_modes_replace(d,&c,d->modes_generation));
+ assert(d->nr_modes==4);d->full_catalog_v27=true;
+ free(old);
+}
+static void preferred_id(struct apple_dcp *d,u32 id) {
+ unsigned found=0;
+ for(unsigned i=0;i<d->nr_modes;i++) {
+  assert(!d->modes[i].firmware_preferred);
+  if(d->modes[i].mode.type&DRM_MODE_TYPE_PREFERRED) {
+   assert(d->modes[i].timing_mode_id==id);found++;
+  }
+ }
+ assert(found==!!id);
+ assert(metadata_id==id);
+}
 int main(void) {
  struct apple_connector con={};
+ struct dcp_hdmi hdmi={.timed_edges=true};
  struct apple_dcp d={.fw_compat=27,.hw.iomfb_method_profile=2,.active_typec_route=&con,
-  .connector=&con,.modes_generation=11,.modes_admitted=true,.full_catalog_v27=true};
- struct dcp_parse_ctx c;
- assert(!parse(catalog,sizeof(catalog),&c));
- d.modes=enumerate_modes(&c,&d.nr_modes,600,330,0,false,true);
- assert(!IS_ERR(d.modes)&&d.nr_modes==3);
- for(unsigned i=0;i<d.nr_modes;i++)assert(!d.modes[i].firmware_preferred);
+  .connector=&con,.modes_generation=11,.dev=&d,.hdmi=&hdmi};
+ con.dcp=&d;
+ publish(&d);
  struct drm_crtc_state state={};u64 g;
+ preferred_id(&d,0); /* The parser's 4K24 area fallback was cleared. */
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
- /* Even after a full catalog, the preferred receipt supplies native geometry. */
+ /* Full first: retag before initialization and derived metadata publication. */
  assert(!dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),11));
- assert(requests==1&&d.nr_preferred_timings_v27==1&&d.nr_modes==3&&d.full_catalog_v27);
+ assert(requests==2&&d.nr_preferred_timings_v27==1&&d.full_catalog_v27);
+ preferred_id(&d,100); /* Native 144 Hz wins, including over larger blanking. */
+ assert(con.edid_invalidation_pending&&!notifications);
+ assert(d.modes[3].mode.clock>d.modes[1].mode.clock);
  assert(!dcp_external_initial_mode(&d,&state,&g)&&g==11);
  assert(state.mode.hdisplay==2560&&state.mode.vdisplay==1440&&state.mode.clock<300000);
  assert(!dcp_modes_set_preferred_v27(&d,id_only,sizeof(id_only),11));
+ preferred_id(&d,100);
  assert(!dcp_external_initial_mode(&d,&state,&g)&&state.mode.hdisplay==2560);
+ /* A late change on an already-connected connector asks DRM to reprobe. */
+ con.connected=true;con.edid_invalidation_pending=false;
  assert(!dcp_modes_set_preferred_v27(&d,unknown,sizeof(unknown),11));
+ preferred_id(&d,0);
+ assert(notifications==1&&con.edid_invalidation_pending);
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
  assert(!dcp_modes_set_preferred_v27(&d,wrong_size,sizeof(wrong_size),11));
+ preferred_id(&d,0);
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
- /* Preference may precede the full catalog, and survives that publication. */
- d.full_catalog_v27=false;d.modes_admitted=false;
- assert(!dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),11));
+ /* Preferred first: actual full-catalog publication consumes the hint. */
+ dcp_modes_begin_attachment(&d);con.connected=false;
+ assert(d.modes_generation==12&&!d.modes_admitted);
+ assert(!dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),12));
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
- d.full_catalog_v27=d.modes_admitted=true;
+ publish(&d);preferred_id(&d,100);
  assert(!dcp_external_initial_mode(&d,&state,&g)&&state.mode.hdisplay==2560);
- /* Retire hints with the sink and refuse a transfer started on the old sink. */
- d.active_typec_route=NULL;d.fixed_phy=&d;
- d.mode_state.changing=true;d.hdmi_presence.generation++;
+ /* Unsafe/non-SDR timing variants never become the preferred DRM mode. */
+ d.modes[1].automatic_rgb8_quirk=true;
+ assert(!dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),12));
+ assert(!(d.modes[1].mode.type&DRM_MODE_TYPE_PREFERRED));
+ d.modes[3].sdr_usable=false;
+ assert(!dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),12));
+ preferred_id(&d,46);
+ /* Retire hints with the sink and refuse an old-sink receipt during A413. */
+ d.active_typec_route=NULL;d.fixed_phy=&d;d.mode_state.changing=true;
+ assert(!dcp_hdmi_record_hpd_edge(&d,0,NSEC_PER_SEC));
+ assert(!dcp_hdmi_record_hpd_edge(&d,1,NSEC_PER_SEC+2*NSEC_PER_MSEC+1));
  dcp_modes_begin_attachment(&d);
- assert(d.modes_generation==12&&!d.modes_admitted&&!d.nr_preferred_timings_v27);
- assert(dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),11)==-ESTALE);
+ assert(d.modes_generation==13&&!d.modes_admitted&&!d.nr_preferred_timings_v27);
+ assert(dcp_modes_set_preferred_v27(&d,preferred,sizeof(preferred),12)==-ESTALE);
  d.modes_admitted=true;
  assert(dcp_external_initial_mode(&d,&state,&g)==-ENODATA);
  free(d.preferred_timings_v27);free(d.modes);
- puts("PASS FW27 real preferred parser, full/preferred arrival orders, native ID/geometry, stale receipt and physical revocation");
+ puts("PASS FW27 real preferred/full publication orders, native 144 Hz DRM/60 Hz bootstrap, blanking/SDR filters and stale receipts");
 }
 '''
 

@@ -10,6 +10,7 @@
 #include <drm/drm_framebuffer.h>
 
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "dcp-internal.h"
 #include "iomfb_v27.h"
 
@@ -25,7 +26,7 @@ struct v27_start_test {
 enum v27_external_event {
 	V27_EXT_NONE, V27_EXT_BOUNCE, V27_EXT_LOW, V27_EXT_DETACH,
 	V27_EXT_CATALOG, V27_EXT_SUSPEND, V27_EXT_PHYSICAL, V27_EXT_REQUEUE,
-	V27_EXT_PHYSICAL_CATALOG,
+	V27_EXT_PHYSICAL_CATALOG, V27_EXT_IRQ_HPD,
 };
 
 struct v27_external_test {
@@ -37,7 +38,17 @@ struct v27_external_test {
 	u32 status;
 	unsigned int calls;
 	atomic_t stops;
+	u64 pulse_ns;
 };
+
+static void v27_external_pulse(struct v27_external_test *t, u64 low_ns)
+{
+	bool service;
+
+	KUNIT_EXPECT_FALSE(t->test, dcp_hdmi_record_hpd_edge(&t->dcp, 0, NSEC_PER_SEC));
+	service = dcp_hdmi_record_hpd_edge(&t->dcp, 1, NSEC_PER_SEC + low_ns);
+	KUNIT_EXPECT_EQ(t->test, service, low_ns <= 2 * NSEC_PER_MSEC);
+}
 
 static void v27_external_noop(struct work_struct *work)
 {
@@ -62,21 +73,19 @@ static void v27_external_reply(struct apple_dcp *dcp,
 	t->calls++;
 	scoped_guard(mutex, &dcp->iomfb.lock) {
 		if (t->event == V27_EXT_BOUNCE || t->event == V27_EXT_LOW ||
-		    t->event == V27_EXT_PHYSICAL || t->event == V27_EXT_PHYSICAL_CATALOG) {
-			if (t->event == V27_EXT_PHYSICAL || t->event == V27_EXT_PHYSICAL_CATALOG) {
-				unsigned long flags;
-
-				spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
-				dcp->hdmi_presence.generation += 2;
-				spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
-			}
+		    t->event == V27_EXT_PHYSICAL || t->event == V27_EXT_PHYSICAL_CATALOG ||
+		    t->event == V27_EXT_IRQ_HPD) {
+			if (t->event == V27_EXT_PHYSICAL || t->event == V27_EXT_PHYSICAL_CATALOG)
+				v27_external_pulse(t, 2 * NSEC_PER_MSEC + 1);
+			if (t->event == V27_EXT_IRQ_HPD)
+				v27_external_pulse(t, t->pulse_ns);
 			/* The fixed-sink trampoline calls this before hotplug. */
 			if (dcp->fixed_phy)
 				dcp_modes_begin_attachment(dcp);
 			KUNIT_EXPECT_TRUE(t->test, dcp_external_hotplug(dcp, false));
 			KUNIT_EXPECT_FALSE(t->test, work_pending(&dcp->external_stop_work));
 			if (t->event == V27_EXT_BOUNCE || t->event == V27_EXT_PHYSICAL ||
-			    t->event == V27_EXT_PHYSICAL_CATALOG)
+			    t->event == V27_EXT_PHYSICAL_CATALOG || t->event == V27_EXT_IRQ_HPD)
 				KUNIT_EXPECT_TRUE(t->test, dcp_external_hotplug(dcp, true));
 		}
 		if (t->event == V27_EXT_DETACH)
@@ -113,6 +122,8 @@ static void v27_external_cleanup(void *data)
 	cancel_work_sync(&t->dcp.vblank_wq);
 	cancel_work_sync(&t->connector.hotplug_wq);
 	kfree(t->dcp.preferred_timings_v27);
+	if (t->dcp.modes != t->modes)
+		kfree(t->dcp.modes);
 }
 
 static struct v27_external_test *v27_external_setup(struct kunit *test, bool fixed)
@@ -128,6 +139,8 @@ static struct v27_external_test *v27_external_setup(struct kunit *test, bool fix
 	snprintf(name, sizeof(name), "v27-external-%lx", (unsigned long)t);
 	dcp->dev = kunit_device_register(test, name);
 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, dcp->dev);
+	if (fixed)
+		KUNIT_ASSERT_EQ(test, dcp_hdmi_create(dcp, true), 0);
 	dcp->fw_compat = DCP_FIRMWARE_V_27_0;
 	dcp->hw.iomfb_method_profile = DCP_IOMFB_METHODS_H17P_EXTERNAL;
 	dcp->test_push = v27_external_reply;
@@ -254,6 +267,10 @@ static void v27_external_initial_selection(struct kunit *test)
 	KUNIT_EXPECT_EQ(test, dcp_external_initial_mode(&t->dcp, &state, &generation), -ENODATA);
 	t->dcp.modes_admitted = false;
 	KUNIT_EXPECT_EQ(test, dcp_external_initial_mode(&t->dcp, &state, &generation), -ENODATA);
+	dcp_modes_adopt(&t->dcp, &t->connector, 11,
+			kmemdup(t->modes, sizeof(t->modes), GFP_KERNEL), ARRAY_SIZE(t->modes));
+	KUNIT_ASSERT_TRUE(test, t->dcp.modes_admitted);
+	KUNIT_EXPECT_FALSE(test, t->dcp.modes[2].mode.type & DRM_MODE_TYPE_PREFERRED);
 }
 
 static void v27_external_physical_replacement(struct kunit *test)
@@ -279,12 +296,47 @@ static void v27_external_physical_replacement(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, v27_external_apply(t, 0), 0);
 	KUNIT_EXPECT_EQ(test, dcp->external_mode.timing_mode_id, 346U);
 	KUNIT_EXPECT_TRUE(test, t->connector.connected);
-	/* No D575 is needed to revoke a cache hit after a later physical edge. */
-	scoped_guard(spinlock_irqsave, &dcp->hdmi_presence_lock)
-		dcp->hdmi_presence.generation++;
+	/* No D575 is needed to revoke a cache hit after a long-low/rising pair. */
+	v27_external_pulse(t, 2 * NSEC_PER_MSEC + 1);
 	KUNIT_EXPECT_EQ(test, v27_external_apply(t, 0), -ESTALE);
 	KUNIT_EXPECT_FALSE(test, dcp->modes_admitted);
 	KUNIT_EXPECT_EQ(test, t->calls, 2U);
+}
+
+static void v27_external_short_hpd(struct kunit *test)
+{
+	static const u64 pulses[] = { 500 * NSEC_PER_USEC, NSEC_PER_MSEC,
+				     2 * NSEC_PER_MSEC };
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(pulses); i++) {
+		struct v27_external_test *t = v27_external_setup(test, true);
+
+		t->event = V27_EXT_IRQ_HPD;
+		t->pulse_ns = pulses[i];
+		KUNIT_ASSERT_EQ(test, v27_external_apply(t, 0), 0);
+		KUNIT_EXPECT_EQ(test, dcp_hdmi_attachment_generation(&t->dcp), 0ULL);
+		KUNIT_EXPECT_EQ(test, t->dcp.modes_generation, 11ULL);
+		KUNIT_EXPECT_TRUE(test, t->dcp.modes_admitted);
+		KUNIT_EXPECT_TRUE(test, t->connector.connected);
+		KUNIT_EXPECT_TRUE(test, t->dcp.external_mode_valid);
+		/* A later service pulse also preserves the established pair. */
+		v27_external_pulse(t, pulses[i]);
+		t->event = V27_EXT_NONE;
+		KUNIT_ASSERT_EQ(test, v27_external_apply(t, 0), 0);
+		KUNIT_EXPECT_EQ(test, t->calls, 1U);
+		KUNIT_EXPECT_EQ(test, atomic_read(&t->stops), 0);
+	}
+}
+
+static void v27_external_untimed_hpd(struct kunit *test)
+{
+	struct v27_external_test *t = v27_external_setup(test, false);
+
+	KUNIT_ASSERT_EQ(test, dcp_hdmi_create(&t->dcp, false), 0);
+	KUNIT_EXPECT_FALSE(test, dcp_hdmi_record_hpd_edge(&t->dcp, 0, NSEC_PER_SEC));
+	KUNIT_EXPECT_FALSE(test, dcp_hdmi_record_hpd_edge(&t->dcp, 1, 2 * NSEC_PER_SEC));
+	KUNIT_EXPECT_EQ(test, dcp_hdmi_attachment_generation(&t->dcp), 0ULL);
 }
 
 static void v27_external_initial_replug(struct kunit *test)
@@ -367,6 +419,7 @@ static void v27_external_preferred_catalog(struct kunit *test)
 
 	t->modes[0].firmware_preferred = false;
 	t->modes[2].mode.clock = 237600;
+	t->modes[2].mode.type |= DRM_MODE_TYPE_PREFERRED;
 	dcp->full_catalog_v27 = true;
 	KUNIT_ASSERT_EQ(test, dcp_external_initial_mode(dcp, &state, &generation), -ENODATA);
 	/* PreferredTimingElements may contain only the authoritative timing ID. */
@@ -381,6 +434,30 @@ static void v27_external_preferred_catalog(struct kunit *test)
 	KUNIT_ASSERT_EQ(test, dcp_external_initial_mode(dcp, &state, &generation), 0);
 	KUNIT_EXPECT_EQ(test, state.mode.hdisplay, 2560);
 	KUNIT_EXPECT_EQ(test, state.mode.clock, 241500);
+	KUNIT_EXPECT_TRUE(test, t->modes[1].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_FALSE(test, t->modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_FALSE(test, t->modes[2].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_FALSE(test, t->modes[0].firmware_preferred);
+	KUNIT_EXPECT_TRUE(test, t->connector.edid_invalidation_pending);
+	/* Pixel clock alone must not beat the faster native refresh rate. */
+	t->modes[0].mode.clock = 600000;
+	t->modes[0].mode.htotal = 6000;
+	KUNIT_ASSERT_EQ(test, dcp_modes_set_preferred_v27(dcp, blob, sizeof(blob), 11), 0);
+	KUNIT_EXPECT_TRUE(test, t->modes[1].mode.type & DRM_MODE_TYPE_PREFERRED);
+	/* An unusable SDR timing cannot remain DRM's preferred mode. */
+	t->modes[1].sdr_usable = false;
+	KUNIT_ASSERT_EQ(test, dcp_modes_set_preferred_v27(dcp, blob, sizeof(blob), 11), 0);
+	KUNIT_EXPECT_TRUE(test, t->modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_FALSE(test, t->modes[1].mode.type & DRM_MODE_TYPE_PREFERRED);
+	t->modes[1].sdr_usable = true;
+	/* Preferred first, followed by a catalog admission, retags that catalog. */
+	dcp->modes_admitted = false;
+	KUNIT_ASSERT_EQ(test, dcp_modes_set_preferred_v27(dcp, blob, sizeof(blob), 11), 0);
+	dcp_modes_adopt(dcp, &t->connector, 11,
+			kmemdup(t->modes, sizeof(t->modes), GFP_KERNEL), ARRAY_SIZE(t->modes));
+	KUNIT_ASSERT_TRUE(test, dcp->modes_admitted);
+	KUNIT_EXPECT_TRUE(test, dcp->modes[1].mode.type & DRM_MODE_TYPE_PREFERRED);
+	KUNIT_EXPECT_FALSE(test, dcp->modes[0].mode.type & DRM_MODE_TYPE_PREFERRED);
 	/* A new attachment cannot use the old sink's preferred identities. */
 	dcp_modes_begin_attachment(dcp);
 	dcp->modes_admitted = true;
@@ -594,6 +671,8 @@ static struct kunit_case v27_start_cases[] = {
 	KUNIT_CASE(v27_external_mode_cache),
 	KUNIT_CASE(v27_external_initial_selection),
 	KUNIT_CASE(v27_external_physical_replacement),
+	KUNIT_CASE(v27_external_short_hpd),
+	KUNIT_CASE(v27_external_untimed_hpd),
 	KUNIT_CASE(v27_external_initial_replug),
 	KUNIT_CASE(v27_external_catalog_during_replacement),
 	KUNIT_CASE(v27_external_initial_retry_bound),

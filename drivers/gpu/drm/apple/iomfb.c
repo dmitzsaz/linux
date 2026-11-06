@@ -34,6 +34,7 @@
 #include <drm/drm_vblank.h>
 
 #include "dcp.h"
+#include "dcp-hdmi.h"
 #include "dcp-link.h"
 #include "dcp-hdr-metadata.h"
 #include "dcp-internal.h"
@@ -1769,6 +1770,81 @@ void dcp_modes_init(struct apple_dcp *dcp)
 	disable_work(&dcp->dimensions_wq);
 }
 
+static bool dcp_external_native_mode(struct apple_dcp *dcp,
+				     const struct dcp_display_mode *mode)
+{
+	unsigned int i;
+
+	if (mode->firmware_preferred)
+		return true;
+	for (i = 0; i < dcp->nr_preferred_timings_v27; i++) {
+		const struct dcp_timing_id *p = &dcp->preferred_timings_v27[i];
+
+		if (p->id == mode->timing_mode_id &&
+		    (!p->width || p->width == mode->mode.hdisplay) &&
+		    (!p->height || p->height == mode->mode.vdisplay))
+			return true;
+	}
+	return false;
+}
+
+/* Caller holds modes_lock; only firmware hints establish native geometry. */
+static const struct dcp_display_mode *dcp_external_native_geometry(struct apple_dcp *dcp)
+{
+	const struct dcp_display_mode *native = NULL;
+	unsigned int i;
+
+	for (i = 0; i < dcp->nr_modes; i++) {
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->sdr_usable || m->automatic_rgb8_quirk ||
+		    !dcp_external_native_mode(dcp, m))
+			continue;
+		if (!native ||
+		    (m->firmware_preferred && !native->firmware_preferred) ||
+		    (m->firmware_preferred == native->firmware_preferred &&
+		     (u64)m->mode.hdisplay * m->mode.vdisplay >
+		     (u64)native->mode.hdisplay * native->mode.vdisplay))
+			native = m;
+	}
+	return native;
+}
+
+/* Keep the raw firmware preference separate from DRM's default selection. */
+static bool dcp_modes_retag_preferred_v27(struct apple_dcp *dcp)
+{
+	const struct dcp_display_mode *native, *best = NULL;
+	bool changed = false;
+	unsigned int i;
+
+	lockdep_assert_held(&dcp->modes_lock);
+	if (dcp->fw_compat != DCP_FIRMWARE_V_27_0 ||
+	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL)
+		return false;
+	native = dcp_external_native_geometry(dcp);
+	for (i = 0; native && i < dcp->nr_modes; i++) {
+		const struct dcp_display_mode *m = &dcp->modes[i];
+
+		if (!m->sdr_usable || m->automatic_rgb8_quirk ||
+		    m->mode.hdisplay != native->mode.hdisplay ||
+		    m->mode.vdisplay != native->mode.vdisplay)
+			continue;
+		if (!best || dcp_mode_default_above(m, m->score, best, best->score))
+			best = m;
+	}
+	for (i = 0; i < dcp->nr_modes; i++) {
+		struct dcp_display_mode *m = &dcp->modes[i];
+		bool preferred = m == best;
+
+		changed |= !!(m->mode.type & DRM_MODE_TYPE_PREFERRED) != preferred;
+		if (preferred)
+			m->mode.type |= DRM_MODE_TYPE_PREFERRED;
+		else
+			m->mode.type &= ~DRM_MODE_TYPE_PREFERRED;
+	}
+	return changed;
+}
+
 /* Caller holds modes_lock. No GPIO reads or firmware calls in this fence. */
 static void dcp_modes_invalidate_locked(struct apple_dcp *dcp)
 {
@@ -1781,7 +1857,6 @@ static void dcp_modes_invalidate_locked(struct apple_dcp *dcp)
 
 static bool dcp_modes_check_hdmi_locked(struct apple_dcp *dcp)
 {
-	unsigned long flags;
 	u64 generation;
 
 	lockdep_assert_held(&dcp->modes_lock);
@@ -1789,9 +1864,7 @@ static bool dcp_modes_check_hdmi_locked(struct apple_dcp *dcp)
 	    dcp->hw.iomfb_method_profile != DCP_IOMFB_METHODS_H17P_EXTERNAL ||
 	    READ_ONCE(dcp->active_typec_route) || !dcp->fixed_phy)
 		return false;
-	spin_lock_irqsave(&dcp->hdmi_presence_lock, flags);
-	generation = dcp->hdmi_presence.generation;
-	spin_unlock_irqrestore(&dcp->hdmi_presence_lock, flags);
+	generation = dcp_hdmi_attachment_generation(dcp);
 	if (generation == dcp->modes_hdmi_generation)
 		return false;
 	dcp->modes_hdmi_generation = generation;
@@ -1835,7 +1908,7 @@ static struct dcp_display_mode *dcp_modes_snapshot(struct apple_dcp *dcp,
 void dcp_modes_begin_attachment(struct apple_dcp *dcp)
 {
 	guard(mutex)(&dcp->modes_lock);
-	/* Physical edges always revoke the catalog, including inside A413. */
+	/* Confirmed cable replacements revoke the catalog, even inside A413. */
 	if (dcp_modes_check_hdmi_locked(dcp))
 		return;
 	/* Only the fixed sink's virtual HPD is settled with the A413 result. */
@@ -1910,6 +1983,7 @@ void dcp_modes_adopt(struct apple_dcp *dcp, struct apple_connector *connector,
 	spin_lock_irqsave(&dcp->metadata.lock, flags);
 	dcp->modes = modes;
 	dcp->nr_modes = count;
+	dcp_modes_retag_preferred_v27(dcp);
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = true;
 	dcp->modes_provisional = true;
@@ -2004,6 +2078,7 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 			modes[i].automatic_catalog_sequence = dcp->rate_proof.catalog_sequence;
 	dcp->modes = modes;
 	dcp->nr_modes = nr_modes;
+	dcp_modes_retag_preferred_v27(dcp);
 	/* Only a complete receipt for a current cable is that cable's catalogue. */
 	dcp->metadata.catalog_ticket = rate_ticket;
 	dcp->metadata.catalog_ticket.associated &= nr_modes > 0;
@@ -2012,6 +2087,10 @@ int dcp_modes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *ctx,
 	spin_unlock_irqrestore(&dcp->metadata.lock, flags);
 	dcp->modes_admitted = !ret;
 	dcp->modes_provisional = false;
+	if (dcp->fw_compat == DCP_FIRMWARE_V_27_0 && h17p_external) {
+		apple_connector_invalidate_edid(dcp->connector);
+		dcp_firmware_metadata_timing(dcp);
+	}
 	/* A fresh catalog replaced one adopted across a route move. */
 	if (!ret && provisional && dcp->connector && dcp->dev &&
 	    dcp_modes_for_connector(dcp, dcp->connector) &&
@@ -2839,7 +2918,10 @@ enum drm_mode_status dcp_mode_valid(struct drm_connector *connector,
 int dcp_modes_set_preferred_v27(struct apple_dcp *dcp, const void *blob, size_t len,
 				u64 generation)
 {
+	struct apple_connector *ready = NULL;
 	struct dcp_timing_id *timings;
+	unsigned long flags;
+	bool changed;
 	int count;
 
 	timings = kcalloc(DCP_MAX_TIMING_MODES, sizeof(*timings), GFP_KERNEL);
@@ -2859,52 +2941,36 @@ int dcp_modes_set_preferred_v27(struct apple_dcp *dcp, const void *blob, size_t 
 		kfree(dcp->preferred_timings_v27);
 		dcp->preferred_timings_v27 = timings;
 		dcp->nr_preferred_timings_v27 = count;
+		spin_lock_irqsave(&dcp->metadata.lock, flags);
+		changed = dcp->modes_admitted && dcp_modes_retag_preferred_v27(dcp);
+		spin_unlock_irqrestore(&dcp->metadata.lock, flags);
+		if (changed) {
+			apple_connector_invalidate_edid(dcp->connector);
+			dcp_firmware_metadata_timing(dcp);
+			if (dcp->connector && dcp->dev &&
+			    READ_ONCE(dcp->connector->connected) &&
+			    READ_ONCE(dcp->connector->dcp) == to_platform_device(dcp->dev) &&
+			    !READ_ONCE(dcp->quiescing))
+				ready = dcp->connector;
+		}
 	}
+	if (ready)
+		dcp_queue_hotplug(ready);
 	dcp_external_queue_initial_mode(dcp);
 	return 0;
-}
-
-static bool dcp_external_native_mode(struct apple_dcp *dcp,
-				     const struct dcp_display_mode *mode)
-{
-	unsigned int i;
-
-	if (mode->firmware_preferred)
-		return true;
-	for (i = 0; i < dcp->nr_preferred_timings_v27; i++) {
-		const struct dcp_timing_id *p = &dcp->preferred_timings_v27[i];
-
-		if (p->id == mode->timing_mode_id &&
-		    (!p->width || p->width == mode->mode.hdisplay) &&
-		    (!p->height || p->height == mode->mode.vdisplay))
-			return true;
-	}
-	return false;
 }
 
 /* Firmware preference supplies the native geometry; start at its lowest clock. */
 int dcp_external_initial_mode(struct apple_dcp *dcp, struct drm_crtc_state *state,
 			     u64 *generation)
 {
-	const struct dcp_display_mode *native = NULL, *best = NULL;
+	const struct dcp_display_mode *native, *best = NULL;
 	unsigned int i;
 
 	guard(mutex)(&dcp->modes_lock);
 	if (!dcp->connector || !dcp_modes_for_connector(dcp, dcp->connector))
 		return -ENODATA;
-	for (i = 0; i < dcp->nr_modes; i++) {
-		const struct dcp_display_mode *m = &dcp->modes[i];
-
-		if (!m->sdr_usable || m->automatic_rgb8_quirk ||
-		    !dcp_external_native_mode(dcp, m))
-			continue;
-		if (!native ||
-		    (m->firmware_preferred && !native->firmware_preferred) ||
-		    (m->firmware_preferred == native->firmware_preferred &&
-		     (u64)m->mode.hdisplay * m->mode.vdisplay >
-		     (u64)native->mode.hdisplay * native->mode.vdisplay))
-			native = m;
-	}
+	native = dcp_external_native_geometry(dcp);
 	if (!native)
 		return -ENODATA;
 	for (i = 0; i < dcp->nr_modes; i++) {

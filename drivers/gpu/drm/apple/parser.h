@@ -180,9 +180,9 @@ struct dimension {
 
 int parse(const void *blob, size_t size, struct dcp_parse_ctx *ctx);
 bool dcp_property_complete(const void *blob, size_t received, size_t advertised);
-#if IS_ENABLED(CONFIG_KUNIT)
 bool dcp_mode_default_above(const struct dcp_display_mode *mode, s64 score,
 			    const struct dcp_display_mode *best, s64 best_score);
+#if IS_ENABLED(CONFIG_KUNIT)
 bool dcp_mode_ranks_above(bool preferred, s64 score, bool best_preferred,
 			  s64 best_score);
 #endif
