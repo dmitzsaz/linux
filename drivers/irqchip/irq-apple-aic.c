@@ -1234,6 +1234,7 @@ static int __init aic_of_ic_init(struct device_node *node, struct device_node *p
 		WARN_ON(!vgic_info.maint_irq);
 	}
 
+	vgic_info.timer_irqs_use_imask = irqc->info.vm_timer_fiq_readonly;
 	vgic_set_kvm_info(&vgic_info);
 
 	pr_info("Initialized with %d/%d IRQs * %d/%d die(s), %d FIQs, %d vIPIs",
