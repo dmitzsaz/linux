@@ -190,6 +190,9 @@ typedef uint64_t u64;
 
 #define READ_ONCE(x) (x)
 #define WRITE_ONCE(x, v) ((x) = (v))
+#define ERR_PTR(e) ((void *)(intptr_t)(e))
+#define PTR_ERR(p) ((int)(intptr_t)(p))
+#define IS_ERR(p) ((uintptr_t)(p) >= (uintptr_t)-4095)
 #define DCP_FIRMWARE_V_27_0 27
 #define DCP_FIRMWARE_V_26_6_DESKTOP 26
 #define DCP_FIRMWARE_V_14_7 14
@@ -377,7 +380,7 @@ static bool typec_follow_crtc = true;
 static unsigned int dcp_hybrid_fails;
 static struct apple_dcp *display;
 static int select_error, deselect_error, disconnect_error, connect_error;
-static int typec_select_error, activate_disconnect_error;
+static int typec_select_error, activate_disconnect_error, yield_error, yields;
 static int selects, deselects, disconnects, connects, errors, retired;
 static int typec_selects, fixed_deselects, typec_connects;
 static int metadata_ends, metadata_starts, external_publications;
@@ -756,13 +759,15 @@ static int of_property_read_string(void *node, const char *name, const char **va
 static void cancel_delayed_work(int *work)
 {
 	(void)work;
-	assert(!"no live fixed sink to yield in this fixture");
+	assert(yield_error);
 }
 
-static void dcp_hdmi_yield_link(struct apple_dcp *dcp)
+static int dcp_hdmi_yield_link(struct apple_dcp *dcp)
 {
 	(void)dcp;
-	assert(!"no live fixed sink to yield in this fixture");
+	assert(yield_error);
+	yields++;
+	return yield_error;
 }
 '''
 
@@ -845,6 +850,30 @@ int main(int argc, char **argv)
 	port.owner = &route;
 	host_list_append(&port.routes, &route.port_link, &route);
 	host_list_append(&dcp_typec_ports, &port.link, &port);
+	if (!strcmp(name, "yield-failure")) {
+		/* HDMI is logically active even though its GPIO has gone low. */
+		gpio = 0;
+		dcp.active_typec_route = NULL;
+		dcp.typec_connector = NULL;
+		dcp.connector = &fixed_connector;
+		dcp.hdmi_yielded = false;
+		dcp.fixed_sink_present = true;
+		dcp.fixed_route_selected = fixed_mux.held = true;
+		route.selected = typec_mux.held = false;
+		port.owner = NULL;
+		port.hpd = port.dp_hpd = false;
+		state.mode = TYPEC_DP_STATE_A;
+		state.alt = &alt;
+		state.data = &dp;
+		dp.status = DP_STATUS_HPD_STATE;
+		yield_error = -EIO;
+		ret = dcp_typec_route_finish(&mux, &state);
+		assert(ret == -EIO && yields == 1 && !typec_connects);
+		assert(!port.owner && !dcp.active_typec_route && !route.selected);
+		assert(fixed_mux.held && !typec_mux.held && !selects && !disconnects);
+		puts("PASS failed HDMI yield propagates before any Type-C activation");
+		return 0;
+	}
 
 	if (!strncmp(name, "recovery-", 9)) {
 		struct phy next_phy = { .id = 3 };
@@ -1120,7 +1149,7 @@ HANDBACK_CASES = ('safe', 'hpd', 'exit', 'select-failure', 'hpd-select-failure',
          'recovery-hpd-high', 'recovery-hpd-high-fixed-error',
          'recovery-hpd-high-mux-error', 'recovery-hpd-high-disconnect-error',
          'recovery-competing-allocator', 'recovery-low-to-waiter',
-         'recovery-teardown-error')
+         'recovery-teardown-error', 'yield-failure')
 
 
 def handback(root, fabric=None):
@@ -1271,6 +1300,7 @@ def handback_mutations(unit, output, cases):
         ('accept-unproven-teardown', apply, apply.replace(
             'if (owner->deactivate_error)\n\t\t\treturn owner->deactivate_error;',
             'if (false)\n\t\t\treturn owner->deactivate_error;')),
+        ('lose-yield-error', 'return PTR_ERR(best);', 'return -ENOSPC;'),
     )
     results = []
     for name, old, new in changes:
